@@ -15,8 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")      # CryptoPanic API key (optional)
 
 BINANCE_PRICE_URL   = "https://data-api.binance.vision/api/v3/ticker/price"
@@ -76,7 +76,7 @@ last_hourly_time       = time.time()
 last_pnl_update_time   = time.time() + 1800
 last_weekly_report_day = None
 
-SCAN_INTERVAL            = 300
+SCAN_INTERVAL            = 90      # scan every 90 seconds (was 300 — 3x faster)
 BATCH_INTERVAL           = 1800
 RIVER_INTERVAL           = 900
 MIN_SETUP_SCORE          = 90
@@ -85,13 +85,15 @@ INSTANT_SIGNAL_THRESHOLD = 97
 MIN_PROFIT_TARGET        = 15.0
 SIGNAL_EXPIRY_MINUTES    = 120
 INSTANT_EXPIRY_MINUTES   = 30
-DELAY_BETWEEN_COINS      = 0.15
+DELAY_BETWEEN_COINS      = 0.10    # slightly faster between coins
 MAX_SIGNALS_PER_CYCLE    = 3
 MAX_ACTIVE_TRADES        = 5
 ATR_SL_MULTIPLIER        = 2.5
 ATR_TP_MULTIPLIER        = 5.0
 MAX_DAILY_LOSSES         = 3
 CIRCUIT_BREAKER_MIN_LOSS = -5.0
+SCAN_CANDLE_TF           = "5m"    # 5m candles — 3x faster pattern detection vs 15m
+PRE_SIGNAL_LOOKBACK      = 50      # candles for pre-signal detection
 WHALE_TRADE_THRESHOLD    = 500000
 ATR_VOLATILITY_RATIO     = 3.0
 CONSEC_LOSS_SUSPEND      = 5
@@ -1802,7 +1804,7 @@ def cmd_scan_manual(btc_trend,fng,market_condition):
     results=[]
     for coin in COINS:
         try:
-            symbol=coin+"USDT"; price=get_price(symbol); klines=get_klines(symbol,"15m",100)
+            symbol=coin+"USDT"; price=get_price(symbol); klines=get_klines(symbol,SCAN_CANDLE_TF,100)
             if not price or not klines: continue
             found=detect_patterns(symbol,klines,price,btc_trend)
             if not found: continue
@@ -1973,20 +1975,27 @@ def cmd_hidden_gems():
         sl=get_structure_sl(klines_15m,best["direction"],entry,atr_1h)
         tp=entry+atr_1h*ATR_TP_MULTIPLIER if best["direction"]=="BUY" else entry-atr_1h*ATR_TP_MULTIPLIER
         ms_b=detect_market_structure(klines_15m)
-        whale=has_whale_activity(best["symbol"])
-        oi_rising=get_oi_trend(best["symbol"])
         adx_val=calculate_adx(klines_15m)
         closes=[float(k[4]) for k in klines_15m]
-        rsi_val=calculate_rsi(closes)
-        vol_ok=is_volume_confirmed(klines_15m)
-        rsi_ok=35<=rsi_val<=65 if best["direction"]=="BUY" else 35<=rsi_val<=65
-        funding_ok=True
-        vwap=calculate_vwap(klines_15m); vwap_ok=(entry>vwap if best["direction"]=="BUY" else entry<vwap) if vwap else False
-        st_15m=calculate_supertrend(klines_15m,ST_PERIOD,ST_MULTIPLIER)
-        st_ok=(st_15m==best["direction"])
-        zone_ok=False
-        ob_imb,_=get_orderbook_imbalance(best["symbol"])
-        grade,pts,_=get_signal_grade(best["score"],whale,oi_rising,best["tf_score"],vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,ob_imb,ms_b["bias"],ms_b["bos"])
+        rsi_15m_b=calculate_rsi(closes)
+        kl1h_b=get_klines(best["symbol"],"1h",50)
+        kl4h_b=get_klines(best["symbol"],"4h",50)
+        rsi_1h_b=calculate_rsi([float(k[4]) for k in kl1h_b]) if kl1h_b else rsi_15m_b
+        rsi_4h_b=calculate_rsi([float(k[4]) for k in kl4h_b]) if kl4h_b else rsi_15m_b
+        vols_b=[float(k[5]) for k in klines_15m]
+        avg_vol_b=sum(vols_b[-20:])/20 if len(vols_b)>=20 else 1
+        vol_str_b=vols_b[-1]/avg_vol_b if avg_vol_b>0 else 1.0
+        vwap_b=calculate_vwap(klines_15m)
+        vwap_ok_b=(entry>vwap_b if best["direction"]=="BUY" else entry<vwap_b) if vwap_b else False
+        zones_b=detect_supply_demand_zones(klines_15m)
+        zone_ok_b,_=is_in_zone(entry,best["direction"],zones_b)
+        st_15m_b=calculate_supertrend(klines_15m,ST_PERIOD,ST_MULTIPLIER)
+        st_ok_b=(st_15m_b==best["direction"])
+        grade,pts,_,_=get_signal_grade(
+            best["score"],vol_str_b,adx_val,best["tf_score"],
+            rsi_15m_b,rsi_1h_b,rsi_4h_b,True,st_ok_b,vwap_ok_b,
+            zone_ok_b,adx_val,ms_b["bos"],ms_b["bias"] in ("bullish","bearish")
+        )
         lev=get_smart_leverage(best["symbol"],atr_pct,best["score"],grade)
         profit_target=(abs(tp-entry)/entry)*100*lev
         sl_pct=abs(entry-sl)/entry*100; tp_pct=abs(tp-entry)/entry*100
@@ -2085,6 +2094,52 @@ def cmd_trade_suggestions():
         text+="\n"
     text+=f"  {YT_BOT}\n  🕐 {get_ist_time()}"
     return text
+
+watch_alerts_sent = {}   # coin -> timestamp of last watch alert
+
+def check_and_send_watch_alert(coin, symbol, price, klines, direction):
+    """Pre-signal Watch Alert — fires 5-15 min before actual signal."""
+    global watch_alerts_sent
+    if not klines or len(klines)<30: return
+    now=get_ist_datetime()
+    if coin in watch_alerts_sent:
+        if (now-watch_alerts_sent[coin]).total_seconds()<1800: return
+    closes=[float(k[4]) for k in klines]; highs=[float(k[2]) for k in klines]
+    lows=[float(k[3]) for k in klines]; vols=[float(k[5]) for k in klines]
+    avg_vol=sum(vols[-20:])/20 if len(vols)>=20 else 1
+    rsi=calculate_rsi(closes); e20=calculate_ema(closes,20)
+    std=(sum((c-e20)**2 for c in closes[-20:])/20)**0.5 if e20 else 0
+    bb_upper=e20+2*std; bb_lower=e20-2*std
+    adx=calculate_adx(klines); vol_ratio=vols[-1]/avg_vol if avg_vol>0 else 0
+    recent_high=max(highs[-20:]); recent_low=min(lows[-20:])
+    alert=None; dir_em="🟢 LONG" if direction=="BUY" else "🔴 SHORT"
+    if (price>=recent_high*0.985 and direction=="SELL" and vol_ratio>=1.2):
+        alert=f"📍 Approaching resistance <code>{format_price(recent_high)}</code> — vol {vol_ratio:.1f}x"
+    elif (price<=recent_low*1.015 and direction=="BUY" and vol_ratio>=1.2):
+        alert=f"📍 Approaching support <code>{format_price(recent_low)}</code> — vol {vol_ratio:.1f}x"
+    elif rsi<38 and direction=="BUY":
+        alert=f"📈 RSI oversold ({rsi:.0f}) — reversal forming"
+    elif rsi>62 and direction=="SELL":
+        alert=f"📉 RSI overbought ({rsi:.0f}) — reversal forming"
+    elif price<=bb_lower*1.008 and direction=="BUY":
+        alert=f"🎯 Near BB lower <code>{format_price(bb_lower)}</code> — watch for bounce"
+    elif price>=bb_upper*0.992 and direction=="SELL":
+        alert=f"🎯 Near BB upper <code>{format_price(bb_upper)}</code> — watch for rejection"
+    elif vol_ratio>=2.5 and adx<25:
+        alert=f"⚡ Volume spike {vol_ratio:.1f}x in quiet market — move incoming"
+    if alert:
+        watch_alerts_sent[coin]=now
+        send_telegram(
+            f"👁 <b>WATCH ALERT — {coin}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"  🪙 <b>{coin}</b>   {dir_em}\n"
+            f"  💰 Price : <code>{format_price(price)}</code>\n\n"
+            f"  {alert}\n\n"
+            f"  RSI:{rsi:.0f}  ADX:{adx:.0f}  Vol:{vol_ratio:.1f}x\n"
+            f"  ⏳ Signal may fire in 5-15 min — be ready!\n"
+            f"  🕐 {get_ist_time()}"
+        )
+        logger.info(f"WATCH ALERT: {coin}|{direction}")
 
 def expire_pending_signals():
     now=get_ist_datetime()
@@ -2197,7 +2252,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     entry=live_price
     if abs(entry-setup["scan_price"])/setup["scan_price"]>0.02:
         logger.info(f"{coin} rejected - drifted"); return False
-    klines_15m=get_klines(setup["symbol"],"15m",100)
+    klines_15m=get_klines(setup["symbol"],SCAN_CANDLE_TF,100)
     klines_1h=get_klines(setup["symbol"],"1h",50)
     if not klines_15m: return False
     closes=[float(x[4]) for x in klines_15m]
@@ -2218,10 +2273,15 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     st_1h=calculate_supertrend(klines_1h,ST_PERIOD,ST_MULTIPLIER) if klines_1h else st_15m
     is_sideways_signal=setup.get("sideways_mode",False)
     if st_15m != setup["direction"] and not is_sideways_signal:
-        # Hard block only for trend signals — sideways signals use mean reversion so ST opposing is expected
         logger.info(f"{coin} rejected - SuperTrend 15m ({st_15m})"); return False
     elif st_15m != setup["direction"] and is_sideways_signal:
-        logger.info(f"{coin} sideways signal — ST opposing ({st_15m}) — grade penalty applied, not blocked")
+        # For sideways: only allow if RSI confirms extreme reversal
+        rsi_check=calculate_rsi([float(k[4]) for k in klines_15m])
+        if setup["direction"]=="BUY" and rsi_check>35:
+            logger.info(f"{coin} sideways BUY rejected - ST opposes and RSI {rsi_check:.0f} not oversold enough"); return False
+        elif setup["direction"]=="SELL" and rsi_check<65:
+            logger.info(f"{coin} sideways SELL rejected - ST opposes and RSI {rsi_check:.0f} not overbought enough"); return False
+        logger.info(f"{coin} sideways signal — ST opposing but RSI {rsi_check:.0f} confirms extreme — allowing")
     st_ok=(st_15m==setup["direction"]) and (st_1h==setup["direction"])
     vwap=calculate_vwap(klines_15m); vwap_ok=False; vwap_label="N/A"
     if vwap:
@@ -2377,9 +2437,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     msg += f"  │  📡 TF   : {tf_label}\n"
     st_icon="✅✅" if st_ok else "⚠️"
     msg += f"  │  🌀 ST   : {st_icon}  VWAP: {'✅' if vwap_ok else '⚠️'}\n"
-    oi_icon="✅" if oi_rising else "⚠️" if oi_rising is False else "➖"
-    whale_icon="✅" if whale else "—"
-    msg += f"  │  📦 OI   : {oi_icon} {oi_label:<8}  🐋: {whale_icon}\n"
+    msg += f"  │  📦 Vol  : {'✅' if vol_strength>=1.5 else '⚠️'} {vol_strength:.1f}x avg\n"
     msg += f"  │  📌 Pat  : {setup['pattern']}\n"
     msg += f"  │  📊 RSI  : {rsi_val:.1f}   ADX: {adx_val:.1f}   Mom: {mom:+.2f}%\n"
     if zone_ok: msg += f"  │  📍 Zone : ✅ {'Demand' if setup['direction']=='BUY' else 'Supply'}\n"
@@ -3020,7 +3078,7 @@ def scan_coins(btc_trend,fng,market_condition):
                     logger.info(f"Skip {coin} - cooldown"); continue
                 else: del coin_cooldowns[coin]
             symbol=coin+"USDT"; price=get_price(symbol)
-            klines=get_klines(symbol,"15m")
+            klines=get_klines(symbol,SCAN_CANDLE_TF)
             if not price or not klines: continue
 
             coin_sideways=is_market_sideways(symbol,klines)
@@ -3079,6 +3137,9 @@ def scan_coins(btc_trend,fng,market_condition):
                     pt=primary+(" + "+" + ".join(extras) if extras else "")
                     confirm_bonus=min(len(dir_pats)*0.5,3.0)
                     score=min(adj_score+confirm_bonus,99)
+                    # Watch alert: score building but not yet at threshold
+                    if 80<=score<MIN_SETUP_SCORE and coin not in active_trades and coin not in pending_signals:
+                        check_and_send_watch_alert(coin,symbol,price,klines,direction)
                     if score<MIN_SETUP_SCORE: continue
                     atr=calculate_atr(klines); atr_pct=(atr/price)*100 if price>0 else 0
                     lev=get_smart_leverage(symbol,atr_pct,score)
