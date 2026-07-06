@@ -15,8 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")      # CryptoPanic API key (optional)
 
 BINANCE_PRICE_URL   = "https://data-api.binance.vision/api/v3/ticker/price"
@@ -2216,10 +2216,12 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
         logger.info(f"{coin} rejected - funding"); return False
     st_15m=calculate_supertrend(klines_15m,ST_PERIOD,ST_MULTIPLIER)
     st_1h=calculate_supertrend(klines_1h,ST_PERIOD,ST_MULTIPLIER) if klines_1h else st_15m
-    # 15m SuperTrend MUST align — hard block
-    # 1h SuperTrend is a grade bonus only (not a hard block — sideways markets keep old 1h ST)
-    if st_15m != setup["direction"]:
+    is_sideways_signal=setup.get("sideways_mode",False)
+    if st_15m != setup["direction"] and not is_sideways_signal:
+        # Hard block only for trend signals — sideways signals use mean reversion so ST opposing is expected
         logger.info(f"{coin} rejected - SuperTrend 15m ({st_15m})"); return False
+    elif st_15m != setup["direction"] and is_sideways_signal:
+        logger.info(f"{coin} sideways signal — ST opposing ({st_15m}) — grade penalty applied, not blocked")
     st_ok=(st_15m==setup["direction"]) and (st_1h==setup["direction"])
     vwap=calculate_vwap(klines_15m); vwap_ok=False; vwap_label="N/A"
     if vwap:
