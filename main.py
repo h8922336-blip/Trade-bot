@@ -15,8 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")      # CryptoPanic API key (optional)
 
 BINANCE_PRICE_URL   = "https://data-api.binance.vision/api/v3/ticker/price"
@@ -2852,12 +2852,12 @@ def poll_telegram():
                         if not trade_journal:
                             send_telegram(_H("TRADE FEEDBACK","📜")+"\n\n  🌙 No trades recorded yet.")
                         else:
-                            recent=trade_journal[-5:][::-1]
+                            recent=trade_journal[::-1]  # ALL trades
                             text=_H("DEEP TRADE FEEDBACK","📜")+"\n\n"
                             wins=sum(1 for t in recent if t.get("result")=="WIN")
                             total=len(recent)
-                            text+=f"  Last {total} trades: {wins}W/{total-wins}L\n\n"
-                            for t in recent:
+                            text+=f"  ALL {total} TRADES: {wins}W / {total-wins}L  WR: <b>{wr:.1f}%</b>\n\n"
+                            for t in recent[:10]:  # show last 10 in detail
                                 em="✅" if t.get("result")=="WIN" else "🔴"
                                 mc_t=t.get("market_condition","?")
                                 note=t.get("close_note","")
