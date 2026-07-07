@@ -15,8 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")      # CryptoPanic API key (optional)
 
 BINANCE_PRICE_URL   = "https://data-api.binance.vision/api/v3/ticker/price"
@@ -98,7 +98,7 @@ SCAN_CANDLE_TF           = "5m"
 PRE_SIGNAL_LOOKBACK      = 50
 BTC_MOMENTUM_PAUSE_PCT   = 1.0    # pause BUY signals if BTC drops 1%+ in 15 min
 BTC_MOMENTUM_PAUSE_MIN   = 20     # pause duration in minutes
-RETEST_PULLBACK_PCT      = 0.3    # wait for 0.3% pullback before entry confirmed
+RETEST_PULLBACK_PCT      = 0.2    # wait for 0.2% pullback before entry confirmed
 WHALE_TRADE_THRESHOLD    = 500000
 ATR_VOLATILITY_RATIO     = 3.0
 CONSEC_LOSS_SUSPEND      = 5
@@ -2189,37 +2189,35 @@ def get_1h_atr_sl(symbol, entry, direction):
         else:                return entry*1.015
 
 
-def is_retest_confirmed(symbol, direction, entry_price, klines):
+def is_retest_confirmed(symbol, direction, entry_price, klines, min_pct=None):
     """
     Change 4: Retest entry confirmation.
-    After pattern fires, check if price pulled back 0.3% from recent high/low.
-    This filters fake breakouts — real breakouts always retest.
+    min_pct: override the default RETEST_PULLBACK_PCT (use 0.15 for sideways signals).
     """
+    threshold = min_pct if min_pct is not None else RETEST_PULLBACK_PCT
     try:
-        if len(klines)<5: return True  # not enough data, allow through
+        if len(klines)<5: return True
         closes=[float(k[4]) for k in klines]
         recent_high=max([float(k[2]) for k in klines[-5:]])
         recent_low=min([float(k[3]) for k in klines[-5:]])
         current=closes[-1]
         if direction=="BUY":
-            # For buy: price should have pulled back at least 0.3% from recent high
             pullback=((recent_high-current)/recent_high)*100
-            if pullback>=RETEST_PULLBACK_PCT:
+            if pullback>=threshold:
                 logger.info(f"{symbol} retest confirmed — pulled back {pullback:.2f}% from high")
                 return True
             else:
-                logger.info(f"{symbol} retest NOT confirmed — only {pullback:.2f}% pullback (need {RETEST_PULLBACK_PCT}%)")
+                logger.info(f"{symbol} retest NOT confirmed — only {pullback:.2f}% pullback (need {threshold}%)")
                 return False
-        else:  # SELL
-            # For sell: price should have bounced at least 0.3% from recent low
+        else:
             bounce=((current-recent_low)/recent_low)*100
-            if bounce>=RETEST_PULLBACK_PCT:
+            if bounce>=threshold:
                 logger.info(f"{symbol} retest confirmed — bounced {bounce:.2f}% from low")
                 return True
             else:
-                logger.info(f"{symbol} retest NOT confirmed — only {bounce:.2f}% bounce (need {RETEST_PULLBACK_PCT}%)")
+                logger.info(f"{symbol} retest NOT confirmed — only {bounce:.2f}% bounce (need {threshold}%)")
                 return False
-    except Exception: return True  # on error, allow through
+    except Exception: return True
 
 
 def check_and_send_watch_alert(coin, symbol, price, klines, direction):
@@ -3192,21 +3190,26 @@ def scan_coins(btc_trend,fng,market_condition):
                 if best_pat[1]<82: continue
                 direction=best_pat[2]
                 # Block against daily trend
+                # Sideways signals: align WITH daily trend
+                # Bull daily → only BUY dips (BB lower bounce, range support)
+                # Bear daily → only SELL bounces (BB upper reject, range resistance)
+                # Neutral daily → allow both directions
                 if daily_trend=="bull" and direction=="SELL":
-                    logger.info(f"Skip {coin} sideways SELL — daily BULL"); continue
+                    logger.info(f"Skip {coin} sideways SELL — daily BULL (only BUY dips)"); continue
                 if daily_trend=="bear" and direction=="BUY":
-                    logger.info(f"Skip {coin} sideways BUY — daily BEAR"); continue
+                    logger.info(f"Skip {coin} sideways BUY — daily BEAR (only SELL bounces)"); continue
+                # Daily trend aligned — continue to next checks
                 # BTC momentum pause
                 if btc_paused and direction=="BUY":
                     logger.info(f"Skip {coin} BUY — BTC pause {pause_mins}min"); continue
                 if btc_crashing and direction=="BUY": continue
-                # Retest confirmation
-                if not is_retest_confirmed(symbol,direction,price,klines): continue
+                # No retest filter for sideways — BB bounce/range touch IS the retest
                 tf_score=get_timeframe_score(symbol,direction)
-                if tf_score==-1: continue
+                if tf_score==-1: tf_score=0  # sideways: counter-trend TF is penalty, not block
                 atr=calculate_atr(klines); atr_pct=(atr/price)*100 if price>0 else 0
                 lev=max(get_smart_leverage(symbol,atr_pct,best_pat[1]),3)
-                if (atr_pct*2.5)*lev<20: continue
+                # Sideways: min 15% leveraged return (smaller moves than trend)
+                if (atr_pct*2.5)*lev<15: continue
                 setup={"coin":coin,"symbol":symbol,"direction":direction,
                        "pattern":best_pat[0],"setup_score":best_pat[1],
                        "leverage":lev,"scan_price":price,
