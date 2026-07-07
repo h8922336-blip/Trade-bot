@@ -15,8 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")      # CryptoPanic API key (optional)
 
 BINANCE_PRICE_URL   = "https://data-api.binance.vision/api/v3/ticker/price"
@@ -37,7 +37,7 @@ COINS = list(dict.fromkeys([
     "THETA","LPT","AKT","SAND","MANA","AXS","GALA","CHZ","APE","GMT",
     "ENJ","PEPE","WIF","JUP","PYTH","JTO","STRK","EIGEN","ETHFI","IO",
     "ONDO","CFX","METIS","ZETA","TRB","PIXEL","PORTAL","STPT","KAS","PIPPIN",
-    "XAU","XAG","ZEC","LIT","TAO","PAXG","YFI","ICP","XMR","QNT",
+    "XAU","XAG","ZEC","BSV","TAO","PAXG","YFI","ICP","LAB","QNT",
     "DASH","NEO","ORCA"
 ]))
 
@@ -76,24 +76,29 @@ last_hourly_time       = time.time()
 last_pnl_update_time   = time.time() + 1800
 last_weekly_report_day = None
 
-SCAN_INTERVAL            = 90      # scan every 90 seconds (was 300 — 3x faster)
+SCAN_INTERVAL            = 90      # scan every 90 seconds
 BATCH_INTERVAL           = 1800
 RIVER_INTERVAL           = 900
 MIN_SETUP_SCORE          = 90
 MIN_PRIMARY_SCORE        = 90
 INSTANT_SIGNAL_THRESHOLD = 97
 MIN_PROFIT_TARGET        = 15.0
+MIN_GRADE_SCORE          = 10     # Grade B+ minimum (10+ pts)
 SIGNAL_EXPIRY_MINUTES    = 120
 INSTANT_EXPIRY_MINUTES   = 30
-DELAY_BETWEEN_COINS      = 0.10    # slightly faster between coins
+DELAY_BETWEEN_COINS      = 0.10
 MAX_SIGNALS_PER_CYCLE    = 3
 MAX_ACTIVE_TRADES        = 5
 ATR_SL_MULTIPLIER        = 2.5
 ATR_TP_MULTIPLIER        = 5.0
+ATR_SL_MIN_PCT           = 1.5    # minimum 1.5% SL distance (uses 1H ATR)
 MAX_DAILY_LOSSES         = 3
 CIRCUIT_BREAKER_MIN_LOSS = -5.0
-SCAN_CANDLE_TF           = "5m"    # 5m candles — 3x faster pattern detection vs 15m
-PRE_SIGNAL_LOOKBACK      = 50      # candles for pre-signal detection
+SCAN_CANDLE_TF           = "5m"
+PRE_SIGNAL_LOOKBACK      = 50
+BTC_MOMENTUM_PAUSE_PCT   = 1.0    # pause BUY signals if BTC drops 1%+ in 15 min
+BTC_MOMENTUM_PAUSE_MIN   = 20     # pause duration in minutes
+RETEST_PULLBACK_PCT      = 0.3    # wait for 0.3% pullback before entry confirmed
 WHALE_TRADE_THRESHOLD    = 500000
 ATR_VOLATILITY_RATIO     = 3.0
 CONSEC_LOSS_SUSPEND      = 5
@@ -2095,7 +2100,127 @@ def cmd_trade_suggestions():
     text+=f"  {YT_BOT}\n  🕐 {get_ist_time()}"
     return text
 
-watch_alerts_sent = {}   # coin -> timestamp of last watch alert
+watch_alerts_sent        = {}   # coin -> timestamp of last watch alert
+btc_momentum_pause_until = None # pause BUY signals after BTC drops fast
+btc_price_15m_ago        = None # BTC price 15 min ago for momentum check
+daily_trend_cache        = {}   # coin -> (trend, timestamp)
+
+def get_daily_trend(symbol):
+    """
+    Change 1: Daily candle confirmation.
+    Returns 'bull', 'bear', or 'neutral' based on daily candles.
+    Caches result for 30 minutes to avoid excessive API calls.
+    """
+    global daily_trend_cache
+    now=get_ist_datetime()
+    if symbol in daily_trend_cache:
+        trend,ts=daily_trend_cache[symbol]
+        if (now-ts).total_seconds()<1800:  # 30 min cache
+            return trend
+    try:
+        klines=get_klines(symbol,"1d",10)
+        if not klines or len(klines)<5: return "neutral"
+        closes=[float(k[4]) for k in klines]
+        price=closes[-1]
+        e7=calculate_ema(closes,7); e21=calculate_ema(closes,min(len(closes),21))
+        if not e7 or not e21: return "neutral"
+        if e7>e21*1.01 and price>e7:   trend="bull"
+        elif e7<e21*0.99 and price<e7: trend="bear"
+        else:                           trend="neutral"
+        daily_trend_cache[symbol]=(trend,now)
+        return trend
+    except Exception: return "neutral"
+
+
+def check_btc_momentum(btc_price):
+    """
+    Change 2: BTC momentum pause.
+    If BTC drops 1%+ in 15 minutes, pause ALL buy signals for 20 minutes.
+    This prevents entering longs right as BTC is crashing.
+    """
+    global btc_momentum_pause_until, btc_price_15m_ago
+    now=get_ist_datetime()
+    # Check if currently paused
+    if btc_momentum_pause_until and now<btc_momentum_pause_until:
+        mins_left=int((btc_momentum_pause_until-now).total_seconds()/60)
+        return True, mins_left  # True = paused
+    # Update 15-min ago price every 15 min
+    if btc_price_15m_ago is None:
+        btc_price_15m_ago=(btc_price,now)
+        return False,0
+    old_price,old_time=btc_price_15m_ago
+    elapsed=(now-old_time).total_seconds()/60
+    if elapsed>=15:
+        drop_pct=((old_price-btc_price)/old_price)*100
+        btc_price_15m_ago=(btc_price,now)
+        if drop_pct>=BTC_MOMENTUM_PAUSE_PCT:
+            btc_momentum_pause_until=now+timedelta(minutes=BTC_MOMENTUM_PAUSE_MIN)
+            logger.info(f"BTC MOMENTUM PAUSE: dropped {drop_pct:.2f}% in 15min — pausing BUY signals for {BTC_MOMENTUM_PAUSE_MIN}min")
+            send_telegram(
+                f"⚠️ <b>BTC MOMENTUM ALERT</b>\n\n"
+                f"BTC dropped <b>{drop_pct:.2f}%</b> in 15 minutes\n"
+                f"Pausing all BUY signals for {BTC_MOMENTUM_PAUSE_MIN} minutes\n"
+                f"🕐 {get_ist_time()}"
+            )
+            return True,BTC_MOMENTUM_PAUSE_MIN
+    return False,0
+
+
+def get_1h_atr_sl(symbol, entry, direction):
+    """
+    Change 3: SL based on 1H ATR with minimum 1.5% distance.
+    Much more reliable than 5m ATR — gives trades room to breathe.
+    """
+    try:
+        klines_1h=get_klines(symbol,"1h",30)
+        if klines_1h and len(klines_1h)>=14:
+            atr_1h=calculate_atr(klines_1h)
+            atr_pct=(atr_1h/entry)*100 if entry>0 else 2.0
+        else:
+            atr_pct=2.0  # fallback 2%
+        # Enforce minimum 1.5% SL distance
+        sl_pct=max(atr_pct*1.5, ATR_SL_MIN_PCT)
+        if direction=="BUY":
+            return entry*(1-sl_pct/100)
+        else:
+            return entry*(1+sl_pct/100)
+    except Exception:
+        if direction=="BUY": return entry*0.985
+        else:                return entry*1.015
+
+
+def is_retest_confirmed(symbol, direction, entry_price, klines):
+    """
+    Change 4: Retest entry confirmation.
+    After pattern fires, check if price pulled back 0.3% from recent high/low.
+    This filters fake breakouts — real breakouts always retest.
+    """
+    try:
+        if len(klines)<5: return True  # not enough data, allow through
+        closes=[float(k[4]) for k in klines]
+        recent_high=max([float(k[2]) for k in klines[-5:]])
+        recent_low=min([float(k[3]) for k in klines[-5:]])
+        current=closes[-1]
+        if direction=="BUY":
+            # For buy: price should have pulled back at least 0.3% from recent high
+            pullback=((recent_high-current)/recent_high)*100
+            if pullback>=RETEST_PULLBACK_PCT:
+                logger.info(f"{symbol} retest confirmed — pulled back {pullback:.2f}% from high")
+                return True
+            else:
+                logger.info(f"{symbol} retest NOT confirmed — only {pullback:.2f}% pullback (need {RETEST_PULLBACK_PCT}%)")
+                return False
+        else:  # SELL
+            # For sell: price should have bounced at least 0.3% from recent low
+            bounce=((current-recent_low)/recent_low)*100
+            if bounce>=RETEST_PULLBACK_PCT:
+                logger.info(f"{symbol} retest confirmed — bounced {bounce:.2f}% from low")
+                return True
+            else:
+                logger.info(f"{symbol} retest NOT confirmed — only {bounce:.2f}% bounce (need {RETEST_PULLBACK_PCT}%)")
+                return False
+    except Exception: return True  # on error, allow through
+
 
 def check_and_send_watch_alert(coin, symbol, price, klines, direction):
     """Pre-signal Watch Alert — fires 5-15 min before actual signal."""
@@ -2318,7 +2443,8 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
         zone_ok, adx_val, ms["bos"], ms["bias"] in ("bullish","bearish")
     )
     lev=get_smart_leverage(setup["symbol"],atr_pct,setup["setup_score"],grade)
-    sl=get_structure_sl(klines_15m,setup["direction"],entry,atr_1h)
+    # Change 3: SL from 1H ATR with minimum 1.5% distance
+    sl=get_1h_atr_sl(setup["symbol"],entry,setup["direction"])
     tp=entry+atr_1h*ATR_TP_MULTIPLIER if setup["direction"]=="BUY" else entry-atr_1h*ATR_TP_MULTIPLIER
     profit_target=(abs(tp-entry)/entry)*100*lev
     if profit_target<MIN_PROFIT_TARGET:
@@ -2337,142 +2463,112 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     mom=(closes[-1]-closes[-3])/closes[-3]*100
     rsi_val=calculate_rsi(closes)
     # grade, pts, breakdown already computed above (before leverage)
+    # GRADE FILTER — only send Grade B+ (10+ pts)
+    if pts < MIN_GRADE_SCORE:
+        logger.info(f"{coin} rejected — grade score {pts}/{max_pts} below minimum {MIN_GRADE_SCORE}")
+        return False
+
     pos_size=get_position_size_pct(grade)
     sl_pct=abs(entry-sl)/entry*100; tp_pct=abs(tp-entry)/entry*100
     rr_ratio=tp_pct/sl_pct if sl_pct>0 else 0
-    tf_map={3:"4h + 1h  ✅✅",2:"4h Only  ✅",1:"1h Only  ⚡",0:"Counter  ⚠️"}
-    tf_label=tf_map.get(tf_score,"N/A")
+
     is_sideways_signal=setup.get("sideways_mode",False)
-    if is_sideways_signal: sig_type="🔀 SIDEWAYS SIGNAL"; cond_em="Sideways ➡️"
-    elif is_instant: sig_type="⚡ INSTANT SIGNAL"; cond_em={"bull":"Bullish 📈","bear":"Bearish 📉","sideways":"Sideways ➡️"}.get(market_condition,"")
-    elif is_river:   sig_type="🌊 RIVER SIGNAL";   cond_em={"bull":"Bullish 📈","bear":"Bearish 📉","sideways":"Sideways ➡️"}.get(market_condition,"")
-    else:            sig_type="🔥 VERIFIED SETUP"; cond_em={"bull":"Bullish 📈","bear":"Bearish 📉","sideways":"Sideways ➡️"}.get(market_condition,"")
-    dir_arrow="🟢 LONG  ▲" if setup["direction"]=="BUY" else "🔴 SHORT ▼"
+    if is_sideways_signal: sig_type="🔀 SIDEWAYS SIGNAL"
+    elif is_instant:       sig_type="⚡ INSTANT SIGNAL"
+    elif is_river:         sig_type="🌊 RIVER SIGNAL"
+    else:                  sig_type="🔥 SIGNAL"
+
+    dir_arrow="🟢 LONG ▲" if setup["direction"]=="BUY" else "🔴 SHORT ▼"
     grade_em="🏆" if "A+" in grade else "🍀" if " A" in grade else "🥈" if "B" in grade else "🥉"
-    cond_icon="📈" if market_condition=="bull" else "📉" if market_condition=="bear" else "➡️"
+    cond_em={"bull":"Bullish 📈","bear":"Bearish 📉","sideways":"Sideways ➡️"}.get(market_condition,"")
 
-    # ASCII chart — visual price diagram
-    def ascii_chart(entry, tp, sl, direction):
-        levels=sorted([tp,entry,sl],reverse=True)
-        chart_h=8
-        p_max=max(tp,entry,sl)*1.002; p_min=min(tp,entry,sl)*0.998
-        p_range=p_max-p_min if p_max>p_min else 1
-        def pos(p): return int((p_max-p)/p_range*(chart_h-1))
-        tp_row=pos(tp); entry_row=pos(entry); sl_row=pos(sl)
-        lines=[]
-        for r in range(chart_h):
-            bar="│"
-            if r==tp_row:    bar="🟢"; label=f" TP  {format_price(tp)}"
-            elif r==entry_row: bar="🔵"; label=f" ENT {format_price(entry)}"
-            elif r==sl_row:  bar="🔴"; label=f" SL  {format_price(sl)}"
-            else: label=""
-            lines.append(f"  {bar}{label}")
-        return "\n".join(lines)
-
-    chart=ascii_chart(entry,tp,sl,setup["direction"])
-
-    # Score bars
-    filled=min(int(setup["setup_score"]/10),10)
-    score_bar="█"*filled+"░"*(10-filled)
-    grade_filled=min(int(pts/max_pts*10),10)
-    grade_bar="█"*grade_filled+"░"*(10-grade_filled)
-
-    # Funding rate label
-    funding_label="✅ Aligned" if funding_ok else "⚠️ Against"
-    # Get funding rate value
+    # Funding rate
+    funding_label="✅" if funding_ok else "⚠️"
     try:
         fr=requests.get(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={setup['symbol']}",timeout=5)
         fr_val=float(fr.json().get("lastFundingRate",0))*100 if fr.status_code==200 else 0
         funding_detail=f"{fr_val:+.4f}%"
     except Exception: funding_detail="N/A"
 
-    msg  = f"{'⚡' if is_instant else '🔀' if is_sideways_signal else '🔥'} <b>{sig_type}</b>\n"
-    msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    msg += f"  🪙 <b>{coin}</b>  {dir_arrow}  🔧 <b>{lev}x Leverage</b>\n"
-    msg += f"  {grade_em} <b>{grade}</b>  •  {pts}/{max_pts} pts\n"
-    msg += f"  [{grade_bar}]\n"
-    msg += f"  📊 Score: <b>{setup['setup_score']:.0f}/100</b>  [{score_bar}]\n"
-    msg += f"  {cond_icon} Market: <b>{cond_em}</b>\n\n"
-
-    # ASCII price chart
-    msg += f"  ┌── PRICE MAP ────────────────┐\n"
-    msg += chart+"\n"
-    msg += f"  └─────────────────────────────┘\n\n"
-
-    msg += f"  ┌── TRADE LEVELS ─────────────┐\n"
-    msg += f"  │  💰 Entry      <code>{format_price(entry)}</code>\n"
-    msg += f"  │  🎯 Target     <code>{format_price(tp)}</code>  <i>+{tp_pct:.2f}%</i>\n"
-    msg += f"  │  🛑 Stop       <code>{format_price(sl)}</code>  <i>-{sl_pct:.2f}%</i>\n"
-    res_dist=abs(res-entry)/entry*100; sup_dist=abs(entry-sup)/entry*100
-
-    def _break_prob(dist_pct, favourable_dir):
-        dist_score = max(0, 50 - dist_pct*8)
-        mom_score = mom * 3 if favourable_dir else -mom * 3
-        adx_score = (adx_val - 20) * 0.6
-        vol_score = 8 if vol_strength>=1.5 else -4
-        rsi_score = (rsi_15m - 50) * 0.4 if favourable_dir else (50 - rsi_15m) * 0.4
-        prob = 35 + dist_score*0.4 + mom_score + adx_score + vol_score + rsi_score
-        return max(5, min(95, prob))
-
-    res_break_pct = _break_prob(res_dist, favourable_dir=True)   # breaking resistance = upward
-    sup_break_pct = _break_prob(sup_dist, favourable_dir=False)  # breaking support = downward
-    msg += f"  │  🚧 Resistance <code>{format_price(res)}</code>  <i>{res_dist:.2f}% away</i>  •  Break: <b>{res_break_pct:.0f}%</b>\n"
-    msg += f"  │  🛡️ Support    <code>{format_price(sup)}</code>  <i>{sup_dist:.2f}% away</i>  •  Break: <b>{sup_break_pct:.0f}%</b>\n"
-    msg += f"  └─────────────────────────────┘\n\n"
-
-    msg += f"  📈 Max Profit : <b>+{profit_target:.1f}%</b>\n"
-    msg += f"  ⚖️  Risk/Reward: <b>1 : {rr_ratio:.1f}</b>\n"
-    msg += f"  💼 Position   : <b>{pos_size:.0f}% of capital</b>\n\n"
-
-    msg += f"  ┌── ALIGNMENT SCORECARD ──────┐\n"
-    for name,p in breakdown:
-        bar="●" if p>0 else "○"
-        pts_txt=f"+{p}pt{'s' if p!=1 else ''}" if p>0 else "  —  "
-        msg+=f"  │  {bar} {name:<22} {pts_txt}\n"
-    msg += f"  │                              \n"
-    msg += f"  │  Total: <b>{pts} / {max_pts} points</b>\n"
-    msg += f"  └─────────────────────────────┘\n\n"
-
-    msg += f"  ┌── CONFIRMATIONS ────────────┐\n"
-    msg += f"  │  📡 TF   : {tf_label}\n"
-    st_icon="✅✅" if st_ok else "⚠️"
-    msg += f"  │  🌀 ST   : {st_icon}  VWAP: {'✅' if vwap_ok else '⚠️'}\n"
-    msg += f"  │  📦 Vol  : {'✅' if vol_strength>=1.5 else '⚠️'} {vol_strength:.1f}x avg\n"
-    msg += f"  │  📌 Pat  : {setup['pattern']}\n"
-    msg += f"  │  📊 RSI  : {rsi_val:.1f}   ADX: {adx_val:.1f}   Mom: {mom:+.2f}%\n"
-    if zone_ok: msg += f"  │  📍 Zone : ✅ {'Demand' if setup['direction']=='BUY' else 'Supply'}\n"
-    if div=="BULLISH_DIV":   msg += f"  │  🔀 Div  : 🟢 Bullish RSI Divergence\n"
-    elif div=="BEARISH_DIV": msg += f"  │  🔀 Div  : 🔴 Bearish RSI Divergence\n"
-    bos_str = "  🔥BOS" if ms["bos"] else ""
-    ms_bias_em="📈" if ms["bias"]=="bullish" else "📉" if ms["bias"]=="bearish" else "➡️"
-    msg += f"  │  🏗️ MS   : {ms_bias_em} {ms['bias'].upper()}{bos_str}\n"
-    msg += f"  │  💸 Fund : {funding_label}  {funding_detail}\n"
-    msg += f"  │  📊 Vol  : {vol_strength:.1f}x avg\n"
-    msg += f"  │  🕐 RSI  : 15m:{rsi_15m:.0f}  1h:{rsi_1h:.0f}  4h:{rsi_4h:.0f}\n"
-    msg += f"  └─────────────────────────────┘\n\n"
-
-    # Proportional milestone plan — scales with the ACTUAL profit target (not fixed 35%)
-    m1_pnl = profit_target*0.30; m2_pnl = profit_target*0.60; m3_pnl = profit_target*0.85
-    def _price_at_pnl(target_pnl):
-        move = entry * (target_pnl/100) / lev
+    # Milestone prices
+    m1_pnl=profit_target*0.30; m2_pnl=profit_target*0.60; m3_pnl=profit_target*0.85
+    def _price_at_pnl(pnl_pct):
+        move=entry*(pnl_pct/100)/lev
         return entry+move if setup["direction"]=="BUY" else entry-move
-    def _sl_lock_price(target_pnl, lock_ratio):
-        # SL locks in lock_ratio of the gain reached at target_pnl
-        gain_price = abs(_price_at_pnl(target_pnl) - entry)
-        locked = gain_price * lock_ratio
-        return entry+locked if setup["direction"]=="BUY" else entry-locked
-    ms1=format_price(_sl_lock_price(m1_pnl, 0.0))   # at 30% of target → SL to breakeven
-    ms2=format_price(_sl_lock_price(m2_pnl, 0.5))   # at 60% of target → lock half the gain so far
-    ms3=format_price(_sl_lock_price(m3_pnl, 0.8))   # at 85% of target → lock 80% of gain
-    msg += f"  ┌── MILESTONE PLAN ───────────┐\n"
-    msg += f"  │  🎯 +{m1_pnl:.1f}%  → SL to <code>{ms1}</code>  <i>(breakeven)</i>\n"
-    msg += f"  │  🔥 +{m2_pnl:.1f}%  → SL to <code>{ms2}</code>  <i>(lock 50%)</i>\n"
-    msg += f"  │  🚀 +{m3_pnl:.1f}%  → SL to <code>{ms3}</code>  <i>(lock 80%)</i>\n"
-    msg += f"  │  🏁 Final Target: +{profit_target:.1f}%\n"
-    msg += f"  └─────────────────────────────┘\n\n"
+    def _sl_lock(pnl_pct,lock):
+        gain=abs(_price_at_pnl(pnl_pct)-entry)*lock
+        return entry+gain if setup["direction"]=="BUY" else entry-gain
+    ms1=format_price(_sl_lock(m1_pnl,0.0))
+    ms2=format_price(_sl_lock(m2_pnl,0.5))
+    ms3=format_price(_sl_lock(m3_pnl,0.8))
 
-    msg += f"  ⏳ ETA: ~{eta} min  •  ⏰ Exp: {expiry_str}\n"
-    msg += f"  🕐 {get_ist_time()}"
+    # Resistance / support break probability
+    res_dist=abs(res-entry)/entry*100; sup_dist=abs(entry-sup)/entry*100
+    def _break_prob(dist_pct,fav):
+        prob=35+max(0,50-dist_pct*8)*0.4+(mom*3 if fav else -mom*3)+(adx_val-20)*0.6+(8 if vol_strength>=1.5 else -4)+((rsi_15m-50)*0.4 if fav else (50-rsi_15m)*0.4)
+        return max(5,min(95,prob))
+    res_brk=_break_prob(res_dist,True); sup_brk=_break_prob(sup_dist,False)
+
+    # Divergence
+    div_line=""
+    if div=="BULLISH_DIV":   div_line="🟢 Bullish RSI Div"
+    elif div=="BEARISH_DIV": div_line="🔴 Bearish RSI Div"
+
+    # Clean score dots (no block chars)
+    def dot_bar(val,mx,dots=10):
+        filled=round(val/mx*dots)
+        return "●"*filled+"○"*(dots-filled)
+
+    bos_txt=" 🔥BOS" if ms["bos"] else ""
+    st_txt="✅" if st_ok else "—"
+    vwap_txt="✅" if vwap_ok else "—"
+    zone_txt=f"✅ {'Demand' if setup['direction']=='BUY' else 'Supply'}" if zone_ok else "—"
+
+    # ══ CLEAN BEAUTIFUL MESSAGE ══
+    daily_trend=setup.get("daily_trend","neutral")
+    dt_em="📈" if daily_trend=="bull" else "📉" if daily_trend=="bear" else "➡️"
+    msg =(f"{'⚡' if is_instant else '🔀' if is_sideways_signal else '🔥'} <b>{sig_type}</b>\n"
+          f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+          f"🪙 <b>{coin}</b>  {dir_arrow}  刀 <b>{lev}x</b>\n"
+          f"{grade_em} <b>{grade}</b>  {dot_bar(pts,max_pts)}  {pts}/{max_pts}pts\n"
+          f"📊 Score <b>{setup['setup_score']:.0f}</b>  {dot_bar(setup['setup_score'],100)}  {cond_em}\n"
+          f"📅 Daily: {dt_em} {daily_trend.upper()}  •  📌 {setup['pattern']}\n\n"
+
+          f"━━━ LEVELS ━━━━━━━━━━━━━━━━━━━━\n"
+          f"💰 Entry   <code>{format_price(entry)}</code>\n"
+          f"🎯 Target  <code>{format_price(tp)}</code>  <i>+{tp_pct:.2f}%</i>\n"
+          f"🛑 Stop    <code>{format_price(sl)}</code>  <i>-{sl_pct:.2f}%</i>\n"
+          f"🚧 Resist  <code>{format_price(res)}</code>  {res_dist:.1f}% away  brk {res_brk:.0f}%\n"
+          f"🛡 Support <code>{format_price(sup)}</code>  {sup_dist:.1f}% away  brk {sup_brk:.0f}%\n\n"
+
+          f"📈 Max  <b>+{profit_target:.1f}%</b>  ⚖️ RR 1:{rr_ratio:.1f}  💼 {pos_size:.0f}% capital\n\n"
+
+          f"━━━ SCORECARD ━━━━━━━━━━━━━━━━━\n")
+
+    for nm,p in breakdown:
+        icon="✅" if p>0 else "○"
+        pts_txt=f"+{p}pt{'s' if p!=1 else ''}" if p>0 else ""
+        msg+=f"{icon} {nm}  {pts_txt}\n"
+
+    msg+=(f"\n━━━ CONFIRMATIONS ━━━━━━━━━━━━━\n"
+          f"📡 TF:{tf_label}  🌀 ST:{st_txt}  💧 VWAP:{vwap_txt}\n"
+          f"📍 Zone:{zone_txt}  💸 Fund:{funding_label} {funding_detail}\n"
+          f"📊 RSI  15m:<b>{rsi_15m:.0f}</b>  1h:<b>{rsi_1h:.0f}</b>  4h:<b>{rsi_4h:.0f}</b>\n"
+          f"💪 ADX:<b>{adx_val:.0f}</b>  Vol:<b>{vol_strength:.1f}x</b>  Mom:{mom:+.2f}%\n"
+          f"🏗️ MS:{ms['bias'].upper()}{bos_txt}")
+
+    if div_line: msg+=f"  🔀 {div_line}"
+    msg+="\n\n"
+
+    msg+=(f"━━━ MILESTONES ━━━━━━━━━━━━━━━━\n"
+          f"⛩ +{m1_pnl:.1f}%  SL → <code>{ms1}</code>  breakeven\n"
+          f"🔥 +{m2_pnl:.1f}%  SL → <code>{ms2}</code>  lock 50%\n"
+          f"🗻 +{m3_pnl:.1f}%  SL → <code>{ms3}</code>  lock 80%\n"
+          f"🏁 Final: <b>+{profit_target:.1f}%</b>\n\n"
+
+          f"⏳ ETA ~{eta}min  •  ⏰ Exp {expiry_str}\n"
+          f"🕐 {get_ist_time()}")
     setup.update({"entry":entry,"sl":sl,"tp":tp,"timestamp":get_ist_datetime(),
                   "expires_at":expiry_time,"reversal_alerted":False,"breakeven_sent":False,
                   "partial_tp_taken":False,"milestones_sent":[],"tf_score":tf_score,
@@ -3066,55 +3162,62 @@ def scan_river(now,market_condition):
     except Exception as e: logger.error(f"River: {e}",exc_info=True)
 
 def scan_coins(btc_trend,fng,market_condition):
-    btc_crashing=is_btc_crashing(); signals_this_cycle=0
+    global btc_price_15m_ago
+    btc_crashing=is_btc_crashing()
+    btc_price_now=get_price("BTCUSDT")
     is_sideways_market=(market_condition=="sideways")
+    btc_paused,pause_mins=check_btc_momentum(btc_price_now) if btc_price_now else (False,0)
+    signals_this_cycle=0
     if is_sideways_market:
         logger.info("Market is SIDEWAYS — using range/mean-reversion signals only")
+
     for coin in COINS:
         if signals_this_cycle>=MAX_SIGNALS_PER_CYCLE: break
         try:
             if coin in coin_cooldowns:
-                if get_ist_datetime()<coin_cooldowns[coin]:
-                    logger.info(f"Skip {coin} - cooldown"); continue
+                if get_ist_datetime()<coin_cooldowns[coin]: continue
                 else: del coin_cooldowns[coin]
             symbol=coin+"USDT"; price=get_price(symbol)
             klines=get_klines(symbol,SCAN_CANDLE_TF)
             if not price or not klines: continue
 
+            # Change 1: Daily trend confirmation
+            daily_trend=get_daily_trend(symbol)
             coin_sideways=is_market_sideways(symbol,klines)
 
             if is_sideways_market or coin_sideways:
-                # Use sideways-specific signals (range/BB/RSI reversion)
                 found=get_sideways_signals(symbol,klines,price)
                 if not found: continue
-                # Lower score threshold for sideways — patterns are simpler
                 best_pat=max(found,key=lambda x:x[1])
                 if best_pat[1]<82: continue
                 direction=best_pat[2]
+                # Block against daily trend
+                if daily_trend=="bull" and direction=="SELL":
+                    logger.info(f"Skip {coin} sideways SELL — daily BULL"); continue
+                if daily_trend=="bear" and direction=="BUY":
+                    logger.info(f"Skip {coin} sideways BUY — daily BEAR"); continue
+                # BTC momentum pause
+                if btc_paused and direction=="BUY":
+                    logger.info(f"Skip {coin} BUY — BTC pause {pause_mins}min"); continue
                 if btc_crashing and direction=="BUY": continue
+                # Retest confirmation
+                if not is_retest_confirmed(symbol,direction,price,klines): continue
                 tf_score=get_timeframe_score(symbol,direction)
                 if tf_score==-1: continue
                 atr=calculate_atr(klines); atr_pct=(atr/price)*100 if price>0 else 0
                 lev=max(get_smart_leverage(symbol,atr_pct,best_pat[1]),3)
-                # Sideways TP: tighter — only 4-6% price move but enforces 20% leveraged
-                min_price_move=(20/lev)  # price% needed for 20% leveraged
-                tp_pct=max(min_price_move, min(atr_pct*2.5, 8.0))
-                # Enforce min 20% leveraged TP
-                if tp_pct*lev < 20:
-                    logger.info(f"Skip {coin} sideways — TP only {tp_pct*lev:.1f}% leveraged (need 20%)")
-                    continue
+                if (atr_pct*2.5)*lev<20: continue
                 setup={"coin":coin,"symbol":symbol,"direction":direction,
                        "pattern":best_pat[0],"setup_score":best_pat[1],
                        "leverage":lev,"scan_price":price,
                        "market_condition":"sideways","tf_score":tf_score,
-                       "sideways_mode":True}
+                       "sideways_mode":True,"daily_trend":daily_trend}
                 if (coin not in active_trades and coin not in pending_signals
                         and len(active_trades)<MAX_ACTIVE_TRADES):
-                    logger.info(f"SIDEWAYS SIGNAL: {coin}|{direction}|Score:{best_pat[1]}|{best_pat[0]}")
+                    logger.info(f"SIDEWAYS SIGNAL: {coin}|{direction}|{best_pat[0]}|daily:{daily_trend}")
                     if format_and_send(setup,coin,is_instant=False,market_condition="sideways"):
                         signals_this_cycle+=1
             else:
-                # Normal trend-following signals
                 found=detect_patterns(symbol,klines,price,btc_trend)
                 if not found: continue
                 scored=get_all_pattern_scores(found,market_condition)
@@ -3129,6 +3232,14 @@ def scan_coins(btc_trend,fng,market_condition):
                     if is_pattern_blacklisted(primary): continue
                     if is_pattern_suspended(primary): continue
                     if not is_sentiment_valid(direction,fng): continue
+                    # Change 1: Daily trend filter
+                    if daily_trend=="bull" and direction=="SELL":
+                        logger.info(f"Skip {coin} SELL — daily BULL"); continue
+                    if daily_trend=="bear" and direction=="BUY":
+                        logger.info(f"Skip {coin} BUY — daily BEAR"); continue
+                    # Change 2: BTC momentum pause
+                    if btc_paused and direction=="BUY":
+                        logger.info(f"Skip {coin} BUY — BTC pause"); continue
                     if btc_crashing and direction=="BUY": continue
                     if coin in BTC_CORRELATED and too_many_correlated_active(): continue
                     tf_score=get_timeframe_score(symbol,direction)
@@ -3137,30 +3248,27 @@ def scan_coins(btc_trend,fng,market_condition):
                     pt=primary+(" + "+" + ".join(extras) if extras else "")
                     confirm_bonus=min(len(dir_pats)*0.5,3.0)
                     score=min(adj_score+confirm_bonus,99)
-                    # Watch alert: score building but not yet at threshold
                     if 80<=score<MIN_SETUP_SCORE and coin not in active_trades and coin not in pending_signals:
                         check_and_send_watch_alert(coin,symbol,price,klines,direction)
                     if score<MIN_SETUP_SCORE: continue
+                    # Change 4: Retest confirmation
+                    if not is_retest_confirmed(symbol,direction,price,klines): continue
                     atr=calculate_atr(klines); atr_pct=(atr/price)*100 if price>0 else 0
                     lev=get_smart_leverage(symbol,atr_pct,score)
-                    # ENFORCE MIN 20% LEVERAGED TP
-                    # Check if ATR-based TP gives at least 20% leveraged return
-                    projected_tp_pct=atr_pct*ATR_TP_MULTIPLIER
-                    if projected_tp_pct*lev<20:
-                        logger.info(f"Skip {coin} — TP only {projected_tp_pct*lev:.1f}% leveraged (need 20%)")
-                        continue
+                    if atr_pct*ATR_TP_MULTIPLIER*lev<20: continue
                     setup={"coin":coin,"symbol":symbol,"direction":direction,"pattern":pt,
                            "setup_score":score,"leverage":lev,"scan_price":price,
                            "market_condition":market_condition,"tf_score":tf_score,
-                           "sideways_mode":False}
+                           "sideways_mode":False,"daily_trend":daily_trend}
                     if (coin not in active_trades and coin not in pending_signals
                             and len(active_trades)<MAX_ACTIVE_TRADES):
                         is_inst=score>=INSTANT_SIGNAL_THRESHOLD
-                        logger.info(f"{'INSTANT' if is_inst else 'SIGNAL'}: {coin}|{direction}|Score:{score:.1f}|{primary}")
+                        logger.info(f"SIGNAL: {coin}|{direction}|{score:.1f}|{primary}|daily:{daily_trend}")
                         if format_and_send(setup,coin,is_instant=is_inst,market_condition=market_condition):
                             signal_sent=True; signals_this_cycle+=1
         except Exception as e: logger.error(f"Scan {coin}: {e}",exc_info=True)
         time.sleep(DELAY_BETWEEN_COINS)
+
 
 def main():
     global last_batch_time,last_river_time,last_hourly_time,last_pnl_update_time,last_weekly_report_day
