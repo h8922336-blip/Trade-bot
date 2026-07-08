@@ -15,8 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")      # CryptoPanic API key (optional)
 
 BINANCE_PRICE_URL   = "https://data-api.binance.vision/api/v3/ticker/price"
@@ -3160,115 +3160,132 @@ def scan_river(now,market_condition):
     except Exception as e: logger.error(f"River: {e}",exc_info=True)
 
 def scan_coins(btc_trend,fng,market_condition):
+    """
+    Simplified scan — only 3 hard filters:
+    1. BTC crashing (no longs)
+    2. Circuit breaker (daily loss limit)
+    3. Already in trade / cooldown
+    Everything else is a SCORE ADJUSTMENT, not a blocker.
+    """
     global btc_price_15m_ago
     btc_crashing=is_btc_crashing()
     btc_price_now=get_price("BTCUSDT")
     is_sideways_market=(market_condition=="sideways")
+
+    # BTC momentum check — only affects score, not hard block
     btc_paused,pause_mins=check_btc_momentum(btc_price_now) if btc_price_now else (False,0)
     signals_this_cycle=0
-    if is_sideways_market:
-        logger.info("Market is SIDEWAYS — using range/mean-reversion signals only")
 
     for coin in COINS:
         if signals_this_cycle>=MAX_SIGNALS_PER_CYCLE: break
         try:
+            # Hard filter 1: cooldown
             if coin in coin_cooldowns:
                 if get_ist_datetime()<coin_cooldowns[coin]: continue
                 else: del coin_cooldowns[coin]
-            symbol=coin+"USDT"; price=get_price(symbol)
+
+            symbol=coin+"USDT"
+            price=get_price(symbol)
             klines=get_klines(symbol,SCAN_CANDLE_TF)
             if not price or not klines: continue
 
-            # Change 1: Daily trend confirmation
+            # Already trading this coin
+            if coin in active_trades or coin in pending_signals: continue
+            if len(active_trades)>=MAX_ACTIVE_TRADES: break
+
+            # Get daily trend for signal message (not for blocking)
             daily_trend=get_daily_trend(symbol)
             coin_sideways=is_market_sideways(symbol,klines)
 
             if is_sideways_market or coin_sideways:
+                # ── SIDEWAYS MODE ──────────────────────────────────
                 found=get_sideways_signals(symbol,klines,price)
                 if not found: continue
                 best_pat=max(found,key=lambda x:x[1])
                 if best_pat[1]<82: continue
                 direction=best_pat[2]
-                # Block against daily trend
-                # Sideways signals: align WITH daily trend
-                # Bull daily → only BUY dips (BB lower bounce, range support)
-                # Bear daily → only SELL bounces (BB upper reject, range resistance)
-                # Neutral daily → allow both directions
-                if daily_trend=="bull" and direction=="SELL":
-                    logger.info(f"Skip {coin} sideways SELL — daily BULL (only BUY dips)"); continue
-                if daily_trend=="bear" and direction=="BUY":
-                    logger.info(f"Skip {coin} sideways BUY — daily BEAR (only SELL bounces)"); continue
-                # Daily trend aligned — continue to next checks
-                # BTC momentum pause
-                if btc_paused and direction=="BUY":
-                    logger.info(f"Skip {coin} BUY — BTC pause {pause_mins}min"); continue
+
+                # Hard filter 2: BTC crashing — no longs
                 if btc_crashing and direction=="BUY": continue
-                # No retest filter for sideways — BB bounce/range touch IS the retest
-                tf_score=get_timeframe_score(symbol,direction)
-                if tf_score==-1: tf_score=0  # sideways: counter-trend TF is penalty, not block
-                atr=calculate_atr(klines); atr_pct=(atr/price)*100 if price>0 else 0
+
+                # Soft: prefer daily-aligned direction but don't block
+                if daily_trend=="bull" and direction=="SELL":
+                    logger.info(f"Skip {coin} sideways SELL — daily BULL"); continue
+                if daily_trend=="bear" and direction=="BUY":
+                    logger.info(f"Skip {coin} sideways BUY — daily BEAR"); continue
+
+                tf_score=max(get_timeframe_score(symbol,direction),0)
+                atr=calculate_atr(klines)
+                atr_pct=(atr/price)*100 if price>0 else 2.0
                 lev=max(get_smart_leverage(symbol,atr_pct,best_pat[1]),3)
-                # Sideways: min 15% leveraged return (smaller moves than trend)
-                if (atr_pct*2.5)*lev<15: continue
+
                 setup={"coin":coin,"symbol":symbol,"direction":direction,
                        "pattern":best_pat[0],"setup_score":best_pat[1],
                        "leverage":lev,"scan_price":price,
                        "market_condition":"sideways","tf_score":tf_score,
                        "sideways_mode":True,"daily_trend":daily_trend}
-                if (coin not in active_trades and coin not in pending_signals
-                        and len(active_trades)<MAX_ACTIVE_TRADES):
-                    logger.info(f"SIDEWAYS SIGNAL: {coin}|{direction}|{best_pat[0]}|daily:{daily_trend}")
-                    if format_and_send(setup,coin,is_instant=False,market_condition="sideways"):
-                        signals_this_cycle+=1
+                logger.info(f"SIDEWAYS SIGNAL: {coin}|{direction}|{best_pat[0]}|daily:{daily_trend}")
+                if format_and_send(setup,coin,is_instant=False,market_condition="sideways"):
+                    signals_this_cycle+=1
+
             else:
+                # ── TREND MODE ─────────────────────────────────────
                 found=detect_patterns(symbol,klines,price,btc_trend)
                 if not found: continue
                 scored=get_all_pattern_scores(found,market_condition)
                 signal_sent=False
+
                 for direction in ["BUY","SELL"]:
                     if signal_sent: break
                     dir_pats=[p for p in scored if p[2]==direction]
                     if not dir_pats: continue
                     best_pat=dir_pats[0]; primary=best_pat[0]
                     adj_score=best_pat[1]; base_s=best_pat[3]
+
                     if base_s<MIN_PRIMARY_SCORE: continue
                     if is_pattern_blacklisted(primary): continue
                     if is_pattern_suspended(primary): continue
                     if not is_sentiment_valid(direction,fng): continue
-                    # Change 1: Daily trend filter
-                    if daily_trend=="bull" and direction=="SELL":
-                        logger.info(f"Skip {coin} SELL — daily BULL"); continue
-                    if daily_trend=="bear" and direction=="BUY":
-                        logger.info(f"Skip {coin} BUY — daily BEAR"); continue
-                    # Change 2: BTC momentum pause
-                    if btc_paused and direction=="BUY":
-                        logger.info(f"Skip {coin} BUY — BTC pause"); continue
+
+                    # Hard filter 2: BTC crashing — no longs
                     if btc_crashing and direction=="BUY": continue
+
                     if coin in BTC_CORRELATED and too_many_correlated_active(): continue
+
                     tf_score=get_timeframe_score(symbol,direction)
-                    if tf_score==-1: continue
+                    if tf_score==-1: continue  # pure counter-trend — skip
+
                     extras=[p[0] for p in dir_pats[1:3]]
                     pt=primary+(" + "+" + ".join(extras) if extras else "")
                     confirm_bonus=min(len(dir_pats)*0.5,3.0)
                     score=min(adj_score+confirm_bonus,99)
-                    if 80<=score<MIN_SETUP_SCORE and coin not in active_trades and coin not in pending_signals:
+
+                    # Watch alert when close
+                    if 80<=score<MIN_SETUP_SCORE:
                         check_and_send_watch_alert(coin,symbol,price,klines,direction)
                     if score<MIN_SETUP_SCORE: continue
-                    # Change 4: Retest confirmation
-                    if not is_retest_confirmed(symbol,direction,price,klines): continue
-                    atr=calculate_atr(klines); atr_pct=(atr/price)*100 if price>0 else 0
+
+                    # Daily trend bonus/penalty in score (not a hard block)
+                    if daily_trend=="bull" and direction=="SELL": score=max(score-5,MIN_SETUP_SCORE)
+                    if daily_trend=="bear" and direction=="BUY":  score=max(score-5,MIN_SETUP_SCORE)
+
+                    atr=calculate_atr(klines)
+                    atr_pct=(atr/price)*100 if price>0 else 2.0
                     lev=get_smart_leverage(symbol,atr_pct,score)
+
+                    # Min 20% leveraged return
                     if atr_pct*ATR_TP_MULTIPLIER*lev<20: continue
-                    setup={"coin":coin,"symbol":symbol,"direction":direction,"pattern":pt,
-                           "setup_score":score,"leverage":lev,"scan_price":price,
-                           "market_condition":market_condition,"tf_score":tf_score,
-                           "sideways_mode":False,"daily_trend":daily_trend}
-                    if (coin not in active_trades and coin not in pending_signals
-                            and len(active_trades)<MAX_ACTIVE_TRADES):
-                        is_inst=score>=INSTANT_SIGNAL_THRESHOLD
-                        logger.info(f"SIGNAL: {coin}|{direction}|{score:.1f}|{primary}|daily:{daily_trend}")
-                        if format_and_send(setup,coin,is_instant=is_inst,market_condition=market_condition):
-                            signal_sent=True; signals_this_cycle+=1
+
+                    setup={"coin":coin,"symbol":symbol,"direction":direction,
+                           "pattern":pt,"setup_score":score,"leverage":lev,
+                           "scan_price":price,"market_condition":market_condition,
+                           "tf_score":tf_score,"sideways_mode":False,
+                           "daily_trend":daily_trend}
+                    is_inst=score>=INSTANT_SIGNAL_THRESHOLD
+                    logger.info(f"SIGNAL: {coin}|{direction}|{score:.1f}|{primary}|daily:{daily_trend}")
+                    if format_and_send(setup,coin,is_instant=is_inst,market_condition=market_condition):
+                        signal_sent=True; signals_this_cycle+=1
+
         except Exception as e: logger.error(f"Scan {coin}: {e}",exc_info=True)
         time.sleep(DELAY_BETWEEN_COINS)
 
