@@ -15,8 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID           = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID           = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY      = os.getenv("NEWS_API_KEY", "")       # CryptoPanic API key (optional)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")  # from console.anthropic.com
 
@@ -2727,6 +2727,8 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
         pts_txt=f"+{p}pt{'s' if p!=1 else ''}" if p>0 else ""
         msg+=f"{icon} {nm}  {pts_txt}\n"
 
+    tf_map={3:"4h+1h ✅✅",2:"4h ✅",1:"1h ⚡",0:"Weak ⚠️",-1:"Counter ❌"}
+    tf_label=tf_map.get(tf_score,"N/A")
     msg+=(f"\n━━━ CONFIRMATIONS ━━━━━━━━━━━━━\n"
           f"📡 TF:{tf_label}  🌀 ST:{st_txt}  💧 VWAP:{vwap_txt}\n"
           f"📍 Zone:{zone_txt}  💸 Fund:{funding_label} {funding_detail}\n"
