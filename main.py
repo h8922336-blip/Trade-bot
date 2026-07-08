@@ -15,8 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID           = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID           = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY      = os.getenv("NEWS_API_KEY", "")       # CryptoPanic API key (optional)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")  # from console.anthropic.com
 
@@ -3402,7 +3402,7 @@ def scan_coins(btc_trend,fng,market_condition):
                 found=get_sideways_signals(symbol,klines,price)
                 if not found: continue
                 best_pat=max(found,key=lambda x:x[1])
-                if best_pat[1]<78: continue
+                if best_pat[1]<MIN_SETUP_SCORE: continue
                 direction=best_pat[2]
 
                 # Hard filter 2: BTC crashing — no longs
