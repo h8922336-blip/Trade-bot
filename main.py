@@ -15,9 +15,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
-NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")      # CryptoPanic API key (optional)
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID           = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
+NEWS_API_KEY      = os.getenv("NEWS_API_KEY", "")       # CryptoPanic API key (optional)
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")  # from console.anthropic.com
 
 BINANCE_PRICE_URL   = "https://data-api.binance.vision/api/v3/ticker/price"
 BINANCE_KLINE_URL   = "https://data-api.binance.vision/api/v3/klines"
@@ -63,8 +64,7 @@ pattern_stats = {p: {"signals":0,"wins":0,"losses":0,"total_pnl":0.0,"weight":1.
     "EMA Trend","Breakout","Pullback to 20 EMA","RSI Reversal","Momentum Surge",
     "Volume Spike","Double Bottom","Double Top","Support Bounce","Resistance Rejection",
     "Bullish Engulfing","Bearish Engulfing","Volume Breakout","Bull Flag Break","Bear Flag Break",
-    "BOS Breakout",
-    # Sideways patterns
+    "BOS Breakout","Hammer Reversal","Shooting Star",
     "BB Lower Bounce","BB Upper Reject","Range Support","Range Resistance",
     "RSI Extreme Low","RSI Extreme High"
 ]}
@@ -76,12 +76,12 @@ last_hourly_time       = time.time()
 last_pnl_update_time   = time.time() + 1800
 last_weekly_report_day = None
 
-SCAN_INTERVAL            = 90      # scan every 90 seconds
+SCAN_INTERVAL            = 30      # scan every 30 seconds — faster signals
 BATCH_INTERVAL           = 1800
 RIVER_INTERVAL           = 900
-MIN_SETUP_SCORE          = 90
-MIN_PRIMARY_SCORE        = 90
-INSTANT_SIGNAL_THRESHOLD = 97
+MIN_SETUP_SCORE          = 88
+MIN_PRIMARY_SCORE        = 82
+INSTANT_SIGNAL_THRESHOLD = 95
 MIN_PROFIT_TARGET        = 15.0
 MIN_GRADE_SCORE          = 10     # Grade B+ minimum (10+ pts)
 SIGNAL_EXPIRY_MINUTES    = 120
@@ -715,12 +715,8 @@ def detect_double_top_pro(highs, lows, closes, vols, price, avg_vol):
 
 def detect_patterns(symbol, klines, price, btc_trend):
     """
-    Upgraded pattern detection with:
-    - Professional Bull/Bear Flag (impulse + consolidation + vol contraction + breakout)
-    - Professional Double Bottom/Top (neckline breakout + volume)
-    - Real market structure (HH/HL/LH/LL + BOS)
-    - BTC independence for strong altcoin setups
-    - Order book awareness built into scoring
+    Pattern detection with REALISTIC thresholds that fire in live markets.
+    Each pattern checks the minimum conditions a trader would look for.
     """
     if len(klines) < 50: return []
     closes = [float(k[4]) for k in klines]
@@ -733,118 +729,131 @@ def detect_patterns(symbol, klines, price, btc_trend):
     ema20  = calculate_ema(closes, 20)
     ema50  = calculate_ema(closes, 50)
     adx    = calculate_adx(klines)
-    # Minimum activity filter
-    if ((max(highs[-20:]) - min(lows[-20:])) / price) * 100 < 1.5: return []
-    if adx < ADX_MIN_TREND: return []
-    # Market structure
-    ms = detect_market_structure(klines)
-    ms_bias = ms["bias"]  # "bullish", "bearish", "neutral"
-    # Audit Fix #4: BTC independence — allow strong altcoin structure to override BTC
-    # If altcoin has clear HH+HL (bullish structure), allow BUY even if BTC neutral
-    # If altcoin has clear LH+LL (bearish structure), allow SELL even if BTC neutral
-    alt_bull_ok  = btc_trend == 1 or ms_bias == "bullish"
-    alt_bear_ok  = btc_trend == -1 or ms_bias == "bearish"
-    p = []
-    sup = ms["swing_low"] if ms["swing_low"] > 0 else min(lows[-30:-1])
+    ms     = detect_market_structure(klines)
+    ms_bias= ms["bias"]
+    p      = []
+
+    # Minimum: coin must have some price movement
+    price_range = (max(highs[-20:]) - min(lows[-20:])) / price * 100
+    if price_range < 0.8: return []  # dead coin
+
+    # BTC alignment (relaxed — altcoin structure can override)
+    alt_bull_ok = btc_trend == 1 or ms_bias == "bullish" or ms_bias == "neutral"
+    alt_bear_ok = btc_trend == -1 or ms_bias == "bearish" or ms_bias == "neutral"
+
+    sup = ms["swing_low"]  if ms["swing_low"]  > 0 else min(lows[-30:-1])
     res = ms["swing_high"] if ms["swing_high"] > 0 else max(highs[-30:-1])
+    mom = (closes[-1] - closes[-4]) / closes[-4] * 100 if len(closes) > 4 else 0
 
-    # ── Professional Bull Flag ──
-    if detect_bull_flag(closes, highs, lows, vols, avg_vol) and alt_bull_ok:
-        # BOS bonus
-        score = 95 if ms["bos"] else 93
-        p.append(("Bull Flag Break", score, "BUY"))
-
-    # ── Professional Bear Flag ──
-    if detect_bear_flag(closes, highs, lows, vols, avg_vol) and alt_bear_ok:
-        score = 95 if ms["bos"] else 93
-        p.append(("Bear Flag Break", score, "SELL"))
-
-    # ── Breakout with structure confirmation ──
-    if closes[-1] > max(highs[-20:-1]) and vols[-1] > avg_vol * 1.4:
-        if alt_bull_ok:
-            score = 93 if (ms["hh"] and ms["hl"]) else 90
-            p.append(("Breakout", score, "BUY"))
-    elif closes[-1] < min(lows[-20:-1]) and vols[-1] > avg_vol * 1.4:
-        if alt_bear_ok:
-            score = 93 if (ms["lh"] and ms["ll"]) else 90
-            p.append(("Breakout", score, "SELL"))
-
-    # ── Bullish Engulfing with structure ──
-    if opens[-2] > closes[-2] and opens[-1] < closes[-2] and closes[-1] > opens[-2]:
-        body_ratio = (closes[-1] - opens[-1]) / (opens[-2] - closes[-2]) if (opens[-2] - closes[-2]) > 0 else 0
-        if body_ratio > 1.2 and alt_bull_ok:  # Must engulf by 20%
-            score = 91 if ms_bias == "bullish" else 88
-            p.append(("Bullish Engulfing", score, "BUY"))
-
-    # ── Bearish Engulfing with structure ──
-    elif opens[-2] < closes[-2] and opens[-1] > closes[-2] and closes[-1] < opens[-2]:
-        body_ratio = (opens[-1] - closes[-1]) / (closes[-2] - opens[-2]) if (closes[-2] - opens[-2]) > 0 else 0
-        if body_ratio > 1.2 and alt_bear_ok:
-            score = 91 if ms_bias == "bearish" else 88
-            p.append(("Bearish Engulfing", score, "SELL"))
-
-    # ── EMA Trend with structure alignment ──
+    # ── 1. EMA Trend ──
+    # Price above both EMAs = uptrend. Simple and reliable.
     if ema20 and ema50:
-        if price > ema20 > ema50 and alt_bull_ok:
-            score = 90 if ms_bias == "bullish" else 87
+        if price > ema20 and ema20 > ema50 * 0.998:
+            score = 92 if ms_bias=="bullish" else 88
             p.append(("EMA Trend", score, "BUY"))
-        elif price < ema20 < ema50 and alt_bear_ok:
-            score = 90 if ms_bias == "bearish" else 87
+        elif price < ema20 and ema20 < ema50 * 1.002:
+            score = 92 if ms_bias=="bearish" else 88
             p.append(("EMA Trend", score, "SELL"))
 
-    # ── Pullback to 20 EMA ──
-    if ema20 and abs(price - ema20) / ema20 < 0.008:
-        if price > ema50 and alt_bull_ok and ms_bias == "bullish":
-            p.append(("Pullback to 20 EMA", 88, "BUY"))
-        elif price < ema50 and alt_bear_ok and ms_bias == "bearish":
-            p.append(("Pullback to 20 EMA", 88, "SELL"))
+    # ── 2. Pullback to EMA20 ──
+    # Price pulled back to EMA20 — classic re-entry point
+    if ema20 and ema50:
+        near_ema20 = abs(price - ema20) / ema20 < 0.015  # within 1.5%
+        if near_ema20 and ema20 > ema50 and closes[-1] > closes[-2]:
+            p.append(("Pullback to 20 EMA", 89, "BUY"))
+        elif near_ema20 and ema20 < ema50 and closes[-1] < closes[-2]:
+            p.append(("Pullback to 20 EMA", 89, "SELL"))
 
-    # ── RSI Reversal (extreme only) ──
-    if rsi < 28 and alt_bull_ok:   p.append(("RSI Reversal", 85, "BUY"))
-    elif rsi > 72 and alt_bear_ok: p.append(("RSI Reversal", 85, "SELL"))
+    # ── 3. RSI Reversal ──
+    # RSI at oversold/overbought — widened from 28/72 to 32/68
+    if rsi <= 32 and closes[-1] >= closes[-2]:
+        p.append(("RSI Reversal", 88, "BUY"))
+    elif rsi >= 68 and closes[-1] <= closes[-2]:
+        p.append(("RSI Reversal", 88, "SELL"))
 
-    # ── Momentum Surge ──
-    mom = (closes[-1] - closes[-4]) / closes[-4] * 100 if len(closes) > 4 else 0
-    if mom > 3.5 and vols[-1] > avg_vol * 1.2 and alt_bull_ok:
-        p.append(("Momentum Surge", 90, "BUY"))
-    elif mom < -3.5 and vols[-1] > avg_vol * 1.2 and alt_bear_ok:
-        p.append(("Momentum Surge", 90, "SELL"))
-
-    # ── Volume Spike ──
-    if vols[-1] > avg_vol * 3.0:
-        direction = "BUY" if closes[-1] > opens[-1] else "SELL"
-        if (direction == "BUY" and alt_bull_ok) or (direction == "SELL" and alt_bear_ok):
-            p.append(("Volume Spike", 88, direction))
-
-    # ── Support Bounce with structure ──
-    if price <= sup * 1.008 and closes[-1] > opens[-1] and alt_bull_ok:
-        score = 92 if ms_bias == "bullish" else 88
+    # ── 4. Support Bounce ──
+    # Price near swing low and bouncing up
+    if price <= sup * 1.012 and closes[-1] > closes[-2] and closes[-1] > opens[-1]:
+        score = 91 if ms_bias=="bullish" else 87
         p.append(("Support Bounce", score, "BUY"))
 
-    # ── Resistance Rejection with structure ──
-    if price >= res * 0.992 and closes[-1] < opens[-1] and alt_bear_ok:
-        score = 92 if ms_bias == "bearish" else 88
+    # ── 5. Resistance Rejection ──
+    # Price near swing high and rejecting down
+    if price >= res * 0.988 and closes[-1] < closes[-2] and closes[-1] < opens[-1]:
+        score = 91 if ms_bias=="bearish" else 87
         p.append(("Resistance Rejection", score, "SELL"))
 
-    # ── Professional Double Bottom ──
-    if detect_double_bottom_pro(highs, lows, closes, vols, price, avg_vol) and alt_bull_ok:
-        p.append(("Double Bottom", 93, "BUY"))
+    # ── 6. Breakout ──
+    # Price closes above recent range high with decent volume
+    recent_high = max(highs[-15:-1])
+    recent_low  = min(lows[-15:-1])
+    if closes[-1] > recent_high and vols[-1] > avg_vol * 1.1:
+        score = 93 if ms["bos"] else 89
+        p.append(("Breakout", score, "BUY"))
+    elif closes[-1] < recent_low and vols[-1] > avg_vol * 1.1:
+        score = 93 if ms["bos"] else 89
+        p.append(("Breakout", score, "SELL"))
 
-    # ── Professional Double Top ──
-    if detect_double_top_pro(highs, lows, closes, vols, price, avg_vol) and alt_bear_ok:
-        p.append(("Double Top", 93, "SELL"))
+    # ── 7. Momentum Surge ──
+    # Price moved 2%+ in 4 candles with volume — lowered from 3.5%
+    if mom > 2.0 and vols[-1] > avg_vol * 1.0 and alt_bull_ok:
+        p.append(("Momentum Surge", 89, "BUY"))
+    elif mom < -2.0 and vols[-1] > avg_vol * 1.0 and alt_bear_ok:
+        p.append(("Momentum Surge", 89, "SELL"))
 
-    # ── Volume Breakout ──
-    if price > res and vols[-1] > avg_vol * 2.2 and alt_bull_ok:
+    # ── 8. Volume Spike ──
+    # Sudden volume 2x+ average — something is happening
+    if vols[-1] > avg_vol * 2.0:
+        direction = "BUY" if closes[-1] > opens[-1] else "SELL"
+        p.append(("Volume Spike", 88, direction))
+
+    # ── 9. Bullish Engulfing ──
+    # Green candle fully engulfs previous red candle
+    if (opens[-2] > closes[-2] and closes[-1] > opens[-1] and
+            closes[-1] >= opens[-2] and opens[-1] <= closes[-2]):
+        score = 90 if ms_bias=="bullish" else 86
+        p.append(("Bullish Engulfing", score, "BUY"))
+
+    # ── 10. Bearish Engulfing ──
+    if (opens[-2] < closes[-2] and closes[-1] < opens[-1] and
+            closes[-1] <= opens[-2] and opens[-1] >= closes[-2]):
+        score = 90 if ms_bias=="bearish" else 86
+        p.append(("Bearish Engulfing", score, "SELL"))
+
+    # ── 11. Bull Flag ──
+    if detect_bull_flag(closes, highs, lows, vols, avg_vol):
         score = 94 if ms["bos"] else 91
-        p.append(("Volume Breakout", score, "BUY"))
+        p.append(("Bull Flag Break", score, "BUY"))
 
-    # ── BOS Signal (pure structure break) ──
-    if ms["bos"] and not ms["choch"]:
-        if ms_bias == "bullish" and alt_bull_ok:
-            p.append(("BOS Breakout", 92, "BUY"))
-        elif ms_bias == "bearish" and alt_bear_ok:
-            p.append(("BOS Breakout", 92, "SELL"))
+    # ── 12. Bear Flag ──
+    if detect_bear_flag(closes, highs, lows, vols, avg_vol):
+        score = 94 if ms["bos"] else 91
+        p.append(("Bear Flag Break", score, "SELL"))
+
+    # ── 13. Double Bottom ──
+    if detect_double_bottom_pro(highs, lows, closes, vols, price, avg_vol):
+        p.append(("Double Bottom", 92, "BUY"))
+
+    # ── 14. Double Top ──
+    if detect_double_top_pro(highs, lows, closes, vols, price, avg_vol):
+        p.append(("Double Top", 92, "SELL"))
+
+    # ── 15. BOS Breakout ──
+    if ms["bos"]:
+        if ms_bias=="bullish": p.append(("BOS Breakout", 93, "BUY"))
+        elif ms_bias=="bearish": p.append(("BOS Breakout", 93, "SELL"))
+
+    # ── 16. Hammer / Pin Bar (reversal candle) ──
+    candle_range = highs[-1] - lows[-1]
+    body = abs(closes[-1] - opens[-1])
+    if candle_range > 0:
+        # Hammer: long lower wick, small body at top
+        lower_wick = min(closes[-1],opens[-1]) - lows[-1]
+        upper_wick = highs[-1] - max(closes[-1],opens[-1])
+        if lower_wick > candle_range*0.6 and body < candle_range*0.3:
+            p.append(("Hammer Reversal", 87, "BUY"))
+        elif upper_wick > candle_range*0.6 and body < candle_range*0.3:
+            p.append(("Shooting Star", 87, "SELL"))
 
     return p
 
@@ -922,25 +931,25 @@ def get_sideways_signals(symbol, klines, price):
         bb_mid=e20
 
         # 1. Bollinger Band bounce — price touches lower band, RSI oversold
-        if price<=bb_lower*1.005 and rsi<38:
+        if price<=bb_lower*1.010 and rsi<42:
             signals.append(("BB Lower Bounce",88,"BUY"))
 
         # 2. Bollinger Band rejection — price touches upper band, RSI overbought
-        if price>=bb_upper*0.995 and rsi>62:
+        if price>=bb_upper*0.990 and rsi>58:
             signals.append(("BB Upper Reject",88,"SELL"))
 
         # 3. Range support bounce — near 20-bar low, RSI neutral-low
         range_low=min(lows[-20:]); range_high=max(highs[-20:])
         range_size=(range_high-range_low)/range_low*100 if range_low>0 else 0
         if range_size>2:  # only if there's a real range
-            if price<=range_low*1.01 and rsi<42:
+            if price<=range_low*1.015 and rsi<45:
                 signals.append(("Range Support",86,"BUY"))
-            if price>=range_high*0.99 and rsi>58:
+            if price>=range_high*0.985 and rsi>55:
                 signals.append(("Range Resistance",86,"SELL"))
 
         # 4. RSI mean reversion from extremes
-        if rsi<25:  signals.append(("RSI Extreme Low",84,"BUY"))
-        if rsi>75:  signals.append(("RSI Extreme High",84,"SELL"))
+        if rsi<32:  signals.append(("RSI Extreme Low",84,"BUY"))
+        if rsi>68:  signals.append(("RSI Extreme High",84,"SELL"))
 
     except Exception as e: logger.warning(f"sideways signals {symbol}: {e}")
     return signals
@@ -1066,10 +1075,14 @@ def get_position_size_pct(grade):
     elif "B" in g: return 5.0
     else:          return 3.0
 
-def is_volume_confirmed(klines):
+def is_volume_confirmed(klines, sideways=False):
     vols=[float(k[5]) for k in klines]
-    # Require 1.5x average — filters out low-conviction moves
-    return len(vols)>=20 and vols[-1]>sum(vols[-20:])/20*1.5
+    if len(vols)<20: return False
+    avg=sum(vols[-20:])/20
+    # Sideways: 0.8x average is enough (range trades happen on low volume)
+    # Trend: 1.2x average required (breakouts need volume)
+    threshold = avg*0.8 if sideways else avg*1.2
+    return vols[-1]>threshold
 
 def is_rsi_valid(closes,direction):
     rsi=calculate_rsi(closes)
@@ -1155,13 +1168,54 @@ def get_htf_trend(symbol,interval="1h"):
         logger.warning(f"HTF {symbol} {interval}: {e}"); return 0
 
 def get_timeframe_score(symbol,direction):
+    """
+    Multi-timeframe check — exactly like a trader manually checking 5m, 15m, 1h.
+    Returns: -1 (hard counter), 0 (neutral), 1 (1h agrees), 2 (1h+4h agree), 3 (all agree)
+    """
     di=1 if direction=="BUY" else -1
-    h4=get_htf_trend(symbol,"4h"); h1=get_htf_trend(symbol,"1h")
+    h4=get_htf_trend(symbol,"4h")
+    h1=get_htf_trend(symbol,"1h")
+    # Hard block only if 4h is strongly against — not just neutral
     if h4!=0 and h4!=di: return -1
     score=0
     if h4==di: score+=2
     if h1==di: score+=1
     return score
+
+
+def get_multi_tf_analysis(symbol, direction, price):
+    """
+    Like a trader: opens 5m, 15m, 1h charts and checks each one.
+    Returns a dict with trend, RSI, pattern strength per timeframe.
+    Used to show in signal output AND to boost/reduce score.
+    """
+    result = {}
+    for tf, label in [("5m","5Min"),("15m","15Min"),("1h","1Hour"),("4h","4Hour")]:
+        try:
+            klines = get_klines(symbol, tf, 60)
+            if not klines or len(klines)<20:
+                result[label] = {"trend":"?","rsi":50,"aligned":False}
+                continue
+            closes = [float(k[4]) for k in klines]
+            e20 = calculate_ema(closes, 20)
+            e50 = calculate_ema(closes, min(50, len(closes)-1))
+            rsi = calculate_rsi(closes)
+            adx = calculate_adx(klines)
+            curr = closes[-1]
+            if e20 and e50:
+                if curr > e20 and e20 > e50: trend="bull"
+                elif curr < e20 and e20 < e50: trend="bear"
+                else: trend="neutral"
+            else: trend="neutral"
+            aligned = (trend=="bull" and direction=="BUY") or (trend=="bear" and direction=="SELL")
+            result[label] = {"trend":trend,"rsi":round(rsi,1),"adx":round(adx,1),"aligned":aligned}
+        except Exception:
+            result[label] = {"trend":"?","rsi":50,"aligned":False}
+    # Count how many timeframes agree
+    agrees = sum(1 for v in result.values() if v.get("aligned"))
+    result["agrees"] = agrees
+    result["score_boost"] = agrees  # +1 per agreeing TF
+    return result
 
 def get_structure_sl(klines,direction,entry,atr):
     lows=[float(k[3]) for k in klines[-20:]]; highs=[float(k[2]) for k in klines[-20:]]
@@ -2220,6 +2274,108 @@ def is_retest_confirmed(symbol, direction, entry_price, klines, min_pct=None):
     except Exception: return True
 
 
+def ai_analyze_setup(coin, direction, klines, price, pattern, market_condition, daily_trend, rsi_15m, rsi_1h, rsi_4h, adx, vol_strength):
+    """
+    Calls Claude Haiku AI to analyze the setup like an experienced trader.
+    Reads candle shapes, wicks, volume, structure — gives CLEAN/MESSY verdict.
+    Cost: ~$0.004 per call (Claude Haiku 4.5)
+    Returns: (verdict, confidence, reasoning) or None if API unavailable
+    """
+    if not ANTHROPIC_API_KEY:
+        return None
+
+    try:
+        # Build candle description from last 20 candles
+        recent = klines[-20:]
+        candle_desc = []
+        for i, k in enumerate(recent):
+            o,h,l,c,v = float(k[1]),float(k[2]),float(k[3]),float(k[4]),float(k[5])
+            body = abs(c-o); rng = h-l if h>l else 0.0001
+            body_pct = body/rng*100
+            lower_wick = (min(o,c)-l)/rng*100
+            upper_wick = (h-max(o,c))/rng*100
+            candle_type = "BULL" if c>o else "BEAR"
+            strength = "strong" if body_pct>60 else "weak" if body_pct<30 else "normal"
+            candle_desc.append(
+                f"C{i+1}: {candle_type} {strength} body={body_pct:.0f}% "
+                f"lower_wick={lower_wick:.0f}% upper_wick={upper_wick:.0f}%"
+            )
+
+        candles_text = "\n".join(candle_desc)
+        dir_word = "LONG (BUY)" if direction=="BUY" else "SHORT (SELL)"
+
+        prompt = f"""You are an expert crypto trader with 10 years experience reading price action.
+
+Analyze this {coin}/USDT setup and tell me if it's worth trading:
+
+SETUP: {dir_word}
+Pattern detected: {pattern}
+Market: {market_condition.upper()} | Daily trend: {daily_trend.upper()}
+Price: {format_price(price)}
+RSI: 15m={rsi_15m:.0f} | 1h={rsi_1h:.0f} | 4h={rsi_4h:.0f}
+ADX (trend strength): {adx:.0f}
+Volume: {vol_strength:.1f}x average
+
+Last 20 candles (most recent = C20):
+{candles_text}
+
+Evaluate:
+1. Is the pattern CLEAN or MESSY? (clean = clear structure, messy = choppy/noisy)
+2. Do the candle wicks tell a story? (long wicks = rejection, short wicks = conviction)
+3. Is volume confirming the move?
+4. Does the RSI support the direction?
+5. Would an experienced trader take this trade?
+
+Respond in exactly this format:
+VERDICT: [CLEAN/MESSY]
+CONFIDENCE: [HIGH/MEDIUM/LOW]
+TRADE: [YES/NO]
+REASONING: [2-3 sentences max explaining your decision]"""
+
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 200,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=15
+        )
+
+        if response.status_code != 200:
+            logger.warning(f"AI analysis failed [{response.status_code}]: {response.text[:100]}")
+            return None
+
+        text = response.json()["content"][0]["text"].strip()
+        logger.info(f"AI analysis for {coin}: {text[:100]}")
+
+        # Parse response
+        verdict = "CLEAN" if "VERDICT: CLEAN" in text else "MESSY"
+        confidence = "HIGH" if "CONFIDENCE: HIGH" in text else "MEDIUM" if "CONFIDENCE: MEDIUM" in text else "LOW"
+        trade = "YES" in text.split("TRADE:")[-1].split("\n")[0] if "TRADE:" in text else "NO"
+
+        reasoning = ""
+        if "REASONING:" in text:
+            reasoning = text.split("REASONING:")[-1].strip()
+
+        return {
+            "verdict": verdict,
+            "confidence": confidence,
+            "trade": trade,
+            "reasoning": reasoning,
+            "raw": text
+        }
+
+    except Exception as e:
+        logger.warning(f"AI analysis error {coin}: {e}")
+        return None
+
+
 def check_and_send_watch_alert(coin, symbol, price, klines, direction):
     """Pre-signal Watch Alert — fires 5-15 min before actual signal."""
     global watch_alerts_sent
@@ -2240,9 +2396,9 @@ def check_and_send_watch_alert(coin, symbol, price, klines, direction):
         alert=f"📍 Approaching resistance <code>{format_price(recent_high)}</code> — vol {vol_ratio:.1f}x"
     elif (price<=recent_low*1.015 and direction=="BUY" and vol_ratio>=1.2):
         alert=f"📍 Approaching support <code>{format_price(recent_low)}</code> — vol {vol_ratio:.1f}x"
-    elif rsi<38 and direction=="BUY":
+    elif rsi<42 and direction=="BUY":
         alert=f"📈 RSI oversold ({rsi:.0f}) — reversal forming"
-    elif rsi>62 and direction=="SELL":
+    elif rsi>58 and direction=="SELL":
         alert=f"📉 RSI overbought ({rsi:.0f}) — reversal forming"
     elif price<=bb_lower*1.008 and direction=="BUY":
         alert=f"🎯 Near BB lower <code>{format_price(bb_lower)}</code> — watch for bounce"
@@ -2369,7 +2525,7 @@ def check_profit_milestones(coin,trade,price,pnl):
 def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition="bull"):
     global sent_coins,coin_cooldowns
     if check_circuit_breaker(): return False
-    if not is_good_trading_session(): return False
+    # trading session check removed — scan 24/7
     live_price=get_price(setup["symbol"])
     if not live_price: return False
     entry=live_price
@@ -2381,17 +2537,20 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     closes=[float(x[4]) for x in klines_15m]
     atr_1h=calculate_atr(klines_1h) if len(klines_1h)>=15 else calculate_atr(klines_15m)
     atr_pct=(atr_1h/entry)*100 if entry>0 else 0
-    vol_ok=is_volume_confirmed(klines_15m)
+    is_sideways_signal=setup.get("sideways_mode",False)
+    vol_ok=is_volume_confirmed(klines_15m, sideways=is_sideways_signal)
     rsi_ok=is_rsi_valid(closes,setup["direction"])
     funding_ok=is_funding_favorable(setup["symbol"],setup["direction"])
     if not vol_ok:
-        logger.info(f"{coin} rejected - volume"); return False
-    if not rsi_ok:
-        logger.info(f"{coin} rejected - RSI"); return False
+        if is_sideways_signal:
+            logger.info(f"{coin} sideways - low volume, noting")
+        else:
+            logger.info(f"{coin} low volume - allowing with note")
+        vol_ok=False  # noted but not blocked
+    # RSI block removed — RSI shown in scorecard instead
     if not is_volatility_normal(klines_15m):
         logger.info(f"{coin} rejected - volatility"); return False
-    if not funding_ok:
-        logger.info(f"{coin} rejected - funding"); return False
+    # funding noted not blocked
     st_15m=calculate_supertrend(klines_15m,ST_PERIOD,ST_MULTIPLIER)
     st_1h=calculate_supertrend(klines_1h,ST_PERIOD,ST_MULTIPLIER) if klines_1h else st_15m
     is_sideways_signal=setup.get("sideways_mode",False)
@@ -2435,8 +2594,14 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     vol_strength=vols[-1]/avg_vol if avg_vol>0 else 1.0
 
     # Compute grade with new signature
+    # Multi-timeframe analysis — like trader checking 5m/15m/1h/4h manually
+    mtf = get_multi_tf_analysis(setup["symbol"], setup["direction"], entry)
+    mtf_agrees = mtf.get("agrees", 0)
+    # Score boost for TF alignment
+    score_boost = min(mtf_agrees, 3)
+
     grade,pts,breakdown,max_pts=get_signal_grade(
-        setup["setup_score"], vol_strength, adx_val, tf_score,
+        min(setup["setup_score"]+score_boost, 99), vol_strength, adx_val, tf_score,
         rsi_15m, rsi_1h, rsi_4h, funding_ok, st_ok, vwap_ok,
         zone_ok, adx_val, ms["bos"], ms["bias"] in ("bullish","bearish")
     )
@@ -2461,6 +2626,19 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     mom=(closes[-1]-closes[-3])/closes[-3]*100
     rsi_val=calculate_rsi(closes)
     # grade, pts, breakdown already computed above (before leverage)
+    # ── AI ANALYSIS — Claude reads candles like a human trader ──
+    ai_result = ai_analyze_setup(
+        coin, setup["direction"], klines_15m, entry,
+        setup["pattern"], market_condition, setup.get("daily_trend","neutral"),
+        rsi_15m, rsi_1h, rsi_4h, adx_val, vol_strength
+    )
+
+    # If AI says MESSY + LOW confidence → skip signal
+    if ai_result and ai_result["trade"]=="NO" and ai_result["confidence"]=="LOW":
+        logger.info(f"{coin} rejected by AI — {ai_result['verdict']} pattern, LOW confidence")
+        logger.info(f"AI reasoning: {ai_result['reasoning']}")
+        return False
+
     # GRADE FILTER — only send Grade B+ (10+ pts)
     if pts < MIN_GRADE_SCORE:
         logger.info(f"{coin} rejected — grade score {pts}/{max_pts} below minimum {MIN_GRADE_SCORE}")
@@ -2558,6 +2736,26 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
 
     if div_line: msg+=f"  🔀 {div_line}"
     msg+="\n\n"
+
+    # AI Analysis section
+    if ai_result:
+        v_em = "✅" if ai_result["verdict"]=="CLEAN" else "⚠️"
+        c_em = "🟢" if ai_result["confidence"]=="HIGH" else "🟡" if ai_result["confidence"]=="MEDIUM" else "🔴"
+        msg += (f"━━━ AI ANALYSIS ━━━━━━━━━━━━━━━\n"
+                f"{v_em} Pattern: <b>{ai_result['verdict']}</b>  "
+                f"{c_em} Confidence: <b>{ai_result['confidence']}</b>\n"
+                f"🧠 {ai_result['reasoning']}\n\n")
+
+    msg +=(f"━━━ TIMEFRAME CHECK ━━━━━━━━━━━━\n")
+    tf_icons = {"bull":"📈","bear":"📉","neutral":"➡️","?":"❓"}
+    for tf_label_k in ["5Min","15Min","1Hour","4Hour"]:
+        tf_data = mtf.get(tf_label_k, {})
+        tf_trend = tf_data.get("trend","?")
+        tf_rsi   = tf_data.get("rsi",50)
+        tf_align = tf_data.get("aligned",False)
+        align_icon = "✅" if tf_align else "—"
+        msg+=f"{tf_icons.get(tf_trend,'?')} <b>{tf_label_k}</b>  {tf_trend.upper():<8} RSI:{tf_rsi:.0f}  {align_icon}\n"
+    msg+=f"{'✅'*mtf_agrees}{'○'*(4-mtf_agrees)}  {mtf_agrees}/4 timeframes aligned\n\n"
 
     msg+=(f"━━━ MILESTONES ━━━━━━━━━━━━━━━━\n"
           f"⛩ +{m1_pnl:.1f}%  SL → <code>{ms1}</code>  breakeven\n"
@@ -3202,7 +3400,7 @@ def scan_coins(btc_trend,fng,market_condition):
                 found=get_sideways_signals(symbol,klines,price)
                 if not found: continue
                 best_pat=max(found,key=lambda x:x[1])
-                if best_pat[1]<82: continue
+                if best_pat[1]<78: continue
                 direction=best_pat[2]
 
                 # Hard filter 2: BTC crashing — no longs
@@ -3274,7 +3472,7 @@ def scan_coins(btc_trend,fng,market_condition):
                     lev=get_smart_leverage(symbol,atr_pct,score)
 
                     # Min 20% leveraged return
-                    if atr_pct*ATR_TP_MULTIPLIER*lev<20: continue
+                    # min TP check removed — AI + grade handle quality
 
                     setup={"coin":coin,"symbol":symbol,"direction":direction,
                            "pattern":pt,"setup_score":score,"leverage":lev,
