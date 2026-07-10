@@ -15,8 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -1553,6 +1553,78 @@ def cmd_trend(coin_input):
            f"  🕐 {get_ist_time()}")
     return text
 
+def ai_analyst_review():
+    """
+    AI Analyst — reviews ALL active trades using Claude, like a portfolio manager.
+    Suggests: HOLD, TAKE PROFIT, EXIT NOW, or WATCH CLOSELY for each trade.
+    """
+    if not active_trades:
+        return f"{_H('AI ANALYST','🧠')}\n\n  🌙 No active trades to review.\n\n  🕐 {get_ist_time()}"
+    if not ANTHROPIC_API_KEY:
+        return f"{_H('AI ANALYST','🧠')}\n\n  ⚠️ ANTHROPIC_API_KEY not set — AI Analyst unavailable.\n\n  🕐 {get_ist_time()}"
+
+    trades_summary=[]
+    for coin,t in active_trades.items():
+        symbol=t.get("symbol",coin+"USDT")
+        price=get_price(symbol)
+        if not price: continue
+        direction=t.get("direction","BUY"); entry=t["entry"]
+        tp=t["tp"]; sl=t["sl"]; lev=t.get("leverage",1)
+        if direction=="BUY": pnl=((price-entry)/entry)*100*lev
+        else:                pnl=((entry-price)/entry)*100*lev
+        klines=get_klines(symbol,"15m",30)
+        rsi=calculate_rsi([float(k[4]) for k in klines]) if klines else 50
+        adx=calculate_adx(klines) if klines else 20
+        dist_tp=abs(tp-price)/price*100
+        dist_sl=abs(price-sl)/price*100
+        trades_summary.append(
+            f"{coin}: {direction} | Entry:{format_price(entry)} Now:{format_price(price)} "
+            f"PnL:{pnl:+.1f}% | TP:{dist_tp:.1f}% away SL:{dist_sl:.1f}% away | "
+            f"RSI:{rsi:.0f} ADX:{adx:.0f} | Pattern:{t.get('pattern','?')}"
+        )
+
+    if not trades_summary:
+        return f"{_H('AI ANALYST','🧠')}\n\n  ⚠️ Could not fetch live prices.\n\n  🕐 {get_ist_time()}"
+
+    prompt = (
+        "You are a professional portfolio manager reviewing open crypto futures positions.\n\n"
+        "OPEN TRADES:\n" + "\n".join(trades_summary) + "\n\n"
+        "For EACH trade, give a one-line action: HOLD, TAKE PROFIT NOW, EXIT NOW (cut loss), "
+        "or WATCH CLOSELY (risk building). Base it on PnL, distance to TP/SL, RSI, and ADX.\n"
+        "Format EXACTLY like this per trade:\n"
+        "COIN: ACTION — short reason (max 12 words)\n\n"
+        "Then add one line: OVERALL: [1 sentence portfolio-level insight]"
+    )
+
+    try:
+        res = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01",
+                     "content-type":"application/json"},
+            json={"model":"claude-haiku-4-5-20251001","max_tokens":400,
+                  "messages":[{"role":"user","content":prompt}]},
+            timeout=20
+        )
+        if res.status_code!=200:
+            return f"{_H('AI ANALYST','🧠')}\n\n  ⚠️ AI request failed.\n\n  🕐 {get_ist_time()}"
+        text = res.json()["content"][0]["text"].strip()
+    except Exception as e:
+        return f"{_H('AI ANALYST','🧠')}\n\n  ⚠️ Error: {e}\n\n  🕐 {get_ist_time()}"
+
+    msg = f"{_H('AI ANALYST — PORTFOLIO REVIEW','🧠')}\n\n"
+    for line in text.split("\n"):
+        line=line.strip()
+        if not line: continue
+        if line.upper().startswith("OVERALL:"):
+            msg += f"\n  📌 <b>{line}</b>\n"
+        elif ":" in line:
+            coin_part, rest = line.split(":",1)
+            em = "🟢" if "HOLD" in rest.upper() else "✅" if "TAKE PROFIT" in rest.upper() else "🔴" if "EXIT" in rest.upper() else "⚠️"
+            msg += f"  {em} <b>{coin_part.strip()}</b>:{rest}\n"
+    msg += f"\n  🕐 {get_ist_time()}"
+    return msg
+
+
 def cmd_market():
     btc=get_price("BTCUSDT"); eth=get_price("ETHUSDT"); sol=get_price("SOLUSDT")
     bnb=get_price("BNBUSDT"); xrp=get_price("XRPUSDT")
@@ -2393,6 +2465,11 @@ def poll_telegram():
                         send_telegram(f"⚙️ Fetching latest news...")
                         safe_send(get_crypto_news,"📰 News")
                     elif txt_slash=="/gems":    safe_send(cmd_hidden_gems,"💎 Hidden Gems")
+                    elif txt_slash=="/analyst":
+                        send_telegram("🧠 AI Analyst reviewing your trades...", parse_mode="")
+                        safe_send(ai_analyst_review,"🧠 AI Analyst")
+                    elif txt_slash in ("/counsel","/regime"):
+                        pass  # handled below
                     elif txt_slash=="/market":   safe_send(cmd_market,"🌍 Market")
                     elif txt_slash=="/cb":
                         cb_on=check_circuit_breaker()
@@ -2443,6 +2520,7 @@ def poll_telegram():
                                 [{"text":"🌀 Patterns"}, {"text":"📰 News"},      {"text":"🌍 Market"}],
                                 [{"text":"🔍 Scan"},     {"text":"⚡ CB Status"}, {"text":"📡 Status"}],
                                 [{"text":"🔔 Alerts"},   {"text":"📉 Trend BTC"}, {"text":"💎 Hidden Gems"}],
+                                [{"text":"🧠 AI Analyst"},{"text":"🔮 Counsel"},  {"text":"🌐 Regime"}],
                             ],
                             "resize_keyboard":True,
                             "persistent":True
@@ -2453,6 +2531,8 @@ def poll_telegram():
                             f"  📊 /trades    — Active trades\n"
                             f"  ⏳ /pending   — Pending signals\n"
                             f"  📈 /stats     — Pattern stats\n"
+                            f"  🧠 /analyst   — AI reviews open trades\n"
+                            f"  🔮 /counsel   — AI suggestion per trade\n"
                             f"  📅 /summary   — 10-day summary\n"
                             f"  🔥 /streak    — Win/loss streak\n"
                             f"  🏆 /best      — Top performers\n"
@@ -2563,6 +2643,38 @@ def poll_telegram():
                         safe_send(lambda: run_backtest(bc2),"🔬 Backtest")
                     elif txt_clean in ("💎 hidden gems","/gems"):
                         safe_send(cmd_hidden_gems,"💎 Hidden Gems")
+                    elif txt_clean in ("🧠 ai analyst","/analyst"):
+                        send_telegram("🧠 AI Analyst reviewing your trades...", parse_mode="")
+                        safe_send(ai_analyst_review,"🧠 AI Analyst")
+                    elif txt_clean in ("🔮 counsel","/counsel"):
+                        if not active_trades:
+                            send_telegram(_H("COUNSEL","🔮")+"\n\n  🌙 No open trades.\n\n  🕐 "+get_ist_time())
+                        else:
+                            lines=[_H("TRADE COUNSEL","🔮")+"\n"]
+                            for coin,t in active_trades.items():
+                                symbol=t.get("symbol",coin+"USDT"); price=get_price(symbol)
+                                if not price: continue
+                                direction=t.get("direction","BUY"); entry=t["entry"]; lev=t.get("leverage",1)
+                                pnl=((price-entry)/entry)*100*lev if direction=="BUY" else ((entry-price)/entry)*100*lev
+                                dist_tp=abs(t["tp"]-price)/price*100
+                                em="🟢" if pnl>=0 else "🔴"
+                                lines.append(f"  {em} <b>{coin}</b> {direction} PnL:{pnl:+.1f}% TP:{dist_tp:.1f}% away")
+                            lines.append(f"\n  🕐 {get_ist_time()}")
+                            send_telegram("\n".join(lines))
+                    elif txt_clean in ("🌐 regime","/regime"):
+                        btc_p=get_price("BTCUSDT"); btc_k=get_klines("BTCUSDT","1h",50)
+                        adx=calculate_adx(btc_k) if btc_k else 0
+                        fng=get_fear_greed_index()
+                        mc=detect_market_condition(btc_p,btc_k) if btc_p and btc_k else "sideways"
+                        em="📈" if mc=="bull" else "📉" if mc=="bear" else "➡️"
+                        send_telegram(
+                            _H("MARKET REGIME","🌐")+"\n\n"
+                            f"  {em} Regime: <b>{mc.upper()}</b>\n"
+                            f"  💪 ADX: {adx:.1f}\n"
+                            f"  😰 F&G: {fng}\n"
+                            f"  ₿ BTC: <code>${format_price(btc_p) if btc_p else 'N/A'}</code>\n\n"
+                            f"  🕐 {get_ist_time()}"
+                        )
         except requests.RequestException as e: logger.error(f"Poll network: {e}")
         except Exception as e:                 logger.error(f"Poll error: {e}",exc_info=True)
         time.sleep(2)
