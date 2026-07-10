@@ -15,8 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -1914,7 +1914,7 @@ def cmd_hidden_gems():
             f"  🕐 {get_ist_time()}")
     return msg
 
-def ai_analyze_setup(coin, direction, klines, price, pattern, rsi_val, adx_val, vol_strength):
+def ai_analyze_setup(coin, direction, klines, price, pattern, rsi_val, adx_val, vol_strength, is_volatile=False):
     """Claude AI analyzes candles like a human trader. Cost ~$0.004 per call."""
     if not ANTHROPIC_API_KEY: return None
     try:
@@ -1929,17 +1929,26 @@ def ai_analyze_setup(coin, direction, klines, price, pattern, rsi_val, adx_val, 
             strength="strong" if body/rng>0.6 else "weak" if body/rng<0.3 else "normal"
             candle_desc.append(f"C{i+1}:{ctype} {strength} low_wick={lower_wick:.0f}% up_wick={upper_wick:.0f}%")
         dir_word="LONG (BUY)" if direction=="BUY" else "SHORT (SELL)"
-        prompt=(f"You are an expert crypto trader. Analyze this {coin}/USDT {dir_word} setup:\n"
-                f"Pattern: {pattern}\nPrice: {format_price(price)}\n"
-                f"RSI: {rsi_val:.0f} | ADX: {adx_val:.0f} | Volume: {vol_strength:.1f}x avg\n\n"
-                f"Last 20 candles (C20=most recent):\n"+"\n".join(candle_desc)+
-                f"\n\nAnalyze candle quality, wicks, momentum. Is this a CLEAN setup?\n"
-                f"Respond EXACTLY:\nVERDICT: [CLEAN/MESSY]\nCONFIDENCE: [HIGH/MEDIUM/LOW]\n"
-                f"TRADE: [YES/NO]\nREASONING: [2 sentences max]")
+        vol_note = "Volatility is currently ELEVATED vs normal — could mean a real breakout OR just chop. Judge from candle quality." if is_volatile else "Volatility is normal."
+        prompt=(f"You are an experienced discretionary crypto trader deciding whether to actually "
+                f"take this trade with real money, the way you would after watching a chart for an hour.\n\n"
+                f"Setup: {coin}/USDT {dir_word}\n"
+                f"Pattern flagged by scanner: {pattern}\n"
+                f"Price: {format_price(price)}\n"
+                f"RSI: {rsi_val:.0f} | ADX (trend strength): {adx_val:.0f} | Volume: {vol_strength:.1f}x average\n"
+                f"{vol_note}\n\n"
+                f"Last 20 candles, oldest to newest (C20 = right now):\n"+"\n".join(candle_desc)+
+                f"\n\nThink like a trader reading this chart: Is momentum genuine or exhausted? "
+                f"Do the wicks show rejection or conviction? Does the recent candle sequence support "
+                f"{direction} continuing, or does it look like a trap / late entry / chop? "
+                f"Would you actually risk money on this right now?\n\n"
+                f"Respond EXACTLY in this format:\n"
+                f"VERDICT: [CLEAN/MESSY]\nCONFIDENCE: [HIGH/MEDIUM/LOW]\n"
+                f"TRADE: [YES/NO]\nREASONING: [2 sentences max, be specific about what you saw]")
         res=requests.post("https://api.anthropic.com/v1/messages",
             headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01",
                      "content-type":"application/json"},
-            json={"model":"claude-haiku-4-5-20251001","max_tokens":150,
+            json={"model":"claude-haiku-4-5-20251001","max_tokens":180,
                   "messages":[{"role":"user","content":prompt}]},timeout=15)
         if res.status_code!=200: return None
         text=res.json()["content"][0]["text"].strip()
@@ -2061,8 +2070,9 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     live_price=get_price(setup["symbol"])
     if not live_price: return False
     entry=live_price
-    if abs(entry-setup["scan_price"])/setup["scan_price"]>0.02:
-        logger.info(f"{coin} rejected - drifted"); return False
+    drift_pct=abs(entry-setup["scan_price"])/setup["scan_price"]*100
+    if drift_pct>3.5:
+        logger.info(f"{coin} rejected - drifted {drift_pct:.1f}%"); return False
     klines_15m=get_klines(setup["symbol"],"15m",100)
     klines_1h=get_klines(setup["symbol"],"1h",50)
     if not klines_15m: return False
@@ -2072,21 +2082,25 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     vol_ok=is_volume_confirmed(klines_15m)
     rsi_ok=is_rsi_valid(closes,setup["direction"])
     funding_ok=is_funding_favorable(setup["symbol"],setup["direction"])
+    is_volatile=not is_volatility_normal(klines_15m)
     if not vol_ok:
         logger.info(f"{coin} rejected - volume"); return False
     if not rsi_ok:
         logger.info(f"{coin} rejected - RSI"); return False
-    if not is_volatility_normal(klines_15m):
-        logger.info(f"{coin} rejected - volatility"); return False
+    # Volatility is no longer a hard block — high volatility is common in real breakouts.
+    # It's passed to the AI as context instead so it can judge, like a human would.
+    if is_volatile:
+        logger.info(f"{coin} high volatility — noted, letting AI judge")
     if not funding_ok:
         logger.info(f"{coin} rejected - funding"); return False
     st_15m=calculate_supertrend(klines_15m,ST_PERIOD,ST_MULTIPLIER)
     st_1h=calculate_supertrend(klines_1h,ST_PERIOD,ST_MULTIPLIER) if klines_1h else st_15m
-    # 15m SuperTrend MUST align — hard block
-    # 1h SuperTrend is a grade bonus only (not a hard block — sideways markets keep old 1h ST)
-    if st_15m != setup["direction"]:
-        logger.info(f"{coin} rejected - SuperTrend 15m ({st_15m})"); return False
+    # SuperTrend lags price — instead of requiring exact match (which kills the earliest,
+    # best entries), we only hard-block when SuperTrend is strongly opposed on BOTH timeframes.
     st_ok=(st_15m==setup["direction"]) and (st_1h==setup["direction"])
+    st_strongly_against = (st_15m!=setup["direction"]) and (st_1h!=setup["direction"])
+    if st_strongly_against:
+        logger.info(f"{coin} rejected - SuperTrend opposed on both 15m+1h"); return False
     vwap=calculate_vwap(klines_15m); vwap_ok=False; vwap_label="N/A"
     if vwap:
         if setup["direction"]=="BUY" and entry>vwap:    vwap_ok=True; vwap_label=f"Above {format_price(vwap)}"
@@ -2128,7 +2142,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     rsi_ai=calculate_rsi(closes)
     adx_ai=calculate_adx(klines_15m)
     ai_result=ai_analyze_setup(coin,setup["direction"],klines_15m,entry,
-                               setup["pattern"],rsi_ai,adx_ai,vol_str_ai)
+                               setup["pattern"],rsi_ai,adx_ai,vol_str_ai,is_volatile)
     if ai_result and ai_result["trade"]==False:
         logger.info(f"{coin} rejected by AI — {ai_result['verdict']}/{ai_result['confidence']}")
         return False
