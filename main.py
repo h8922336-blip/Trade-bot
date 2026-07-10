@@ -15,8 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -2048,22 +2048,18 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
             else: return False
     setup["leverage"]=lev
 
-    # AI only called for score 93+ OR Grade A/A+ — saves cost on lower grade signals
+    # AI analysis runs on EVERY signal that passes filters
     ai_result=None
-    is_high_grade = "A" in grade  # Grade A or A+
-    if is_high_grade or setup["setup_score"]>=93:
-        vols_ai=[float(k[5]) for k in klines_15m]
-        avg_vol_ai=sum(vols_ai[-20:])/20 if len(vols_ai)>=20 else 1
-        vol_str_ai=vols_ai[-1]/avg_vol_ai if avg_vol_ai>0 else 1.0
-        rsi_ai=calculate_rsi(closes)
-        adx_ai=calculate_adx(klines_15m)
-        ai_result=ai_analyze_setup(coin,setup["direction"],klines_15m,entry,
-                                   setup["pattern"],rsi_ai,adx_ai,vol_str_ai)
-        if ai_result and ai_result["trade"]==False:
-            logger.info(f"{coin} rejected by AI — {ai_result['verdict']}/{ai_result['confidence']}")
-            return False
-    else:
-        logger.info(f"{coin} AI skipped — Grade {grade} below A (cost saving)")
+    vols_ai=[float(k[5]) for k in klines_15m]
+    avg_vol_ai=sum(vols_ai[-20:])/20 if len(vols_ai)>=20 else 1
+    vol_str_ai=vols_ai[-1]/avg_vol_ai if avg_vol_ai>0 else 1.0
+    rsi_ai=calculate_rsi(closes)
+    adx_ai=calculate_adx(klines_15m)
+    ai_result=ai_analyze_setup(coin,setup["direction"],klines_15m,entry,
+                               setup["pattern"],rsi_ai,adx_ai,vol_str_ai)
+    if ai_result and ai_result["trade"]==False:
+        logger.info(f"{coin} rejected by AI — {ai_result['verdict']}/{ai_result['confidence']}")
+        return False
     price_range=(max(closes[-10:])-min(closes[-10:]))/10
     eta=int(abs(tp-entry)/(price_range if price_range>0 else 0.001)*15)
     eta=max(30,min(eta,1440)); setup["eta_minutes"]=eta
