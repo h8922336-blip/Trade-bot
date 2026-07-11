@@ -15,8 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -39,7 +39,7 @@ COINS = list(dict.fromkeys([
     "GMT","ENJ","PEPE","WIF","FLOKI","BONK","ORDI","BOME","NOT","DOGS",
     "JUP","PYTH","JTO","STRK","EIGEN","ETHFI","IO","ZERO","ONDO",
     "BLUR","CFX","METIS","MANTA","ZETA","TRB","ALT","PIXEL","PORTAL","STPT","KAS",
-    "PIPPIN","BSB","CL"
+    "PIPPIN","BSB","CL","RIVER"
 ]))
 
 active_trades             = {}
@@ -52,6 +52,7 @@ last_reset_day            = datetime.now(IST).date()
 trade_journal             = []
 learning_notes            = []
 coin_cooldowns            = {}
+retest_watchlist          = {}   # coin -> {level, direction, pattern, logged_at, symbol}
 consecutive_loss_patterns = {}
 price_alerts              = {}
 market_memory = {
@@ -78,8 +79,11 @@ SCAN_INTERVAL            = 90
 BATCH_INTERVAL           = 1800
 RIVER_INTERVAL           = 900
 MIN_SETUP_SCORE          = 90
-MIN_PRIMARY_SCORE        = 90
+MIN_PRIMARY_SCORE        = 85    # matches the normalized pattern base (Point 5) — the floor
+                                  # a pattern must exist at, not a bar it must clear pre-confirmation
 INSTANT_SIGNAL_THRESHOLD = 97
+GRADE_A_THRESHOLD        = 92.2  # Point 5/6: setup_score >= this = Grade A -> eligible for AI review
+VIP_AI_COINS             = {"MANA","RIVER","ENJ"}  # Point 2: ONLY these coins may ever call Claude
 MIN_PROFIT_TARGET        = 15.0
 SIGNAL_EXPIRY_MINUTES    = 120
 INSTANT_EXPIRY_MINUTES   = 30
@@ -101,7 +105,64 @@ ST_MULTIPLIER            = 3.0
 MIN_SL_PCT               = 0.02
 DEAD_HOUR_START          = 2
 DEAD_HOUR_END            = 7
+
+# Point 4: Macro-Time Awareness.
+# HONEST SCOPE: this bot has no live economic calendar API, so it cannot
+# know "FOMC in 10 minutes" in real time on its own. What it DOES do:
+#  (a) flags known low-liquidity weekend windows (Sat/Sun chop is real
+#      and doesn't need an API to detect),
+#  (b) checks a manually-maintained list below of major scheduled dates
+#      you update occasionally (FOMC, CPI, major unlocks) — add entries
+#      as "YYYY-MM-DD HH:MM" in IST, the bot pauses new signals for a
+#      window around each,
+#  (c) falls back to a volatility/spread-based "erratic market" read
+#      using existing ATR data as a real-time signal when (b) is empty.
+MACRO_EVENT_PAUSE_MIN_BEFORE = 30   # pause new signals starting 30 min before a listed event
+MACRO_EVENT_PAUSE_MIN_AFTER  = 30   # and for 30 min after, while the market digests it
+SCHEDULED_MACRO_EVENTS = [
+    # Add known high-impact events here as "YYYY-MM-DD HH:MM" (IST).
+    # Example: "2026-08-01 18:00",  # FOMC rate decision
+]
+
+def is_macro_event_window():
+    """Point 4(b): checks the manually-maintained scheduled events list."""
+    now = get_ist_datetime()
+    for ev_str in SCHEDULED_MACRO_EVENTS:
+        try:
+            ev_time = IST.localize(datetime.strptime(ev_str, "%Y-%m-%d %H:%M"))
+        except Exception:
+            continue
+        window_start = ev_time - timedelta(minutes=MACRO_EVENT_PAUSE_MIN_BEFORE)
+        window_end = ev_time + timedelta(minutes=MACRO_EVENT_PAUSE_MIN_AFTER)
+        if window_start <= now <= window_end:
+            return True, f"scheduled macro event at {ev_time.strftime('%H:%M IST')}"
+    return False, ""
+
+def is_weekend_low_liquidity():
+    """Point 4(a): Sat/Sun chop detection — doesn't need an API, just the clock."""
+    now = get_ist_datetime()
+    # Saturday (5) and Sunday (6) — weekday() is 0=Mon .. 6=Sun
+    return now.weekday() in (5, 6)
+
 BTC_CORRELATED           = ["ETH","BNB","SOL","AVAX","NEAR","APT","SUI"]
+
+# Point 3: Sector groupings — used for the "check the neighborhood" correlation
+# check before confirming a signal. Coins not in any listed sector are treated
+# as having no sector peers and skip this check (falls through, doesn't block).
+SECTOR_GROUPS = {
+    "gaming":     ["SAND","MANA","AXS","GALA","ENJ","PIXEL","RIVER","GMT","APE"],
+    "layer1":     ["ETH","SOL","AVAX","NEAR","APT","SUI","ADA","DOT","ATOM","TIA","SEI","ALGO","EGLD","FLOW","KAS"],
+    "defi":       ["UNI","AAVE","MKR","SNX","COMP","CRV","SUSHI","LDO","CAKE","1INCH","DYDX","GMX","PENDLE"],
+    "meme":       ["DOGE","SHIB","PEPE","WIF","FLOKI","BONK","ORDI","BOME","NOT","DOGS"],
+    "ai_compute": ["RNDR","FET","WLD","AR","AKT","IO","THETA"],
+    "l2":         ["ARB","OP","STRK","METIS","ZETA","MANTA"],
+    "oracle_data":["LINK","PYTH","GRT","BLUR"],
+}
+# Reverse lookup: coin -> sector name, built once at import time
+COIN_SECTOR = {}
+for _sector, _coins in SECTOR_GROUPS.items():
+    for _c in _coins:
+        COIN_SECTOR[_c] = _sector
 LEV_TIER_1               = ["BTC","ETH"]
 LEV_TIER_2               = ["BNB","SOL","XRP","ADA","AVAX","DOT","LINK","LTC",
                              "NEAR","UNI","ATOM","APT","SUI","ARB","OP","INJ"]
@@ -201,6 +262,29 @@ def save_pending_signals():
             s[coin]=d
         with open("pending_signals.json","w") as f: json.dump(s,f)
     except Exception as e: logger.error(f"save_pending: {e}")
+
+def save_retest_watchlist():
+    try:
+        s={}
+        for coin,w in list(retest_watchlist.items()):
+            d=dict(w)
+            if isinstance(d.get("logged_at"),datetime): d["logged_at"]=d["logged_at"].isoformat()
+            s[coin]=d
+        with open("retest_watchlist.json","w") as f: json.dump(s,f)
+    except Exception as e: logger.error(f"save_retest_watchlist: {e}")
+
+def load_retest_watchlist():
+    global retest_watchlist
+    try:
+        if not os.path.exists("retest_watchlist.json"): return
+        with open("retest_watchlist.json") as f: data=json.load(f)
+        for coin,w in data.items():
+            if w.get("logged_at"):
+                try: w["logged_at"]=datetime.fromisoformat(w["logged_at"])
+                except Exception: w["logged_at"]=get_ist_datetime()
+            retest_watchlist[coin]=w
+        logger.info(f"Loaded {len(retest_watchlist)} retest watchlist entries.")
+    except Exception as e: logger.error(f"load_retest_watchlist: {e}")
 
 def load_pending_signals():
     global pending_signals
@@ -654,6 +738,66 @@ def detect_double_top_pro(highs, lows, closes, vols, price, avg_vol):
     return breakdown and vol_ok
 
 
+def detect_volatility_contraction(closes, highs, lows, vols, price):
+    """
+    Point 2: Volatility Contraction Pattern (VCP) — catches the setup BEFORE
+    the breakout candle and its volume spike, instead of after.
+
+    Looks for: a prior impulse move, followed by a tightening range with
+    shrinking (dying) volume, price resting just under resistance / just
+    above support. This is the "coiling" phase — the bot flags it as a
+    signal candidate while the crowd is still waiting for volume confirmation.
+
+    Returns (direction, tightness_score) or (None, 0) if no contraction found.
+    """
+    if len(closes) < 40: return None, 0
+    lookback = closes[-40:]
+    look_highs = highs[-40:]
+    look_lows = lows[-40:]
+    look_vols = vols[-40:]
+
+    # Split into: impulse window (older) vs contraction window (recent 12 candles)
+    impulse = lookback[:-12]
+    contraction = lookback[-12:]
+    contraction_highs = look_highs[-12:]
+    contraction_lows = look_lows[-12:]
+    contraction_vols = look_vols[-12:]
+    impulse_vols = look_vols[:-12]
+
+    if len(impulse) < 10 or not impulse_vols: return None, 0
+
+    # 1. Was there a real prior impulse (up or down) into this range?
+    impulse_move_pct = (impulse[-1] - impulse[0]) / impulse[0] * 100 if impulse[0] > 0 else 0
+
+    # 2. Is the recent range genuinely tight (contracting)?
+    range_high = max(contraction_highs)
+    range_low = min(contraction_lows)
+    range_pct = (range_high - range_low) / price * 100 if price > 0 else 99
+
+    # 3. Is volume dying out in the contraction vs the impulse?
+    avg_impulse_vol = sum(impulse_vols) / len(impulse_vols)
+    avg_contraction_vol = sum(contraction_vols) / len(contraction_vols)
+    vol_dying = avg_contraction_vol < avg_impulse_vol * 0.75
+
+    # 4. Where does current price sit inside the tight range? (resting near the top = bullish coil)
+    pos_in_range = (price - range_low) / (range_high - range_low) if range_high > range_low else 0.5
+
+    tight_enough = range_pct < 3.5  # tight coil, not a wide chop
+    if not tight_enough or not vol_dying:
+        return None, 0
+
+    tightness_score = max(0, 100 - range_pct * 15)  # tighter range = higher score
+
+    # Bullish coil: prior impulse up, resting in upper half of tight range, dying volume
+    if impulse_move_pct > 4.0 and pos_in_range > 0.55:
+        return "BUY", tightness_score
+    # Bearish coil: prior impulse down, resting in lower half of tight range, dying volume
+    if impulse_move_pct < -4.0 and pos_in_range < 0.45:
+        return "SELL", tightness_score
+
+    return None, 0
+
+
 def detect_patterns(symbol, klines, price, btc_trend):
     """
     Upgraded pattern detection with:
@@ -689,103 +833,108 @@ def detect_patterns(symbol, klines, price, btc_trend):
     sup = ms["swing_low"] if ms["swing_low"] > 0 else min(lows[-30:-1])
     res = ms["swing_high"] if ms["swing_high"] > 0 else max(highs[-30:-1])
 
+    # ── NORMALIZED BASE SCORE (Point 5) ─────────────────────────
+    # Every pattern starts from the SAME base score (85.0). Previously
+    # Bull Flag started at 93-95 and RSI Reversal at 85 — meaning a fixed
+    # threshold like 92.2 could never fire for some patterns no matter how
+    # clean the setup was. Now the pattern only identifies WHAT kind of
+    # setup this is; confirmation bonuses (added later in scan_coins) are
+    # the only thing that pushes a score above the base. A 92.2+ score
+    # means "this setup earned strong confirmation," regardless of pattern.
+    PATTERN_BASE = 85.0
+
+    # ── Volatility Contraction Pattern — catches the coil BEFORE breakout (Point 2) ──
+    vcp_dir, vcp_tightness = detect_volatility_contraction(closes, highs, lows, vols, price)
+    if vcp_dir == "BUY" and alt_bull_ok:
+        p.append(("Volatility Contraction (Coiling)", PATTERN_BASE, "BUY"))
+    elif vcp_dir == "SELL" and alt_bear_ok:
+        p.append(("Volatility Contraction (Coiling)", PATTERN_BASE, "SELL"))
+
     # ── Professional Bull Flag ──
     if detect_bull_flag(closes, highs, lows, vols, avg_vol) and alt_bull_ok:
-        # BOS bonus
-        score = 95 if ms["bos"] else 93
-        p.append(("Bull Flag Break", score, "BUY"))
+        p.append(("Bull Flag Break", PATTERN_BASE, "BUY"))
 
     # ── Professional Bear Flag ──
     if detect_bear_flag(closes, highs, lows, vols, avg_vol) and alt_bear_ok:
-        score = 95 if ms["bos"] else 93
-        p.append(("Bear Flag Break", score, "SELL"))
+        p.append(("Bear Flag Break", PATTERN_BASE, "SELL"))
 
     # ── Breakout with structure confirmation ──
     if closes[-1] > max(highs[-20:-1]) and vols[-1] > avg_vol * 1.4:
         if alt_bull_ok:
-            score = 93 if (ms["hh"] and ms["hl"]) else 90
-            p.append(("Breakout", score, "BUY"))
+            p.append(("Breakout", PATTERN_BASE, "BUY"))
     elif closes[-1] < min(lows[-20:-1]) and vols[-1] > avg_vol * 1.4:
         if alt_bear_ok:
-            score = 93 if (ms["lh"] and ms["ll"]) else 90
-            p.append(("Breakout", score, "SELL"))
+            p.append(("Breakout", PATTERN_BASE, "SELL"))
 
     # ── Bullish Engulfing with structure ──
     if opens[-2] > closes[-2] and opens[-1] < closes[-2] and closes[-1] > opens[-2]:
         body_ratio = (closes[-1] - opens[-1]) / (opens[-2] - closes[-2]) if (opens[-2] - closes[-2]) > 0 else 0
         if body_ratio > 1.2 and alt_bull_ok:  # Must engulf by 20%
-            score = 91 if ms_bias == "bullish" else 88
-            p.append(("Bullish Engulfing", score, "BUY"))
+            p.append(("Bullish Engulfing", PATTERN_BASE, "BUY"))
 
     # ── Bearish Engulfing with structure ──
     elif opens[-2] < closes[-2] and opens[-1] > closes[-2] and closes[-1] < opens[-2]:
         body_ratio = (opens[-1] - closes[-1]) / (closes[-2] - opens[-2]) if (closes[-2] - opens[-2]) > 0 else 0
         if body_ratio > 1.2 and alt_bear_ok:
-            score = 91 if ms_bias == "bearish" else 88
-            p.append(("Bearish Engulfing", score, "SELL"))
+            p.append(("Bearish Engulfing", PATTERN_BASE, "SELL"))
 
     # ── EMA Trend with structure alignment ──
     if ema20 and ema50:
         if price > ema20 > ema50 and alt_bull_ok:
-            score = 90 if ms_bias == "bullish" else 87
-            p.append(("EMA Trend", score, "BUY"))
+            p.append(("EMA Trend", PATTERN_BASE, "BUY"))
         elif price < ema20 < ema50 and alt_bear_ok:
-            score = 90 if ms_bias == "bearish" else 87
-            p.append(("EMA Trend", score, "SELL"))
+            p.append(("EMA Trend", PATTERN_BASE, "SELL"))
 
     # ── Pullback to 20 EMA ──
     if ema20 and abs(price - ema20) / ema20 < 0.008:
         if price > ema50 and alt_bull_ok and ms_bias == "bullish":
-            p.append(("Pullback to 20 EMA", 88, "BUY"))
+            p.append(("Pullback to 20 EMA", PATTERN_BASE, "BUY"))
         elif price < ema50 and alt_bear_ok and ms_bias == "bearish":
-            p.append(("Pullback to 20 EMA", 88, "SELL"))
+            p.append(("Pullback to 20 EMA", PATTERN_BASE, "SELL"))
 
     # ── RSI Reversal (extreme only) ──
-    if rsi < 28 and alt_bull_ok:   p.append(("RSI Reversal", 85, "BUY"))
-    elif rsi > 72 and alt_bear_ok: p.append(("RSI Reversal", 85, "SELL"))
+    if rsi < 28 and alt_bull_ok:   p.append(("RSI Reversal", PATTERN_BASE, "BUY"))
+    elif rsi > 72 and alt_bear_ok: p.append(("RSI Reversal", PATTERN_BASE, "SELL"))
 
     # ── Momentum Surge ──
     mom = (closes[-1] - closes[-4]) / closes[-4] * 100 if len(closes) > 4 else 0
     if mom > 3.5 and vols[-1] > avg_vol * 1.2 and alt_bull_ok:
-        p.append(("Momentum Surge", 90, "BUY"))
+        p.append(("Momentum Surge", PATTERN_BASE, "BUY"))
     elif mom < -3.5 and vols[-1] > avg_vol * 1.2 and alt_bear_ok:
-        p.append(("Momentum Surge", 90, "SELL"))
+        p.append(("Momentum Surge", PATTERN_BASE, "SELL"))
 
     # ── Volume Spike ──
     if vols[-1] > avg_vol * 3.0:
         direction = "BUY" if closes[-1] > opens[-1] else "SELL"
         if (direction == "BUY" and alt_bull_ok) or (direction == "SELL" and alt_bear_ok):
-            p.append(("Volume Spike", 88, direction))
+            p.append(("Volume Spike", PATTERN_BASE, direction))
 
     # ── Support Bounce with structure ──
     if price <= sup * 1.008 and closes[-1] > opens[-1] and alt_bull_ok:
-        score = 92 if ms_bias == "bullish" else 88
-        p.append(("Support Bounce", score, "BUY"))
+        p.append(("Support Bounce", PATTERN_BASE, "BUY"))
 
     # ── Resistance Rejection with structure ──
     if price >= res * 0.992 and closes[-1] < opens[-1] and alt_bear_ok:
-        score = 92 if ms_bias == "bearish" else 88
-        p.append(("Resistance Rejection", score, "SELL"))
+        p.append(("Resistance Rejection", PATTERN_BASE, "SELL"))
 
     # ── Professional Double Bottom ──
     if detect_double_bottom_pro(highs, lows, closes, vols, price, avg_vol) and alt_bull_ok:
-        p.append(("Double Bottom", 93, "BUY"))
+        p.append(("Double Bottom", PATTERN_BASE, "BUY"))
 
     # ── Professional Double Top ──
     if detect_double_top_pro(highs, lows, closes, vols, price, avg_vol) and alt_bear_ok:
-        p.append(("Double Top", 93, "SELL"))
+        p.append(("Double Top", PATTERN_BASE, "SELL"))
 
     # ── Volume Breakout ──
     if price > res and vols[-1] > avg_vol * 2.2 and alt_bull_ok:
-        score = 94 if ms["bos"] else 91
-        p.append(("Volume Breakout", score, "BUY"))
+        p.append(("Volume Breakout", PATTERN_BASE, "BUY"))
 
     # ── BOS Signal (pure structure break) ──
     if ms["bos"] and not ms["choch"]:
         if ms_bias == "bullish" and alt_bull_ok:
-            p.append(("BOS Breakout", 92, "BUY"))
+            p.append(("BOS Breakout", PATTERN_BASE, "BUY"))
         elif ms_bias == "bearish" and alt_bear_ok:
-            p.append(("BOS Breakout", 92, "SELL"))
+            p.append(("BOS Breakout", PATTERN_BASE, "SELL"))
 
     return p
 
@@ -812,6 +961,12 @@ def is_good_trading_session():
     hour=datetime.now(IST).hour
     if DEAD_HOUR_START<=hour<DEAD_HOUR_END:
         logger.info(f"Dead session {hour}:xx IST"); return False
+    # Point 4(b): scheduled macro events are a genuine deliberate pause window,
+    # not indicator lag — kept as a hard block, same as opening a leveraged
+    # position 10 minutes before FOMC would be a bad idea for a human too.
+    is_macro, macro_note = is_macro_event_window()
+    if is_macro:
+        logger.info(f"Paused - {macro_note}"); return False
     return True
 
 def get_smart_leverage(symbol, atr_pct, score, grade="Grade B"):
@@ -850,6 +1005,15 @@ def get_smart_leverage(symbol, atr_pct, score, grade="Grade B"):
     return max(lev, 1)
 
 def get_signal_grade(score,whale,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,ob_imbalance=None,ms_bias=None,bos=False):
+    """
+    Point 6: The grade LABEL is now authoritative directly on the normalized
+    setup_score against GRADE_A_THRESHOLD (92.2) — this is the exact same
+    number the Score Gate uses to decide whether AI gets called. Previously
+    this function computed a separate 0-19 points system that could disagree
+    with the score-based gate (e.g. label "Grade B" on a signal that actually
+    triggered AI review). The points breakdown below is now purely supplementary
+    detail shown in the Telegram message, not what decides the grade name.
+    """
     breakdown=[]
     pts=0
     if score>=98:    pts+=3; breakdown.append(("🎯 Score ≥98",      3))
@@ -878,21 +1042,22 @@ def get_signal_grade(score,whale,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_
     else:                    breakdown.append(("📍 S/D Zone",        0))
     if adx_val>=35:  pts+=1; breakdown.append(("💪 ADX Strong",      1))
     else:                    breakdown.append(("💪 ADX",             0))
-    # New: Order book imbalance
     if ob_imbalance is not None and abs(ob_imbalance) > 0.2:
         pts+=1; breakdown.append(("📖 OB Imbalance",    1))
     else:            breakdown.append(("📖 Order Book",       0))
-    # New: Market structure alignment
     if ms_bias in ("bullish","bearish"):
         pts+=1; breakdown.append(("🏗️ Market Structure", 1))
     else:            breakdown.append(("🏗️ Structure",        0))
-    # New: BOS confirmation
     if bos:          pts+=1; breakdown.append(("🔥 BOS Confirm",     1))
     else:            breakdown.append(("🔥 BOS",              0))
-    if pts>=16:   grade="Grade A+ 🍀"
-    elif pts>=12: grade="Grade A 🍀"
-    elif pts>=8:  grade="Grade B"
-    else:         grade="Grade C"
+
+    # Grade label — authoritative on normalized score, matches the VIP Gate exactly.
+    if score >= GRADE_A_THRESHOLD:
+        grade = "Grade A+ 🍀" if score >= 96 else "Grade A 🍀"
+    elif score >= MIN_SETUP_SCORE:
+        grade = "Grade B"
+    else:
+        grade = "Grade C"
     return grade, pts, breakdown
 
 def get_position_size_pct(grade):
@@ -1049,17 +1214,115 @@ def is_btc_crashing():
     except Exception: return False
 
 def get_adjusted_score(pattern_name,base_score,market_condition):
+    """
+    FIX: previously this blended base_score with historical win rate (mc_wr)
+    using a factor up to 0.6 at 20+ signals — meaning a pattern with a 45%
+    historical win rate could drag an 85.0 normalized base down to ~61,
+    making it mathematically impossible to ever reach GRADE_A_THRESHOLD
+    (92.2) again, no matter how strong today's confirmation bonuses are.
+    That defeated the entire point of the normalized baseline (Point 5):
+    the score is supposed to reflect THIS setup's confirmation quality,
+    not get silently overridden by yesterday's win-rate history before
+    confirmations are even applied.
+
+    Now: base_score passes through untouched, except for the existing
+    lightweight `weight` multiplier (bounded 0.5x-1.5x, moves by only
+    0.1-0.15 per trade, only triggers at >=70% or <40% win rate — see
+    learn_from_trade()). That's a much gentler, bounded adjustment than
+    the removed blend, and genuinely bad patterns are still caught
+    separately by is_pattern_blacklisted() (win rate <40% over 10+ signals).
+    """
     stats=pattern_stats.get(pattern_name,{})
-    signals=stats.get("signals",0)
-    if signals<5: return base_score
-    overall_wr=(stats["wins"]/signals)*100
-    mc_wr=stats.get(f"{market_condition}_wr",overall_wr)
     weight=stats.get("weight",1.0)
-    if signals>=20:   pf=0.6
-    elif signals>=10: pf=0.4
-    else:             pf=0.2
-    adjusted=(base_score*(1-pf)+mc_wr*pf)*weight
+    adjusted=base_score*weight
     return min(round(adjusted,1),99.0)
+
+def check_sector_correlation(coin, direction):
+    """
+    Point 3: Trade like a human — check the "neighborhood" before confirming.
+    If the bot wants to BUY a gaming coin but the rest of the gaming sector
+    is red, that's a likely fake-out/trap rather than a genuine sector move.
+    Checks up to 4 sector peers' 15m price change; requires the majority to
+    agree with the trade direction. Coins with no defined sector, or fewer
+    than 2 peers with data, skip this check (returns True — doesn't block).
+    Returns (passes: bool, note: str) — this feeds the AI prompt as context
+    and can also be used as a soft scoring signal, not a hard block on its own,
+    since a genuine sector-leading move can happen before peers catch up.
+    """
+    sector = COIN_SECTOR.get(coin)
+    if not sector:
+        return True, "no sector defined"
+    peers = [c for c in SECTOR_GROUPS[sector] if c != coin][:4]
+    if len(peers) < 2:
+        return True, "insufficient sector peers"
+
+    agree = 0
+    checked = 0
+    for peer in peers:
+        try:
+            k = get_klines(peer+"USDT", "15m", 5)
+            if not k or len(k) < 3: continue
+            closes_p = [float(x[4]) for x in k]
+            change_pct = (closes_p[-1] - closes_p[-3]) / closes_p[-3] * 100 if closes_p[-3] > 0 else 0
+            checked += 1
+            if direction == "BUY" and change_pct > -0.3: agree += 1
+            elif direction == "SELL" and change_pct < 0.3: agree += 1
+        except Exception:
+            continue
+
+    if checked < 2:
+        return True, "insufficient sector data"
+
+    agree_ratio = agree / checked
+    passes = agree_ratio >= 0.5
+    note = f"sector {sector}: {agree}/{checked} peers agree"
+    return passes, note
+
+
+def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, ob_imbalance=None):
+    """
+    Point 5 (part 2): The confirmation bonus system.
+    Every pattern now starts at the same 85.0 base — this function is the
+    ONLY source of extra points above that base. A setup that reaches
+    92.2+ therefore means "this specific instance earned strong, measurable
+    confirmation," not "this happened to be a pattern type that scores high."
+
+    Bonus weights (deliberately generous so a genuinely strong setup can
+    clear the 92.2 Grade A line, per the spec):
+      +2.0  strong volume  (1.5x+ average)
+      +1.0  moderate volume (1.2x-1.5x average)
+      +3.0  HTF trend alignment (4h+1h both agree — tf_score==3)
+      +1.5  partial HTF alignment (tf_score==2)
+      +2.2  order book imbalance in trade's favor (>0.2 magnitude)
+      +1.5  strong ADX (>=30, real trend strength not chop)
+    """
+    bonus = 0.0
+    notes = []
+
+    avg_vol = sum(vols[-20:]) / 20 if len(vols) >= 20 else (vols[-1] if vols else 1)
+    vol_ratio = vols[-1] / avg_vol if avg_vol > 0 else 1.0
+    if vol_ratio >= 1.5:
+        bonus += 2.0; notes.append("volume strong (+2.0)")
+    elif vol_ratio >= 1.2:
+        bonus += 1.0; notes.append("volume moderate (+1.0)")
+
+    if tf_score == 3:
+        bonus += 3.0; notes.append("HTF fully aligned (+3.0)")
+    elif tf_score == 2:
+        bonus += 1.5; notes.append("HTF partially aligned (+1.5)")
+
+    if ob_imbalance is not None:
+        favors_buy = ob_imbalance > 0.2
+        favors_sell = ob_imbalance < -0.2
+        if (direction == "BUY" and favors_buy) or (direction == "SELL" and favors_sell):
+            bonus += 2.2; notes.append("order book favors trade (+2.2)")
+
+    adx_val = calculate_adx(klines)
+    if adx_val >= 30:
+        bonus += 1.5; notes.append("ADX strong (+1.5)")
+
+    return round(bonus, 1), notes
+
 
 def get_all_pattern_scores(patterns,market_condition):
     scored=[]
@@ -1914,8 +2177,15 @@ def cmd_hidden_gems():
             f"  🕐 {get_ist_time()}")
     return msg
 
-def ai_analyze_setup(coin, direction, klines, price, pattern, rsi_val, adx_val, vol_strength, is_volatile=False):
-    """Claude AI analyzes candles like a human trader. Cost ~$0.004 per call."""
+def ai_analyze_setup(coin, direction, klines, price, pattern, rsi_val, adx_val, vol_strength, is_volatile=False, penalty_notes=None):
+    """
+    Point 4: Claude AI analyzes candles like a human trader — but now framed
+    toward identifying BUILD-UP (coiling/absorption/calm-before-storm), not
+    just grading an already-confirmed move. This is the fix for the "by the
+    time every filter agrees the move is already gone" problem: the AI's job
+    is to judge whether this is EARLY, MID, or LATE stage, not just clean/messy.
+    Cost ~$0.004 per call.
+    """
     if not ANTHROPIC_API_KEY: return None
     try:
         recent=klines[-20:]
@@ -1930,34 +2200,46 @@ def ai_analyze_setup(coin, direction, klines, price, pattern, rsi_val, adx_val, 
             candle_desc.append(f"C{i+1}:{ctype} {strength} low_wick={lower_wick:.0f}% up_wick={upper_wick:.0f}%")
         dir_word="LONG (BUY)" if direction=="BUY" else "SHORT (SELL)"
         vol_note = "Volatility is currently ELEVATED vs normal — could mean a real breakout OR just chop. Judge from candle quality." if is_volatile else "Volatility is normal."
+        penalty_line = f"Note: scanner flagged secondary weakness — {', '.join(penalty_notes)}. Weigh this against price action quality.\n" if penalty_notes else ""
         prompt=(f"You are an experienced discretionary crypto trader deciding whether to actually "
-                f"take this trade with real money, the way you would after watching a chart for an hour.\n\n"
+                f"take this trade with real money, the way you would after watching a chart for an hour "
+                f"across multiple timeframes.\n\n"
                 f"Setup: {coin}/USDT {dir_word}\n"
                 f"Pattern flagged by scanner: {pattern}\n"
                 f"Price: {format_price(price)}\n"
                 f"RSI: {rsi_val:.0f} | ADX (trend strength): {adx_val:.0f} | Volume: {vol_strength:.1f}x average\n"
-                f"{vol_note}\n\n"
+                f"{vol_note}\n{penalty_line}\n"
                 f"Last 20 candles, oldest to newest (C20 = right now):\n"+"\n".join(candle_desc)+
-                f"\n\nThink like a trader reading this chart: Is momentum genuine or exhausted? "
-                f"Do the wicks show rejection or conviction? Does the recent candle sequence support "
-                f"{direction} continuing, or does it look like a trap / late entry / chop? "
-                f"Would you actually risk money on this right now?\n\n"
+                f"\n\nDo NOT just grade whether momentum already confirmed — a confirmed breakout "
+                f"candle often means the easy money is already made. Instead, judge the STAGE of this "
+                f"move by looking for signs of build-up: volatility contraction (tightening range), "
+                f"absorption (heavy volume with small net price change = someone accumulating/distributing "
+                f"quietly), dying volume before a squeeze, or wicks showing rejection at a level repeatedly "
+                f"tested. A calm, tightening range sitting just under resistance (or above support) with "
+                f"fading volume is often the BEST entry — before the crowd's breakout signal fires.\n\n"
+                f"Classify the STAGE: EARLY (still coiling/building, low risk entry), MID (breaking out now, "
+                f"some room left), or LATE (already extended, chasing).\n\n"
                 f"Respond EXACTLY in this format:\n"
                 f"VERDICT: [CLEAN/MESSY]\nCONFIDENCE: [HIGH/MEDIUM/LOW]\n"
-                f"TRADE: [YES/NO]\nREASONING: [2 sentences max, be specific about what you saw]")
+                f"STAGE: [EARLY/MID/LATE]\nTRADE: [YES/NO]\n"
+                f"ETA_READ: [short phrase, e.g. 'could take 2-4h to develop' or 'move may already be exhausted']\n"
+                f"REASONING: [2 sentences max, be specific about what you saw]")
         res=requests.post("https://api.anthropic.com/v1/messages",
             headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01",
                      "content-type":"application/json"},
-            json={"model":"claude-haiku-4-5-20251001","max_tokens":180,
+            json={"model":"claude-haiku-4-5-20251001","max_tokens":220,
                   "messages":[{"role":"user","content":prompt}]},timeout=15)
         if res.status_code!=200: return None
         text=res.json()["content"][0]["text"].strip()
         verdict="CLEAN" if "VERDICT: CLEAN" in text else "MESSY"
         confidence="HIGH" if "CONFIDENCE: HIGH" in text else "MEDIUM" if "CONFIDENCE: MEDIUM" in text else "LOW"
+        stage="EARLY" if "STAGE: EARLY" in text else "MID" if "STAGE: MID" in text else "LATE" if "STAGE: LATE" in text else "UNKNOWN"
         trade="YES" in (text.split("TRADE:")[-1].split("\n")[0] if "TRADE:" in text else "")
+        eta_read=text.split("ETA_READ:")[-1].split("REASONING:")[0].strip() if "ETA_READ:" in text else ""
         reasoning=text.split("REASONING:")[-1].strip() if "REASONING:" in text else ""
-        logger.info(f"AI {coin}: {verdict}/{confidence}/TRADE:{'YES' if trade else 'NO'}")
-        return {"verdict":verdict,"confidence":confidence,"trade":trade,"reasoning":reasoning}
+        logger.info(f"AI {coin}: {verdict}/{confidence}/STAGE:{stage}/TRADE:{'YES' if trade else 'NO'}")
+        return {"verdict":verdict,"confidence":confidence,"stage":stage,"trade":trade,
+                "eta_read":eta_read,"reasoning":reasoning}
     except Exception as e:
         logger.warning(f"AI error {coin}: {e}"); return None
 
@@ -2063,6 +2345,33 @@ def check_profit_milestones(coin,trade,price,pnl):
         send_telegram(_ms("🚀",f"MILESTONE 3  •  +{m3:.1f}% reached",
                           f"SL moved to lock in ~80% of current gain ({fmt_pnl(m3*0.8)} minimum). Final target +{target:.1f}%!",sl_price))
 
+def get_ltf_confirmation(symbol, direction):
+    """
+    Point 3: Lower Timeframe (5m) execution trigger.
+    The 15m/1h scan builds the candidate ("watchlist" logic already happening
+    via the main scan cycle) — this checks the 5m chart for the actual
+    execution-timing confirmation, so entries aren't stale by a full 15m candle.
+    Returns (confirmed: bool, note: str) — this is informational/scoring,
+    not a hard block, since 5m data can be noisy on its own.
+    """
+    try:
+        k5 = get_klines(symbol, "5m", 20)
+        if not k5 or len(k5) < 10:
+            return True, "5m data unavailable"
+        closes5 = [float(k[4]) for k in k5]
+        last3_move = (closes5[-1] - closes5[-3]) / closes5[-3] * 100 if closes5[-3] > 0 else 0
+        rsi5 = calculate_rsi(closes5)
+        if direction == "BUY":
+            confirmed = last3_move > -0.3 and rsi5 > 35
+            note = f"5m momentum {'holding' if confirmed else 'fading'} ({last3_move:+.2f}%, RSI {rsi5:.0f})"
+        else:
+            confirmed = last3_move < 0.3 and rsi5 < 65
+            note = f"5m momentum {'holding' if confirmed else 'fading'} ({last3_move:+.2f}%, RSI {rsi5:.0f})"
+        return confirmed, note
+    except Exception:
+        return True, "5m check unavailable"
+
+
 def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition="bull"):
     global sent_coins,coin_cooldowns
     if check_circuit_breaker(): return False
@@ -2083,24 +2392,61 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     rsi_ok=is_rsi_valid(closes,setup["direction"])
     funding_ok=is_funding_favorable(setup["symbol"],setup["direction"])
     is_volatile=not is_volatility_normal(klines_15m)
+
+    # ── WEIGHTED SCORING (Point 1) ──────────────────────────────
+    # Secondary indicators no longer hard-block a signal outright.
+    # Each miss subtracts from setup_score instead, so a genuinely
+    # strong price-action pattern can still survive one weak indicator,
+    # while stacking multiple misses correctly kills a weak setup.
+    score_penalty = 0
+    penalty_notes = []
     if not vol_ok:
-        logger.info(f"{coin} rejected - volume"); return False
+        score_penalty += 6; penalty_notes.append("volume soft (-6)")
     if not rsi_ok:
-        logger.info(f"{coin} rejected - RSI"); return False
-    # Volatility is no longer a hard block — high volatility is common in real breakouts.
-    # It's passed to the AI as context instead so it can judge, like a human would.
+        score_penalty += 5; penalty_notes.append("RSI stretched (-5)")
+    if not funding_ok:
+        score_penalty += 4; penalty_notes.append("funding against (-4)")
     if is_volatile:
         logger.info(f"{coin} high volatility — noted, letting AI judge")
-    if not funding_ok:
-        logger.info(f"{coin} rejected - funding"); return False
+
+    # Point 3: LTF (5m) execution timing check — informational, feeds scoring not a hard block
+    ltf_confirmed, ltf_note = get_ltf_confirmation(setup["symbol"], setup["direction"])
+    if not ltf_confirmed:
+        score_penalty += 4; penalty_notes.append(f"5m timing weak (-4)")
+    logger.info(f"{coin} LTF check: {ltf_note}")
+
+    # Point 3: Sector correlation — "check the neighborhood" like a human trader.
+    # A coin moving against its own sector is more likely a fake-out/trap.
+    sector_ok, sector_note = check_sector_correlation(coin, setup["direction"])
+    if not sector_ok:
+        score_penalty += 5; penalty_notes.append(f"sector diverging (-5)")
+    logger.info(f"{coin} sector check: {sector_note}")
+
+    # Point 4(a): weekend low-liquidity — soft penalty, not a full block.
+    # Weekend moves can be genuine, but choppy low-volume weekend action
+    # is a well-known trap generator, so it costs a modest score deduction
+    # rather than shutting the bot down for 2 out of every 7 days.
+    if is_weekend_low_liquidity():
+        score_penalty += 3; penalty_notes.append("weekend low-liquidity (-3)")
+
     st_15m=calculate_supertrend(klines_15m,ST_PERIOD,ST_MULTIPLIER)
     st_1h=calculate_supertrend(klines_1h,ST_PERIOD,ST_MULTIPLIER) if klines_1h else st_15m
-    # SuperTrend lags price — instead of requiring exact match (which kills the earliest,
-    # best entries), we only hard-block when SuperTrend is strongly opposed on BOTH timeframes.
     st_ok=(st_15m==setup["direction"]) and (st_1h==setup["direction"])
     st_strongly_against = (st_15m!=setup["direction"]) and (st_1h!=setup["direction"])
     if st_strongly_against:
+        # Both timeframes opposed is still a hard block — this isn't lag,
+        # it's the trend actively pointing the other way on two timeframes.
         logger.info(f"{coin} rejected - SuperTrend opposed on both 15m+1h"); return False
+    elif st_15m!=setup["direction"] or st_1h!=setup["direction"]:
+        score_penalty += 5; penalty_notes.append("SuperTrend partial lag (-5)")
+
+    setup["setup_score"] = max(setup["setup_score"] - score_penalty, 0)
+    if penalty_notes:
+        logger.info(f"{coin} score adjusted: -{score_penalty} ({', '.join(penalty_notes)}) -> {setup['setup_score']:.1f}")
+    # A setup that's now too weak after penalties gets dropped here,
+    # instead of earlier — so strong price action had a chance to survive.
+    if setup["setup_score"] < MIN_SETUP_SCORE - 8:
+        logger.info(f"{coin} rejected - score too low after penalties ({setup['setup_score']:.1f})"); return False
     vwap=calculate_vwap(klines_15m); vwap_ok=False; vwap_label="N/A"
     if vwap:
         if setup["direction"]=="BUY" and entry>vwap:    vwap_ok=True; vwap_label=f"Above {format_price(vwap)}"
@@ -2134,18 +2480,38 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
             else: return False
     setup["leverage"]=lev
 
-    # AI analysis runs on EVERY signal that passes filters
+    # ── SCORE GATE + VIP WATCHLIST (Points 1, 2, 6) ─────────────
+    # Exclusive VIP Gate: Claude is called if and only if
+    #   (1) coin is in VIP_AI_COINS, AND
+    #   (2) setup_score >= GRADE_A_THRESHOLD (92.2)
+    # Every other coin — regardless of score — executes on pure code/math.
+    # This is a strict AND, not an OR: a random altcoin scoring 99 never
+    # calls Claude, and a VIP coin scoring 88 never calls Claude either.
     ai_result=None
-    vols_ai=[float(k[5]) for k in klines_15m]
-    avg_vol_ai=sum(vols_ai[-20:])/20 if len(vols_ai)>=20 else 1
-    vol_str_ai=vols_ai[-1]/avg_vol_ai if avg_vol_ai>0 else 1.0
-    rsi_ai=calculate_rsi(closes)
-    adx_ai=calculate_adx(klines_15m)
-    ai_result=ai_analyze_setup(coin,setup["direction"],klines_15m,entry,
-                               setup["pattern"],rsi_ai,adx_ai,vol_str_ai,is_volatile)
-    if ai_result and ai_result["trade"]==False:
-        logger.info(f"{coin} rejected by AI — {ai_result['verdict']}/{ai_result['confidence']}")
-        return False
+    is_grade_a = setup["setup_score"] >= GRADE_A_THRESHOLD
+    is_vip = coin in VIP_AI_COINS
+    if is_vip and is_grade_a:
+        vols_ai=[float(k[5]) for k in klines_15m]
+        avg_vol_ai=sum(vols_ai[-20:])/20 if len(vols_ai)>=20 else 1
+        vol_str_ai=vols_ai[-1]/avg_vol_ai if avg_vol_ai>0 else 1.0
+        rsi_ai=calculate_rsi(closes)
+        adx_ai=calculate_adx(klines_15m)
+        logger.info(f"{coin} VIP + Grade A ({setup['setup_score']:.1f}) — calling Claude for final verification")
+        ai_result=ai_analyze_setup(coin,setup["direction"],klines_15m,entry,
+                                   setup["pattern"],rsi_ai,adx_ai,vol_str_ai,is_volatile,penalty_notes)
+        if ai_result and ai_result["trade"]==False:
+            logger.info(f"{coin} rejected by AI — {ai_result['verdict']}/{ai_result['confidence']}")
+            return False
+        if ai_result and ai_result.get("stage")=="LATE":
+            logger.info(f"{coin} AI flagged stage LATE — logging as retest candidate instead of chasing")
+            highs_r=[float(k[2]) for k in klines_15m]; lows_r=[float(k[3]) for k in klines_15m]
+            log_retest_candidate(coin,setup["symbol"],setup["direction"],closes,highs_r,lows_r,setup["pattern"])
+            return False
+    elif is_vip and not is_grade_a:
+        logger.info(f"{coin} is VIP but score {setup['setup_score']:.1f} below Grade A ({GRADE_A_THRESHOLD}) — executing on pure code, no AI call")
+    else:
+        logger.info(f"{coin} not on VIP watchlist — executing on pure code, no AI call")
+
     price_range=(max(closes[-10:])-min(closes[-10:]))/10
     eta=int(abs(tp-entry)/(price_range if price_range>0 else 0.001)*15)
     eta=max(30,min(eta,1440)); setup["eta_minutes"]=eta
@@ -2284,11 +2650,18 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     if ai_result:
         v_em="✅" if ai_result["verdict"]=="CLEAN" else "⚠️"
         c_em="🟢" if ai_result["confidence"]=="HIGH" else "🟡" if ai_result["confidence"]=="MEDIUM" else "🔴"
+        stage_em={"EARLY":"🌱","MID":"🔥","LATE":"⏰"}.get(ai_result.get("stage","UNKNOWN"),"❔")
         msg+=f"\n  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         msg+=f"  🧠 <b>AI ANALYSIS</b>\n"
         msg+=f"  {v_em} Pattern: <b>{ai_result['verdict']}</b>  {c_em} Confidence: <b>{ai_result['confidence']}</b>\n"
+        if ai_result.get("stage") and ai_result["stage"]!="UNKNOWN":
+            msg+=f"  {stage_em} Stage: <b>{ai_result['stage']}</b>\n"
+        if ai_result.get("eta_read"):
+            msg+=f"  ⏱️ {ai_result['eta_read']}\n"
         if ai_result['reasoning']:
             msg+=f"  💡 {ai_result['reasoning']}\n"
+        if penalty_notes:
+            msg+=f"  📉 Score adj: {', '.join(penalty_notes)}\n"
     msg += f"  ⏳ ETA: ~{eta} min  •  ⏰ Exp: {expiry_str}\n"
     msg += f"  🕐 {get_ist_time()}"
     setup.update({"entry":entry,"sl":sl,"tp":tp,"timestamp":get_ist_datetime(),
@@ -2467,6 +2840,7 @@ def poll_telegram():
                             msg+=f"  🕐 {get_ist_time()}"
                             send_telegram(msg)
                         else: send_telegram(f"{_H('PENDING SIGNALS','⏳')}\n\n  ⚪ No pending signals.\n\n  🕐 {get_ist_time()}")
+                    elif txt_slash=="/retests":   safe_send(get_retest_watchlist_text,"👀 Retests")
                     elif txt_slash=="/stats":    safe_send(get_pattern_stats_text,"📈 Stats")
                     elif txt_slash=="/summary":  safe_send(get_10day_summary_text,"📅 Summary")
                     elif txt_slash=="/streak":   safe_send(get_streak_text,"🔥 Streak")
@@ -2544,6 +2918,7 @@ def poll_telegram():
                             f"  Tap a button or type a command:\n\n"
                             f"  📊 /trades    — Active trades\n"
                             f"  ⏳ /pending   — Pending signals\n"
+                            f"  👀 /retests   — Coins watched for pullback\n"
                             f"  📈 /stats     — Pattern stats\n"
                             f"  🧠 /analyst   — AI reviews open trades\n"
                             f"  🔮 /counsel   — AI suggestion per trade\n"
@@ -2789,6 +3164,82 @@ def scan_river(now,market_condition):
         last_river_time=now
     except Exception as e: logger.error(f"River: {e}",exc_info=True)
 
+def is_move_already_extended(closes, direction):
+    """
+    Point 5: Detects if a move has already run too far to chase.
+    If price moved 8%+ in the last 12 candles in the signal direction,
+    the easy part of the move is likely already gone.
+    """
+    if len(closes) < 12: return False
+    recent = closes[-12:]
+    move_pct = (recent[-1] - recent[0]) / recent[0] * 100 if recent[0] > 0 else 0
+    if direction == "BUY" and move_pct > 8.0: return True
+    if direction == "SELL" and move_pct < -8.0: return True
+    return False
+
+
+def log_retest_candidate(coin, symbol, direction, closes, highs, lows, pattern):
+    """
+    Point 5: Silent background logging. When a move is too extended to chase,
+    log the breakout level as a Demand/Supply zone to watch for a pullback,
+    instead of sending a push notification. Visible via /retests command,
+    and only pings Telegram once price actually returns to the level.
+    """
+    global retest_watchlist
+    # Use the recent swing as the level to watch for a retest back to
+    level = min(lows[-12:]) if direction == "BUY" else max(highs[-12:])
+    retest_watchlist[coin] = {
+        "symbol": symbol,
+        "direction": direction,
+        "level": level,
+        "pattern": pattern,
+        "logged_at": get_ist_datetime(),
+        "current_price": closes[-1],
+        "notified": False
+    }
+    save_retest_watchlist()
+    logger.info(f"{coin} move already extended — logged retest watch at {format_price(level)} (silent, no push)")
+
+
+def check_retest_triggers():
+    """
+    Point 5: Runs each cycle against the silent watchlist. Only sends an
+    active Telegram ping when price actually pulls back to the logged level —
+    this is the one case where a push notification is warranted.
+    """
+    global retest_watchlist
+    triggered = []
+    for coin, w in list(retest_watchlist.items()):
+        # Expire stale watches after 12 hours — the setup is no longer relevant
+        if (get_ist_datetime() - w["logged_at"]).total_seconds() > 12*3600:
+            del retest_watchlist[coin]; continue
+        price = get_price(w["symbol"])
+        if not price: continue
+        near_level = abs(price - w["level"]) / w["level"] * 100 < 1.0 if w["level"] > 0 else False
+        if near_level and not w["notified"]:
+            w["notified"] = True
+            triggered.append((coin, w, price))
+    if triggered: save_retest_watchlist()
+    return triggered
+
+
+def get_retest_watchlist_text():
+    if not retest_watchlist:
+        return f"{_H('RETEST WATCHLIST','👀')}\n\n  🌙 No coins currently being watched for retest.\n\n  🕐 {get_ist_time()}"
+    lines = [f"{_H('RETEST WATCHLIST','👀')}\n"]
+    for coin, w in retest_watchlist.items():
+        price = get_price(w["symbol"]) or w["current_price"]
+        dist = abs(price - w["level"]) / w["level"] * 100 if w["level"] > 0 else 0
+        dir_em = "🟢" if w["direction"] == "BUY" else "🔴"
+        age_min = int((get_ist_datetime() - w["logged_at"]).total_seconds() / 60)
+        lines.append(
+            f"  {dir_em} <b>{coin}</b> {w['direction']} — watching <code>{format_price(w['level'])}</code>\n"
+            f"     now {format_price(price)} ({dist:.1f}% away) · {w['pattern']} · {age_min}m ago\n"
+        )
+    lines.append(f"\n  🕐 {get_ist_time()}")
+    return "\n".join(lines)
+
+
 def scan_coins(btc_trend,fng,market_condition):
     btc_crashing=is_btc_crashing(); signals_this_cycle=0
     for coin in COINS:
@@ -2819,9 +3270,21 @@ def scan_coins(btc_trend,fng,market_condition):
                 if tf_score==-1: logger.info(f"Skip {coin} {direction} - counter-trend"); continue
                 extras=[p[0] for p in dir_pats[1:3]]
                 pt=primary+(" + "+" + ".join(extras) if extras else "")
-                confirm_bonus=min(len(dir_pats)*0.5,3.0)
-                score=min(adj_score+confirm_bonus,99)
+                vols_chk=[float(k[5]) for k in klines]
+                ob_imb,_=get_orderbook_imbalance(symbol)
+                confirm_bonus,bonus_notes=compute_confirmation_bonus(symbol,direction,klines,vols_chk,tf_score,ob_imb)
+                # Extra-pattern confluence still counts, but modestly — it's not the main driver anymore
+                confluence_bonus=min(len(dir_pats)*0.3,1.0)
+                score=min(adj_score+confirm_bonus+confluence_bonus,99)
+                if bonus_notes:
+                    logger.info(f"{coin} {direction} confirmation: base={adj_score:.1f} +{confirm_bonus} ({', '.join(bonus_notes)}) -> {score:.1f}")
                 if score<MIN_SETUP_SCORE: continue
+                closes_chk=[float(k[4]) for k in klines]
+                highs_chk=[float(k[2]) for k in klines]
+                lows_chk=[float(k[3]) for k in klines]
+                if "Volatility Contraction" not in primary and is_move_already_extended(closes_chk,direction):
+                    log_retest_candidate(coin,symbol,direction,closes_chk,highs_chk,lows_chk,pt)
+                    continue
                 atr=calculate_atr(klines); atr_pct=(atr/price)*100 if price>0 else 0
                 lev=get_smart_leverage(symbol,atr_pct,score)
                 setup={"coin":coin,"symbol":symbol,"direction":direction,"pattern":pt,
@@ -2837,7 +3300,7 @@ def scan_coins(btc_trend,fng,market_condition):
 
 def main():
     global last_batch_time,last_river_time,last_hourly_time,last_pnl_update_time,last_weekly_report_day
-    load_alerts(); load_circuit_breaker(); load_pending_signals()
+    load_alerts(); load_circuit_breaker(); load_pending_signals(); load_retest_watchlist()
     cloud_load_all()   # loads journal, pattern_stats, learning, active_trades from Supabase (falls back to local JSON)
     threading.Thread(target=poll_telegram,daemon=True).start()
     logger.info(f"{BOT_NAME} {BOT_VERSION} starting...")
@@ -2892,6 +3355,19 @@ def main():
             check_active_trades()
             expire_pending_signals()
             check_price_alerts()
+            for coin,w,price in check_retest_triggers():
+                dir_em="🟢 LONG" if w["direction"]=="BUY" else "🔴 SHORT"
+                send_telegram(
+                    f"👀 <b>RETEST TRIGGERED — {coin}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"  {dir_em}  •  {w['pattern']}\n"
+                    f"  Missed the initial move — price pulled back to\n"
+                    f"  the watched level <code>{format_price(w['level'])}</code>\n"
+                    f"  Now: <code>{format_price(price)}</code>\n\n"
+                    f"  Check the chart — this may be your entry.\n"
+                    f"  🕐 {get_ist_time()}"
+                )
+                logger.info(f"RETEST PING sent: {coin}")
             now=time.time()
             if (now-last_hourly_time)>=3600:          send_hourly_report();   last_hourly_time=now
             if (now-last_pnl_update_time)>=3600:      send_live_pnl_update(); last_pnl_update_time=now
