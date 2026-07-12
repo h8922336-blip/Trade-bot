@@ -15,8 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -65,7 +65,7 @@ pattern_stats = {p: {"signals":0,"wins":0,"losses":0,"total_pnl":0.0,"weight":1.
     "EMA Trend","Breakout","Pullback to 20 EMA","RSI Reversal","Momentum Surge",
     "Volume Spike","Double Bottom","Double Top","Support Bounce","Resistance Rejection",
     "Bullish Engulfing","Bearish Engulfing","Volume Breakout","Bull Flag Break","Bear Flag Break",
-    "BOS Breakout"
+    "BOS Breakout","Change of Character (ChoCh)"
 ]}
 
 last_update_id         = None
@@ -833,108 +833,133 @@ def detect_patterns(symbol, klines, price, btc_trend):
     sup = ms["swing_low"] if ms["swing_low"] > 0 else min(lows[-30:-1])
     res = ms["swing_high"] if ms["swing_high"] > 0 else max(highs[-30:-1])
 
-    # ── NORMALIZED BASE SCORE (Point 5) ─────────────────────────
-    # Every pattern starts from the SAME base score (85.0). Previously
-    # Bull Flag started at 93-95 and RSI Reversal at 85 — meaning a fixed
-    # threshold like 92.2 could never fire for some patterns no matter how
-    # clean the setup was. Now the pattern only identifies WHAT kind of
-    # setup this is; confirmation bonuses (added later in scan_coins) are
-    # the only thing that pushes a score above the base. A 92.2+ score
-    # means "this setup earned strong confirmation," regardless of pattern.
-    PATTERN_BASE = 85.0
+    # ── TIER 1 / TIER 2 BASE SCORES (Hard AI Cap) ───────────────
+    # Tier 1 (AI-eligible): Volatility Contraction, Double Bottom/Top,
+    #   Bull/Bear Flags, Zone Bounces (Support/Resistance), BOS Breakout.
+    #   Base 88.0 — chosen specifically because it's the value in the
+    #   stated 88.0-90.0 range that genuinely "easily hits the AI
+    #   threshold with just a little volume": 88.0 + zone bonus (+3.5)
+    #   + one more confirmation reaches 92.2+ without needing everything
+    #   maxed out. At 90.0, even strong volume alone falls short (92.0).
+    #
+    # Tier 2 (auto-execute only, mathematically banned from AI):
+    #   Engulfing, RSI Reversal, EMA Trend, Pullback, Momentum Surge,
+    #   Volume Spike. Base 75.0. These are EXCLUDED from the Zone, BOS,
+    #   and ChoCh bonuses entirely in compute_confirmation_bonus (not
+    #   just "start lower" — structurally cannot receive them), so their
+    #   real ceiling is 75.0 + HTF(3.0) + OB(2.2) + vol(2.0) + ADX(1.5)
+    #   = 83.7, safely under both the stated 85.0 ceiling and nowhere
+    #   near 92.2. This is a hard mathematical guarantee, not a
+    #   probabilistic one.
+    TIER1_BASE = 88.0
+    TIER2_BASE = 75.0
 
-    # ── Volatility Contraction Pattern — catches the coil BEFORE breakout (Point 2) ──
+    # ── Volatility Contraction Pattern — Tier 1 ──
     vcp_dir, vcp_tightness = detect_volatility_contraction(closes, highs, lows, vols, price)
     if vcp_dir == "BUY" and alt_bull_ok:
-        p.append(("Volatility Contraction (Coiling)", PATTERN_BASE, "BUY"))
+        p.append(("Volatility Contraction (Coiling)", TIER1_BASE, "BUY"))
     elif vcp_dir == "SELL" and alt_bear_ok:
-        p.append(("Volatility Contraction (Coiling)", PATTERN_BASE, "SELL"))
+        p.append(("Volatility Contraction (Coiling)", TIER1_BASE, "SELL"))
 
-    # ── Professional Bull Flag ──
+    # ── Professional Bull Flag — Tier 1 ──
     if detect_bull_flag(closes, highs, lows, vols, avg_vol) and alt_bull_ok:
-        p.append(("Bull Flag Break", PATTERN_BASE, "BUY"))
+        p.append(("Bull Flag Break", TIER1_BASE, "BUY"))
 
-    # ── Professional Bear Flag ──
+    # ── Professional Bear Flag — Tier 1 ──
     if detect_bear_flag(closes, highs, lows, vols, avg_vol) and alt_bear_ok:
-        p.append(("Bear Flag Break", PATTERN_BASE, "SELL"))
+        p.append(("Bear Flag Break", TIER1_BASE, "SELL"))
 
-    # ── Breakout with structure confirmation ──
+    # ── Breakout with structure confirmation — Tier 1 (zone-adjacent behavior) ──
     if closes[-1] > max(highs[-20:-1]) and vols[-1] > avg_vol * 1.4:
         if alt_bull_ok:
-            p.append(("Breakout", PATTERN_BASE, "BUY"))
+            p.append(("Breakout", TIER1_BASE, "BUY"))
     elif closes[-1] < min(lows[-20:-1]) and vols[-1] > avg_vol * 1.4:
         if alt_bear_ok:
-            p.append(("Breakout", PATTERN_BASE, "SELL"))
+            p.append(("Breakout", TIER1_BASE, "SELL"))
 
-    # ── Bullish Engulfing with structure ──
+    # ── Bullish Engulfing — Tier 2 (auto-execute only) ──
     if opens[-2] > closes[-2] and opens[-1] < closes[-2] and closes[-1] > opens[-2]:
         body_ratio = (closes[-1] - opens[-1]) / (opens[-2] - closes[-2]) if (opens[-2] - closes[-2]) > 0 else 0
         if body_ratio > 1.2 and alt_bull_ok:  # Must engulf by 20%
-            p.append(("Bullish Engulfing", PATTERN_BASE, "BUY"))
+            p.append(("Bullish Engulfing", TIER2_BASE, "BUY"))
 
-    # ── Bearish Engulfing with structure ──
+    # ── Bearish Engulfing — Tier 2 ──
     elif opens[-2] < closes[-2] and opens[-1] > closes[-2] and closes[-1] < opens[-2]:
         body_ratio = (opens[-1] - closes[-1]) / (closes[-2] - opens[-2]) if (closes[-2] - opens[-2]) > 0 else 0
         if body_ratio > 1.2 and alt_bear_ok:
-            p.append(("Bearish Engulfing", PATTERN_BASE, "SELL"))
+            p.append(("Bearish Engulfing", TIER2_BASE, "SELL"))
 
-    # ── EMA Trend with structure alignment ──
+    # ── EMA Trend — Tier 2 ──
     if ema20 and ema50:
         if price > ema20 > ema50 and alt_bull_ok:
-            p.append(("EMA Trend", PATTERN_BASE, "BUY"))
+            p.append(("EMA Trend", TIER2_BASE, "BUY"))
         elif price < ema20 < ema50 and alt_bear_ok:
-            p.append(("EMA Trend", PATTERN_BASE, "SELL"))
+            p.append(("EMA Trend", TIER2_BASE, "SELL"))
 
-    # ── Pullback to 20 EMA ──
+    # ── Pullback to 20 EMA — Tier 2 ──
     if ema20 and abs(price - ema20) / ema20 < 0.008:
         if price > ema50 and alt_bull_ok and ms_bias == "bullish":
-            p.append(("Pullback to 20 EMA", PATTERN_BASE, "BUY"))
+            p.append(("Pullback to 20 EMA", TIER2_BASE, "BUY"))
         elif price < ema50 and alt_bear_ok and ms_bias == "bearish":
-            p.append(("Pullback to 20 EMA", PATTERN_BASE, "SELL"))
+            p.append(("Pullback to 20 EMA", TIER2_BASE, "SELL"))
 
-    # ── RSI Reversal (extreme only) ──
-    if rsi < 28 and alt_bull_ok:   p.append(("RSI Reversal", PATTERN_BASE, "BUY"))
-    elif rsi > 72 and alt_bear_ok: p.append(("RSI Reversal", PATTERN_BASE, "SELL"))
+    # ── RSI Reversal (extreme only) — Tier 2 ──
+    if rsi < 28 and alt_bull_ok:   p.append(("RSI Reversal", TIER2_BASE, "BUY"))
+    elif rsi > 72 and alt_bear_ok: p.append(("RSI Reversal", TIER2_BASE, "SELL"))
 
-    # ── Momentum Surge ──
+    # ── Momentum Surge — Tier 2 ──
     mom = (closes[-1] - closes[-4]) / closes[-4] * 100 if len(closes) > 4 else 0
     if mom > 3.5 and vols[-1] > avg_vol * 1.2 and alt_bull_ok:
-        p.append(("Momentum Surge", PATTERN_BASE, "BUY"))
+        p.append(("Momentum Surge", TIER2_BASE, "BUY"))
     elif mom < -3.5 and vols[-1] > avg_vol * 1.2 and alt_bear_ok:
-        p.append(("Momentum Surge", PATTERN_BASE, "SELL"))
+        p.append(("Momentum Surge", TIER2_BASE, "SELL"))
 
-    # ── Volume Spike ──
+    # ── Volume Spike — Tier 2 ──
     if vols[-1] > avg_vol * 3.0:
         direction = "BUY" if closes[-1] > opens[-1] else "SELL"
         if (direction == "BUY" and alt_bull_ok) or (direction == "SELL" and alt_bear_ok):
-            p.append(("Volume Spike", PATTERN_BASE, direction))
+            p.append(("Volume Spike", TIER2_BASE, direction))
 
-    # ── Support Bounce with structure ──
+    # ── Support Bounce (Zone Bounce) — Tier 1 ──
     if price <= sup * 1.008 and closes[-1] > opens[-1] and alt_bull_ok:
-        p.append(("Support Bounce", PATTERN_BASE, "BUY"))
+        p.append(("Support Bounce", TIER1_BASE, "BUY"))
 
-    # ── Resistance Rejection with structure ──
+    # ── Resistance Rejection (Zone Bounce) — Tier 1 ──
     if price >= res * 0.992 and closes[-1] < opens[-1] and alt_bear_ok:
-        p.append(("Resistance Rejection", PATTERN_BASE, "SELL"))
+        p.append(("Resistance Rejection", TIER1_BASE, "SELL"))
 
-    # ── Professional Double Bottom ──
+    # ── Professional Double Bottom — Tier 1 ──
     if detect_double_bottom_pro(highs, lows, closes, vols, price, avg_vol) and alt_bull_ok:
-        p.append(("Double Bottom", PATTERN_BASE, "BUY"))
+        p.append(("Double Bottom", TIER1_BASE, "BUY"))
 
-    # ── Professional Double Top ──
+    # ── Professional Double Top — Tier 1 ──
     if detect_double_top_pro(highs, lows, closes, vols, price, avg_vol) and alt_bear_ok:
-        p.append(("Double Top", PATTERN_BASE, "SELL"))
+        p.append(("Double Top", TIER1_BASE, "SELL"))
 
-    # ── Volume Breakout ──
+    # ── Volume Breakout — Tier 1 ──
     if price > res and vols[-1] > avg_vol * 2.2 and alt_bull_ok:
-        p.append(("Volume Breakout", PATTERN_BASE, "BUY"))
+        p.append(("Volume Breakout", TIER1_BASE, "BUY"))
 
-    # ── BOS Signal (pure structure break) ──
+    # ── BOS Signal (pure structure break) — Tier 1 ──
     if ms["bos"] and not ms["choch"]:
         if ms_bias == "bullish" and alt_bull_ok:
-            p.append(("BOS Breakout", PATTERN_BASE, "BUY"))
+            p.append(("BOS Breakout", TIER1_BASE, "BUY"))
         elif ms_bias == "bearish" and alt_bear_ok:
-            p.append(("BOS Breakout", PATTERN_BASE, "SELL"))
+            p.append(("BOS Breakout", TIER1_BASE, "SELL"))
+
+    # ── Change of Character (ChoCh) — Tier 1, "the ultimate human prediction tool" ──
+    # Lower Lows -> hits Demand Zone -> sudden Higher High (or the bearish mirror).
+    # detect_market_structure() already computes ms["choch"]; this pattern makes
+    # it an explicit, tradeable signal instead of the flag being nearly unused.
+    # Direction is inferred from which way structure just flipped: a bullish
+    # ChoCh means price broke the recent swing HIGH against a prior bearish
+    # bias (reversal up); a bearish ChoCh means it broke the recent swing LOW
+    # against a prior bullish bias (reversal down).
+    if ms["choch"]:
+        if ms_bias == "bearish" and closes[-1] > ms["swing_high"] and alt_bull_ok:
+            p.append(("Change of Character (ChoCh)", TIER1_BASE, "BUY"))
+        elif ms_bias == "bullish" and closes[-1] < ms["swing_low"] and alt_bear_ok:
+            p.append(("Change of Character (ChoCh)", TIER1_BASE, "SELL"))
 
     return p
 
@@ -1279,32 +1304,60 @@ def check_sector_correlation(coin, direction):
     return passes, note
 
 
-def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, ob_imbalance=None):
+def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, ob_imbalance=None, zone_ok=False, ms_bos=False, ms_bias=None, ms_choch=False, is_tier1=True):
     """
-    Point 5 (part 2): The confirmation bonus system.
-    Every pattern now starts at the same 85.0 base — this function is the
-    ONLY source of extra points above that base. A setup that reaches
-    92.2+ therefore means "this specific instance earned strong, measurable
-    confirmation," not "this happened to be a pattern type that scores high."
+    The Location Multiplier + hard Tier 1/Tier 2 AI cap.
 
-    Bonus weights (deliberately generous so a genuinely strong setup can
-    clear the 92.2 Grade A line, per the spec):
-      +2.0  strong volume  (1.5x+ average)
-      +1.0  moderate volume (1.2x-1.5x average)
+    Bonus weights:
+      +7.5  ChoCh occurred INSIDE a Supply/Demand zone — "the ultimate
+            human prediction tool": lower lows into a demand zone then a
+            sudden higher high (or the bearish mirror). This is the single
+            largest bonus in the system, deliberately above the standalone
+            Location bonus, since ChoCh-in-zone is Location + Shift at once.
+      +6.0  Location: price is inside a valid Supply/Demand zone in the
+            trade's favor (Point 1's "Location Multiplier" — mathematically
+            forces the bot toward trading only where institutions trade)
+      +3.0  Shift: Break of Structure (BOS) confirms the trade direction
+      +1.2  structure bias agrees with trade direction, no fresh BOS/ChoCh yet
       +3.0  HTF trend alignment (4h+1h both agree — tf_score==3)
       +1.5  partial HTF alignment (tf_score==2)
       +2.2  order book imbalance in trade's favor (>0.2 magnitude)
+      +2.0  strong volume (1.5x+ average)
+      +1.0  moderate volume (1.2x-1.5x average)
       +1.5  strong ADX (>=30, real trend strength not chop)
+
+    HARD TIER 2 CAP (is_tier1=False): Tier 2 patterns (Engulfing, RSI
+    Reversal, EMA Trend, Pullback, Momentum Surge, Volume Spike) are
+    STRUCTURALLY EXCLUDED from the ChoCh, Location, and BOS/structure
+    bonuses below — not just scored lower, the code physically skips
+    those branches. Their only available bonuses are HTF + order book +
+    volume + ADX = 8.7 max. On a 75.0 base that's a hard ceiling of 83.7,
+    safely under the stated 85.0 target and nowhere near the 92.2 AI
+    threshold, regardless of confirmation quality. This is what makes
+    Tier 2 "mathematically banned from ever waking up the AI" a
+    guarantee rather than a probability.
     """
     bonus = 0.0
     notes = []
 
-    avg_vol = sum(vols[-20:]) / 20 if len(vols) >= 20 else (vols[-1] if vols else 1)
-    vol_ratio = vols[-1] / avg_vol if avg_vol > 0 else 1.0
-    if vol_ratio >= 1.5:
-        bonus += 2.0; notes.append("volume strong (+2.0)")
-    elif vol_ratio >= 1.2:
-        bonus += 1.0; notes.append("volume moderate (+1.0)")
+    if is_tier1:
+        # ── ChoCh-in-Zone: the single biggest bonus — Location + Shift at once ──
+        choch_in_zone = ms_choch and zone_ok
+        if choch_in_zone:
+            bonus += 7.5; notes.append("ChoCh inside zone - ultimate signal (+7.5)")
+        else:
+            # ── LOCATION: Supply/Demand Zone — Point 1's Location Multiplier ──
+            if zone_ok:
+                bonus += 6.0; notes.append("in S/D zone - Location Multiplier (+6.0)")
+
+            # ── SHIFT: Market Structure / BOS ──
+            structure_agrees = ms_bias == ("bullish" if direction == "BUY" else "bearish")
+            if ms_bos and structure_agrees:
+                bonus += 3.0; notes.append("BOS confirms direction - Shift (+3.0)")
+            elif structure_agrees:
+                bonus += 1.2; notes.append("structure bias agrees (+1.2)")
+    else:
+        notes.append("Tier 2: zone/BOS/ChoCh bonuses excluded by design (auto-execute only)")
 
     if tf_score == 3:
         bonus += 3.0; notes.append("HTF fully aligned (+3.0)")
@@ -1316,6 +1369,13 @@ def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, ob_imb
         favors_sell = ob_imbalance < -0.2
         if (direction == "BUY" and favors_buy) or (direction == "SELL" and favors_sell):
             bonus += 2.2; notes.append("order book favors trade (+2.2)")
+
+    avg_vol = sum(vols[-20:]) / 20 if len(vols) >= 20 else (vols[-1] if vols else 1)
+    vol_ratio = vols[-1] / avg_vol if avg_vol > 0 else 1.0
+    if vol_ratio >= 1.5:
+        bonus += 2.0; notes.append("volume strong (+2.0)")
+    elif vol_ratio >= 1.2:
+        bonus += 1.0; notes.append("volume moderate (+1.0)")
 
     adx_val = calculate_adx(klines)
     if adx_val >= 30:
@@ -2177,14 +2237,23 @@ def cmd_hidden_gems():
             f"  🕐 {get_ist_time()}")
     return msg
 
-def ai_analyze_setup(coin, direction, klines, price, pattern, rsi_val, adx_val, vol_strength, is_volatile=False, penalty_notes=None):
+def ai_analyze_setup(coin, direction, klines, price, pattern, rsi_val, adx_val, vol_strength, is_volatile=False, penalty_notes=None, htf_4h_trend=None, zone_ok=False, zone_label="", ms_bos=False, ms_choch=False, ms_bias=None):
     """
-    Point 4: Claude AI analyzes candles like a human trader — but now framed
-    toward identifying BUILD-UP (coiling/absorption/calm-before-storm), not
-    just grading an already-confirmed move. This is the fix for the "by the
-    time every filter agrees the move is already gone" problem: the AI's job
-    is to judge whether this is EARLY, MID, or LATE stage, not just clean/messy.
-    Cost ~$0.004 per call.
+    The Human Narrative upgrade: Claude previously only saw 20 raw 15m
+    candles (~5 hours of data) with no idea what the 4h trend was or
+    whether price is sitting on a real institutional level. That's not
+    what a human trader uses to decide — a human's first questions are
+    "what's the bigger trend, and where are we relative to it," THEN
+    they look at the local candles.
+
+    Now the prompt leads with the actual top-down narrative, built from
+    real data already computed by the caller (4h trend via get_htf_trend,
+    zone status via detect_supply_demand_zones/is_in_zone, structure/BOS/
+    ChoCh via detect_market_structure) — not invented context. Only after
+    establishing that narrative does the prompt hand over the raw candles,
+    the same order a discretionary trader actually works in.
+
+    Cost ~$0.004 per call (larger prompt now, still Haiku-tier cheap).
     """
     if not ANTHROPIC_API_KEY: return None
     try:
@@ -2201,22 +2270,45 @@ def ai_analyze_setup(coin, direction, klines, price, pattern, rsi_val, adx_val, 
         dir_word="LONG (BUY)" if direction=="BUY" else "SHORT (SELL)"
         vol_note = "Volatility is currently ELEVATED vs normal — could mean a real breakout OR just chop. Judge from candle quality." if is_volatile else "Volatility is normal."
         penalty_line = f"Note: scanner flagged secondary weakness — {', '.join(penalty_notes)}. Weigh this against price action quality.\n" if penalty_notes else ""
+
+        # ── THE HUMAN NARRATIVE — top-down context, built from real data ──
+        htf_desc = {1:"BULLISH",-1:"BEARISH",0:"NEUTRAL/UNCLEAR",None:"UNKNOWN"}.get(htf_4h_trend,"UNKNOWN")
+        zone_line = f"We are currently sitting INSIDE a {'Demand' if direction=='BUY' else 'Supply'} zone ({zone_label})." if zone_ok else "Price is NOT inside a known Supply/Demand zone right now — no man's land."
+        if ms_choch and zone_ok:
+            shift_line = "A Change of Character (ChoCh) just fired INSIDE this zone — the market just reversed structure exactly at a key level. This is the strongest possible setup type."
+        elif ms_choch:
+            shift_line = "A Change of Character (ChoCh) just fired, but NOT inside a known zone — a real structure shift, though without the location confirmation."
+        elif ms_bos:
+            shift_line = f"A Break of Structure (BOS) just confirmed, structure bias is {ms_bias or 'unclear'}."
+        else:
+            shift_line = f"No fresh structure break yet — current bias reads {ms_bias or 'neutral'}."
+
+        narrative = (
+            f"THE NARRATIVE (read this first, the way a trader scans top-down):\n"
+            f"- 4-Hour trend: {htf_desc}.\n"
+            f"- {zone_line}\n"
+            f"- {shift_line}\n"
+            f"- On the 15-minute chart, the scanner flagged: {pattern}.\n"
+        )
+
         prompt=(f"You are an experienced discretionary crypto trader deciding whether to actually "
-                f"take this trade with real money, the way you would after watching a chart for an hour "
-                f"across multiple timeframes.\n\n"
-                f"Setup: {coin}/USDT {dir_word}\n"
-                f"Pattern flagged by scanner: {pattern}\n"
+                f"take this trade with real money, the way you would after scanning a chart top-down "
+                f"across multiple timeframes — starting with the big picture, then zooming in.\n\n"
+                f"Setup: {coin}/USDT {dir_word}\n\n"
+                f"{narrative}\n"
                 f"Price: {format_price(price)}\n"
                 f"RSI: {rsi_val:.0f} | ADX (trend strength): {adx_val:.0f} | Volume: {vol_strength:.1f}x average\n"
                 f"{vol_note}\n{penalty_line}\n"
-                f"Last 20 candles, oldest to newest (C20 = right now):\n"+"\n".join(candle_desc)+
-                f"\n\nDo NOT just grade whether momentum already confirmed — a confirmed breakout "
-                f"candle often means the easy money is already made. Instead, judge the STAGE of this "
-                f"move by looking for signs of build-up: volatility contraction (tightening range), "
-                f"absorption (heavy volume with small net price change = someone accumulating/distributing "
-                f"quietly), dying volume before a squeeze, or wicks showing rejection at a level repeatedly "
-                f"tested. A calm, tightening range sitting just under resistance (or above support) with "
-                f"fading volume is often the BEST entry — before the crowd's breakout signal fires.\n\n"
+                f"Last 20 candles on the 15m chart, oldest to newest (C20 = right now):\n"+"\n".join(candle_desc)+
+                f"\n\nUsing the narrative above FIRST — is this accumulation/distribution happening at a "
+                f"real level, with the higher timeframe on your side? Then look at the local candles: "
+                f"do NOT just grade whether momentum already confirmed — a confirmed breakout candle "
+                f"often means the easy money is already made. Judge the STAGE of this move by looking "
+                f"for signs of build-up: volatility contraction, absorption (heavy volume with small net "
+                f"price change), dying volume before a squeeze, or wicks showing rejection at a level "
+                f"repeatedly tested. A calm, tightening range sitting just under resistance (or above "
+                f"support), inside a real zone, with the 4h trend aligned, is often the BEST entry — "
+                f"before the crowd's breakout signal fires.\n\n"
                 f"Classify the STAGE: EARLY (still coiling/building, low risk entry), MID (breaking out now, "
                 f"some room left), or LATE (already extended, chasing).\n\n"
                 f"Respond EXACTLY in this format:\n"
@@ -2496,9 +2588,15 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
         vol_str_ai=vols_ai[-1]/avg_vol_ai if avg_vol_ai>0 else 1.0
         rsi_ai=calculate_rsi(closes)
         adx_ai=calculate_adx(klines_15m)
+        # The Human Narrative: fetch the real 4h trend and pass the zone/
+        # structure data already computed above (zone_ok, zone_label, ms)
+        # instead of sending Claude only raw 15m candles with no context.
+        htf_4h=get_htf_trend(setup["symbol"],"4h")
         logger.info(f"{coin} VIP + Grade A ({setup['setup_score']:.1f}) — calling Claude for final verification")
         ai_result=ai_analyze_setup(coin,setup["direction"],klines_15m,entry,
-                                   setup["pattern"],rsi_ai,adx_ai,vol_str_ai,is_volatile,penalty_notes)
+                                   setup["pattern"],rsi_ai,adx_ai,vol_str_ai,is_volatile,penalty_notes,
+                                   htf_4h_trend=htf_4h,zone_ok=zone_ok,zone_label=zone_label,
+                                   ms_bos=ms["bos"],ms_choch=ms["choch"],ms_bias=ms["bias"])
         if ai_result and ai_result["trade"]==False:
             logger.info(f"{coin} rejected by AI — {ai_result['verdict']}/{ai_result['confidence']}")
             return False
@@ -3272,7 +3370,20 @@ def scan_coins(btc_trend,fng,market_condition):
                 pt=primary+(" + "+" + ".join(extras) if extras else "")
                 vols_chk=[float(k[5]) for k in klines]
                 ob_imb,_=get_orderbook_imbalance(symbol)
-                confirm_bonus,bonus_notes=compute_confirmation_bonus(symbol,direction,klines,vols_chk,tf_score,ob_imb)
+                # Location + Shift: check S/D zone and market structure/BOS/ChoCh before
+                # scoring — these are now the heaviest-weighted confirmations for Tier 1.
+                zones_chk=detect_supply_demand_zones(klines)
+                zone_ok,_zone_label=is_in_zone(price,direction,zones_chk)
+                ms_chk=detect_market_structure(klines)
+                # base_s is the pattern's own untouched base score (TIER1_BASE=88.0 or
+                # TIER2_BASE=75.0 from detect_patterns) — use it directly to determine
+                # tier, rather than matching on pattern name strings.
+                is_tier1_pattern = base_s >= 88.0
+                confirm_bonus,bonus_notes=compute_confirmation_bonus(
+                    symbol,direction,klines,vols_chk,tf_score,ob_imb,
+                    zone_ok=zone_ok,ms_bos=ms_chk["bos"],ms_bias=ms_chk["bias"],
+                    ms_choch=ms_chk["choch"],is_tier1=is_tier1_pattern
+                )
                 # Extra-pattern confluence still counts, but modestly — it's not the main driver anymore
                 confluence_bonus=min(len(dir_pats)*0.3,1.0)
                 score=min(adj_score+confirm_bonus+confluence_bonus,99)
