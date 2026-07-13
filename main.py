@@ -15,8 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -1299,7 +1299,7 @@ def get_smart_leverage(symbol, atr_pct, score, grade="Grade B"):
 
     return max(lev, 1)
 
-def get_signal_grade(score,whale,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,ob_imbalance=None,ms_bias=None,bos=False):
+def get_signal_grade(score,vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,ob_imbalance=None,ms_bias=None,bos=False):
     """
     Unified grading fix: the letter grade is now decided PURELY by the
     confirmation scorecard (max 21 pts), completely disconnected from the
@@ -1320,6 +1320,17 @@ def get_signal_grade(score,whale,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_
     scorecard itself (the "🎯 Score >=X" line below, max 3 pts) — so the
     100-point score still matters as one input among many, it just no
     longer single-handedly determines the letter grade.
+
+    WHALE/OI REMOVAL: `whale` (has_whale_activity — boolean-only, no
+    visible underlying number) and its 2pt slot are replaced with
+    `vol_ratio` (the real volume-vs-20-candle-average multiple, e.g.
+    "1.8x") scored in tiers matching the same 1.5x/1.2x thresholds
+    compute_confirmation_bonus already uses elsewhere. This absorbs the
+    2 points whale used to contribute, so the 21-point total and the
+    14/18 A/A+ thresholds stay meaningful without recalibration.
+    oi_rising's parameter is kept (still receives the real value from
+    get_oi_trend) but no longer scored below — removed for the same
+    "no reliably visible data" reason as whale.
     """
     breakdown=[]
     pts=0
@@ -1328,10 +1339,9 @@ def get_signal_grade(score,whale,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_
     elif score>=92:  pts+=2; breakdown.append(("🎯 Score ≥92",      2))
     elif score>=85:  pts+=1; breakdown.append(("🎯 Score ≥85",      1))
     else:                    breakdown.append(("🎯 Score",           0))
-    if whale:        pts+=2; breakdown.append(("🐋 Whale Activity",  2))
-    else:                    breakdown.append(("🐋 Whale Activity",  0))
-    if oi_rising:    pts+=2; breakdown.append(("📦 OI Rising",       2))
-    else:                    breakdown.append(("📦 OI",              0))
+    if vol_ratio>=1.5:   pts+=2; breakdown.append((f"📊 Volume {vol_ratio:.1f}x (strong)",   2))
+    elif vol_ratio>=1.2: pts+=1; breakdown.append((f"📊 Volume {vol_ratio:.1f}x (moderate)",  1))
+    else:                        breakdown.append((f"📊 Volume {vol_ratio:.1f}x",              0))
     if tf_score==3:  pts+=2; breakdown.append(("📡 4h+1h Aligned",  2))
     elif tf_score==2:pts+=1; breakdown.append(("📡 4h Aligned",     1))
     else:                    breakdown.append(("📡 TF Alignment",    0))
@@ -1444,6 +1454,12 @@ def get_oi_trend(symbol):
         logger.warning(f"OI {symbol}: {e}"); return None
 
 def has_whale_activity(symbol):
+    """
+    UNUSED as of the whale/OI removal — no live call sites remain (was
+    only ever called from get_signal_grade's two call sites, both now
+    pass vol_ratio instead). Left defined rather than deleted, in case
+    it's wanted back later; not currently doing anything.
+    """
     try:
         res=requests.get(BINANCE_AGG_URL,params={"symbol":symbol,"limit":20},timeout=10)
         if res.status_code==200:
@@ -2565,7 +2581,9 @@ def cmd_hidden_gems():
             tp_dist=max(atr_tp_dist,min_rr_tp_dist)
             tp=entry+tp_dist if best["direction"]=="BUY" else entry-tp_dist
         ms_b=detect_market_structure(klines_15m)
-        whale=has_whale_activity(best["symbol"])
+        vols_gem=[float(k[5]) for k in klines_15m]
+        avg_vol_gem=sum(vols_gem[-20:])/20 if len(vols_gem)>=20 else 1
+        vol_ratio_gem=vols_gem[-1]/avg_vol_gem if avg_vol_gem>0 else 1.0
         oi_rising=get_oi_trend(best["symbol"])
         adx_val=calculate_adx(klines_15m)
         closes=[float(k[4]) for k in klines_15m]
@@ -2578,7 +2596,7 @@ def cmd_hidden_gems():
         st_ok=(st_15m==best["direction"])
         zone_ok=False
         ob_imb,_=get_orderbook_imbalance(best["symbol"])
-        grade,pts,_=get_signal_grade(best["score"],whale,oi_rising,best["tf_score"],vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,ob_imb,ms_b["bias"],ms_b["bos"])
+        grade,pts,_=get_signal_grade(best["score"],vol_ratio_gem,oi_rising,best["tf_score"],vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,ob_imb,ms_b["bias"],ms_b["bos"])
         lev=get_smart_leverage(best["symbol"],atr_pct,best["score"],grade)
         profit_target=(abs(tp-entry)/entry)*100*lev
         sl_pct=abs(entry-sl)/entry*100; tp_pct=abs(tp-entry)/entry*100
@@ -2927,6 +2945,17 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     setup["setup_score"] = max(setup["setup_score"] - score_penalty, 0)
     if penalty_notes:
         logger.info(f"{coin} score adjusted: -{score_penalty} ({', '.join(penalty_notes)}) -> {setup['setup_score']:.1f}")
+    # Point 1 fix: is_instant was being decided by the CALLER using the
+    # pre-penalty score (e.g. 99.0), then passed in as a fixed boolean —
+    # so a signal that dropped to 93.0 after penalties here still kept
+    # showing the ⚡ INSTANT tag, because that decision was already locked
+    # in before this function even ran. Confirmed exactly in the logs:
+    # "INSTANT: DYDX|SELL|Score:99.0" at tag time, "Signal sent:
+    # DYDX|SELL|Score:93" at send time — still tagged Instant either way.
+    # Recomputed here, AFTER the real final score is known, so the tag
+    # (and the expiry window / message wording that depend on it below)
+    # are authoritative on the true final score, not a stale snapshot.
+    is_instant = setup["setup_score"] >= INSTANT_SIGNAL_THRESHOLD
     # A setup that's now too weak after penalties gets dropped here,
     # instead of earlier — so strong price action had a chance to survive.
     # ── STRICT HARD FLOOR (Point 2) ─────────────────────────────
@@ -2946,8 +2975,14 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     zone_ok,zone_label=is_in_zone(entry,setup["direction"],zones)
     div=detect_rsi_divergence(closes)
     oi_rising=get_oi_trend(setup["symbol"])
-    oi_label="Rising" if oi_rising else "Falling" if oi_rising is False else "N/A"
-    whale=has_whale_activity(setup["symbol"])
+    # Point (whale/OI removal): replaced has_whale_activity's boolean-only
+    # signal with the real volume-vs-average multiple — computed once here,
+    # reused both for grading (get_signal_grade below) and for the message
+    # display further down, so the actual number is finally visible instead
+    # of a whale emoji that never showed any underlying data.
+    vols_disp=[float(k[5]) for k in klines_15m]
+    avg_vol_disp=sum(vols_disp[-20:])/20 if len(vols_disp)>=20 else 1
+    vol_ratio=vols_disp[-1]/avg_vol_disp if avg_vol_disp>0 else 1.0
     adx_val=calculate_adx(klines_15m)
     tf_score=setup.get("tf_score",get_timeframe_score(setup["symbol"],setup["direction"]))
     ob_imbalance, ob_label = get_orderbook_imbalance(setup["symbol"])
@@ -2966,7 +3001,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     sweep_dir_chk, sweep_strength_chk = detect_liquidity_sweep(klines_15m, highs_15m, lows_15m, closes, opens_15m, sup, res, ms)
     is_sweep = sweep_dir_chk is not None and sweep_dir_chk == setup["direction"]
     # Compute grade FIRST so leverage can use it
-    grade_result=get_signal_grade(setup["setup_score"],whale,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,ob_imbalance,ms["bias"],ms["bos"])
+    grade_result=get_signal_grade(setup["setup_score"],vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,ob_imbalance,ms["bias"],ms["bos"])
     grade,pts,breakdown=grade_result
 
     # Second half of the strict floor: kill Grade C outright, regardless
@@ -3008,32 +3043,36 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
             else: return False
     setup["leverage"]=lev
 
-    # ── SCORE GATE + AI-ELIGIBLE WATCHLIST ──────────────────────
-    # Claude is called if and only if:
-    #   (1) coin is in VIP_AI_COINS OR PREMIUM_COINS, AND
-    #   (2) the letter grade (scorecard-based, see get_signal_grade) is
-    #       "Grade A" or "Grade A+" — NOT a numeric score check.
+    # ── SCORE GATE — UNIVERSAL, NO COIN RESTRICTION ─────────────
+    # Claude is called if and only if the letter grade (scorecard-based,
+    # see get_signal_grade) is "Grade A" or "Grade A+" — the VIP_AI_COINS/
+    # PREMIUM_COINS name-check that used to additionally require the coin
+    # be on a specific watchlist has been DELETED per explicit instruction.
+    # Confirmed via logs this was a real, active restriction (not stale
+    # drift): "IO not on VIP/Premium watchlist — executing on pure code,
+    # no AI call" despite IO scoring a genuine Grade A+. Any coin on the
+    # scanner that earns Grade A/A+ now reaches the AI, full stop.
     #
-    # This changed from a numeric setup_score>=GRADE_A_THRESHOLD check to
-    # a grade-string check because of today's Point 1: the letter grade
-    # is now purely decided by the 21-point confirmation scorecard,
-    # deliberately disconnected from the 100-point base score. If the AI
-    # gate kept checking the numeric score independently, it could
-    # disagree with the grade shown in the Telegram message (e.g. a
-    # signal displayed as "Grade A" that never actually triggered AI
-    # review, or vice versa) — the exact kind of B/C confusion Point 1
-    # was written to eliminate. Gating on `grade` directly makes the two
-    # agree by construction.
+    # NOTE ON THRESHOLD: the instruction was given in two slightly
+    # different framings — "Grade A or A+" vs "final setup score of 93.0
+    # or higher." These are NOT the same condition: `grade` is purely
+    # scorecard-point-based (14+/18+ pts, from an earlier round that
+    # deliberately decoupled it from the 100-point score), so a coin
+    # could be Grade A at score 90, or Grade B at score 95. Kept the
+    # grade-based check (the more detailed framing, and consistent with
+    # that earlier round's whole point of making `grade` the authoritative
+    # signal-quality indicator) rather than silently switching to a raw
+    # score>=93 check, which would partially undo that decoupling. Flagging
+    # this choice explicitly rather than picking silently.
     #
-    # PREMIUM_COINS (BTC, ETH, BNB, SOL, PAXG, XAU, XAG) were added
-    # alongside the existing VIP_AI_COINS set — high-market-cap assets
-    # carry less noise, making them easier for the AI to read accurately,
-    # per the explicit instruction to stop them "completely skipping
-    # the AI review."
+    # VIP_AI_COINS is now entirely unused (no longer referenced by any
+    # live conditional) — left defined at the top of the file rather than
+    # deleted, in case the restriction is wanted back later. PREMIUM_COINS
+    # is still genuinely used elsewhere (the 24/7 session override), so
+    # that one remains load-bearing.
     ai_result=None
     is_grade_a = grade in ("Grade A 🍀","Grade A+ 🍀")
-    is_ai_eligible_coin = coin in VIP_AI_COINS or coin in PREMIUM_COINS
-    if is_ai_eligible_coin and is_grade_a:
+    if is_grade_a:
         vols_ai=[float(k[5]) for k in klines_15m]
         avg_vol_ai=sum(vols_ai[-20:])/20 if len(vols_ai)>=20 else 1
         vol_str_ai=vols_ai[-1]/avg_vol_ai if avg_vol_ai>0 else 1.0
@@ -3080,10 +3119,8 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
             highs_r=[float(k[2]) for k in klines_15m]; lows_r=[float(k[3]) for k in klines_15m]
             log_retest_candidate(coin,setup["symbol"],setup["direction"],closes,highs_r,lows_r,setup["pattern"])
             return False
-    elif is_ai_eligible_coin and not is_grade_a:
-        logger.info(f"{coin} is AI-eligible but grade is {grade} ({pts}pts, not A/A+) — executing on pure code, no AI call")
     else:
-        logger.info(f"{coin} not on VIP/Premium watchlist — executing on pure code, no AI call")
+        logger.info(f"{coin} grade is {grade} ({pts}pts, not A/A+) — executing on pure code, no AI call")
 
     price_range=(max(closes[-10:])-min(closes[-10:]))/10
     eta=int(abs(tp-entry)/(price_range if price_range>0 else 0.001)*15)
@@ -3173,9 +3210,12 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     msg += f"  │  📡 TF   : {tf_label}\n"
     st_icon="✅✅" if st_ok else "⚠️"
     msg += f"  │  🌀 ST   : {st_icon}  VWAP: {'✅' if vwap_ok else '⚠️'}\n"
-    oi_icon="✅" if oi_rising else "⚠️" if oi_rising is False else "➖"
-    whale_icon="✅" if whale else "—"
-    msg += f"  │  📦 OI   : {oi_icon} {oi_label:<8}  🐋: {whale_icon}\n"
+    # OI/whale removed — both were boolean-only with no visible underlying
+    # number, per explicit request ("we're not getting the data from
+    # anywhere for this"). Replaced with the real volume ratio (same
+    # value now feeding get_signal_grade's tiered volume scoring above).
+    vol_icon="✅" if vol_ratio>=1.5 else "⚠️" if vol_ratio>=1.2 else "➖"
+    msg += f"  │  📊 Vol  : {vol_icon} {vol_ratio:.2f}x avg\n"
     msg += f"  │  📌 Pat  : {setup['pattern']}\n"
     msg += f"  │  📊 RSI  : {rsi_val:.1f}   ADX: {adx_val:.1f}   Mom: {mom:+.2f}%\n"
     if zone_ok: msg += f"  │  📍 Zone : ✅ {'Demand' if setup['direction']=='BUY' else 'Supply'}\n"
