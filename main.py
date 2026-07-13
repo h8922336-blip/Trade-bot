@@ -15,13 +15,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
 BINANCE_PRICE_URL   = "https://data-api.binance.vision/api/v3/ticker/price"
 BINANCE_KLINE_URL   = "https://data-api.binance.vision/api/v3/klines"
+BINANCE_FUTURES_PRICE_URL = "https://fapi.binance.com/fapi/v1/ticker/price"
+BINANCE_FUTURES_KLINE_URL = "https://fapi.binance.com/fapi/v1/klines"
+# Symbols confirmed Futures-only (Binance TradFi Perpetuals, launched under a
+# dedicated [TradFi] tab on Futures — no Spot listing exists for XAU/XAG).
+# PAXG is genuinely available on BOTH Spot and Futures (verified: real PAXG/
+# USDT spot trading, spot grid bots, spot DCA all confirmed live) — routed to
+# Futures anyway for consistency with the other two precious-metals symbols.
+#
+# ADVISORY: PAXG's Futures liquidity can vary by region and is sometimes less
+# reliable than its Spot market. If price/kline WARNING log lines start
+# appearing for PAXG specifically, remove "PAXGUSDT" from this set below —
+# it will then fall back to the Spot engine automatically, no other code
+# changes needed. Not applied preemptively here since there's no current
+# evidence of an actual problem; this is a one-line self-service fix for if
+# that changes.
+FUTURES_ONLY_SYMBOLS = {"XAUUSDT","XAGUSDT","PAXGUSDT"}
 BINANCE_AGG_URL     = "https://api.binance.com/api/v3/aggTrades"
 BINANCE_FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
 BINANCE_OI_URL      = "https://fapi.binance.com/futures/data/openInterestHist"
@@ -39,7 +55,7 @@ COINS = list(dict.fromkeys([
     "GMT","ENJ","PEPE","WIF","FLOKI","BONK","ORDI","BOME","NOT","DOGS",
     "JUP","PYTH","JTO","STRK","EIGEN","ETHFI","IO","ZERO","ONDO",
     "BLUR","CFX","METIS","MANTA","ZETA","TRB","ALT","PIXEL","PORTAL","STPT","KAS",
-    "PIPPIN","BSB","CL","RIVER"
+    "PIPPIN","BSB","CL","LAB","PAXG","XAU","XAG"
 ]))
 
 active_trades             = {}
@@ -53,6 +69,7 @@ trade_journal             = []
 learning_notes            = []
 coin_cooldowns            = {}
 retest_watchlist          = {}   # coin -> {level, direction, pattern, logged_at, symbol}
+htf_zones_cache           = {}   # symbol -> {"zones": {...}, "cached_at": datetime} — 15min TTL, see get_htf_zones
 consecutive_loss_patterns = {}
 price_alerts              = {}
 market_memory = {
@@ -65,7 +82,7 @@ pattern_stats = {p: {"signals":0,"wins":0,"losses":0,"total_pnl":0.0,"weight":1.
     "EMA Trend","Breakout","Pullback to 20 EMA","RSI Reversal","Momentum Surge",
     "Volume Spike","Double Bottom","Double Top","Support Bounce","Resistance Rejection",
     "Bullish Engulfing","Bearish Engulfing","Volume Breakout","Bull Flag Break","Bear Flag Break",
-    "BOS Breakout","Change of Character (ChoCh)"
+    "BOS Breakout","Change of Character (ChoCh)","Liquidity Sweep","Volatility Contraction (Coiling)"
 ]}
 
 last_update_id         = None
@@ -83,7 +100,14 @@ MIN_PRIMARY_SCORE        = 85    # matches the normalized pattern base (Point 5)
                                   # a pattern must exist at, not a bar it must clear pre-confirmation
 INSTANT_SIGNAL_THRESHOLD = 97
 GRADE_A_THRESHOLD        = 92.2  # Point 5/6: setup_score >= this = Grade A -> eligible for AI review
-VIP_AI_COINS             = {"MANA","RIVER","ENJ"}  # Point 2: ONLY these coins may ever call Claude
+VIP_AI_COINS             = {"MANA","LAB","ENJ"}  # RIVER replaced with LAB (RIVER no longer liquid/supported on Binance)
+
+# Point 3: 24/7 Premium Institutional Watchlist. These assets are granted
+# VIP immunity from Dead Hour (2-7AM IST) and scheduled macro-event pauses
+# — they scan continuously because high-liquidity institutional assets
+# genuinely do respect technicals around the clock, unlike thin altcoins
+# that go dead/erratic during low-volume overnight hours.
+PREMIUM_COINS             = {"BTC","ETH","BNB","SOL","PAXG","XAU","XAG"}
 MIN_PROFIT_TARGET        = 15.0
 SIGNAL_EXPIRY_MINUTES    = 120
 INSTANT_EXPIRY_MINUTES   = 30
@@ -92,6 +116,11 @@ MAX_SIGNALS_PER_CYCLE    = 3
 MAX_ACTIVE_TRADES        = 5
 ATR_SL_MULTIPLIER        = 2.5
 ATR_TP_MULTIPLIER        = 5.0
+MIN_RR_RATIO             = 2.0  # TP must be at least this many multiples of the
+                                  # actual SL distance — see the TP anchoring fix
+                                  # in format_and_send (the ATR-only TP could
+                                  # previously land inside a 1:0.5 R/R when the
+                                  # structural SL was tight but ATR was also small)
 MAX_DAILY_LOSSES         = 3
 CIRCUIT_BREAKER_MIN_LOSS = -5.0
 WHALE_TRADE_THRESHOLD    = 500000
@@ -102,7 +131,14 @@ SUSPEND_HOURS            = 12
 ADX_MIN_TREND            = 21
 ST_PERIOD                = 10
 ST_MULTIPLIER            = 3.0
-MIN_SL_PCT               = 0.02
+MIN_SL_PCT               = 0.003  # was 0.02 (2%) — that floor was silently widening
+                                    # every tight structural stop back to 2%, via the
+                                    # min()/max() clamp in get_structure_sl, completely
+                                    # overriding the swing-pivot-based SL system. 0.3%
+                                    # stays meaningfully wider than the 0.05% one-tick
+                                    # buffer (still a genuine sanity floor against a stop
+                                    # sitting on entry) while letting realistic tight
+                                    # swing stops (0.3%-2% away) actually be respected.
 DEAD_HOUR_START          = 2
 DEAD_HOUR_END            = 7
 
@@ -150,7 +186,7 @@ BTC_CORRELATED           = ["ETH","BNB","SOL","AVAX","NEAR","APT","SUI"]
 # check before confirming a signal. Coins not in any listed sector are treated
 # as having no sector peers and skip this check (falls through, doesn't block).
 SECTOR_GROUPS = {
-    "gaming":     ["SAND","MANA","AXS","GALA","ENJ","PIXEL","RIVER","GMT","APE"],
+    "gaming":     ["SAND","MANA","AXS","GALA","ENJ","PIXEL","LAB","GMT","APE"],
     "layer1":     ["ETH","SOL","AVAX","NEAR","APT","SUI","ADA","DOT","ATOM","TIA","SEI","ALGO","EGLD","FLOW","KAS"],
     "defi":       ["UNI","AAVE","MKR","SNX","COMP","CRV","SUSHI","LDO","CAKE","1INCH","DYDX","GMX","PENDLE"],
     "meme":       ["DOGE","SHIB","PEPE","WIF","FLOKI","BONK","ORDI","BOME","NOT","DOGS"],
@@ -388,17 +424,47 @@ def answer_callback(cbid, text="OK"):
         logger.warning(f"answerCallback: {e}")
 
 def get_price(symbol):
+    """
+    Point 2 fix: XAUUSDT/XAGUSDT are Futures-only (Binance TradFi
+    Perpetuals — confirmed via search: launched exclusively under the
+    Futures [TradFi] tab, no Spot listing exists). Querying the Spot API
+    (data-api.binance.vision) for these returns no data, silently skipping
+    Gold/Silver every scan cycle despite being in COINS/PREMIUM_COINS.
+
+    Implemented as a per-symbol routing switch rather than globally
+    swapping BINANCE_PRICE_URL to Futures for everyone: get_price/
+    get_klines are called for every one of the ~97 coins in COINS, and
+    only XAU/XAG/PAXG are confirmed to need the Futures endpoint — a
+    global swap would risk the ~94 other coins that are presumably
+    working correctly on Spot right now, to fix a problem specific to 2-3
+    symbols.
+    """
+    price_url = BINANCE_FUTURES_PRICE_URL if symbol in FUTURES_ONLY_SYMBOLS else BINANCE_PRICE_URL
     try:
-        res=requests.get(BINANCE_PRICE_URL,params={"symbol":symbol},timeout=10)
-        return float(res.json()["price"]) if res.status_code==200 else None
+        res=requests.get(price_url,params={"symbol":symbol},timeout=10)
+        if res.status_code==200: return float(res.json()["price"])
+        if symbol in FUTURES_ONLY_SYMBOLS:
+            # Point 4 advisory: make PAXG/XAU/XAG Futures failures actually
+            # visible in logs — a non-200 status previously returned None
+            # silently here, so "watch your logs for warnings" had nothing
+            # to actually show if this ever broke.
+            logger.warning(f"get_price {symbol}: Futures endpoint returned {res.status_code} — "
+                          f"if this persists for PAXG, remove it from FUTURES_ONLY_SYMBOLS")
+        return None
     except Exception as e:
         logger.warning(f"get_price {symbol}: {e}"); return None
 
 def get_klines(symbol,interval,limit=100):
+    """See get_price's docstring for the Futures-routing reasoning."""
+    kline_url = BINANCE_FUTURES_KLINE_URL if symbol in FUTURES_ONLY_SYMBOLS else BINANCE_KLINE_URL
     try:
-        res=requests.get(BINANCE_KLINE_URL,
+        res=requests.get(kline_url,
                          params={"symbol":symbol,"interval":interval,"limit":limit},timeout=10)
-        return res.json() if res.status_code==200 else []
+        if res.status_code==200: return res.json()
+        if symbol in FUTURES_ONLY_SYMBOLS:
+            logger.warning(f"get_klines {symbol}: Futures endpoint returned {res.status_code} — "
+                          f"if this persists for PAXG, remove it from FUTURES_ONLY_SYMBOLS")
+        return []
     except Exception as e:
         logger.warning(f"get_klines {symbol}: {e}"); return []
 
@@ -798,6 +864,72 @@ def detect_volatility_contraction(closes, highs, lows, vols, price):
     return None, 0
 
 
+def detect_liquidity_sweep(klines, highs, lows, closes, opens, sup, res, ms):
+    """
+    Liquidity Sweep (failed breakout / stop hunt), per instruction.
+
+    SCOPE NOTE: the instruction described this against a "known supply or
+    demand zone." detect_patterns() does not receive S/D zone data (zones
+    are computed separately, in scan_coins/format_and_send, via
+    get_htf_zones — adding a zones parameter here would require touching
+    all 5 call sites of detect_patterns and adding new HTF zone fetches
+    to several scan paths that don't currently make them, multiplying API
+    cost significantly). Implemented instead against the structural swing
+    high/low (`sup`/`res`, already computed from detect_market_structure) —
+    both represent "a level that matters," and this keeps the change
+    contained to detect_patterns without new fetches or signature changes
+    across the codebase. Flagging this as a real interpretation choice,
+    not a silent substitution.
+
+    Looks for, in the most recent 1-3 candles:
+    1. A wick that pierces beyond the structural level (sup for a bullish
+       sweep-reversal, res for a bearish one) — this is the stop-hunt,
+       retail stops on the wrong side of the level get triggered.
+    2. The candle's CLOSE reverts back inside the level — the piercing
+       was rejected, not accepted.
+    3. A Change of Character (ms["choch"]) confirms the reversal is real,
+       not just a random wick.
+
+    This is deliberately a narrower, higher-conviction condition than
+    ChoCh alone — it requires the specific sweep-then-reject candle
+    shape on top of the same structure-shift signal.
+
+    Returns (direction, sweep_strength) or (None, 0).
+    """
+    if len(closes) < 10 or not ms["choch"]:
+        return None, 0
+
+    # Check the most recent 1-3 candles for the sweep-and-reject shape
+    for i in range(1, 4):
+        if i > len(closes): break
+        idx = -i
+        c_open, c_high, c_low, c_close = opens[idx], highs[idx], lows[idx], closes[idx]
+        candle_range = c_high - c_low
+        if candle_range <= 0: continue
+
+        # Bullish sweep: wick pierces BELOW support, close reverts back above it
+        pierced_support = c_low < sup and sup > 0
+        closed_back_above = c_close > sup
+        lower_wick_pct = (min(c_open, c_close) - c_low) / candle_range * 100
+        if pierced_support and closed_back_above and lower_wick_pct > 40:
+            if ms["bias"] == "bullish" or ms["choch"]:
+                sweep_depth_pct = abs(sup - c_low) / sup * 100 if sup > 0 else 0
+                strength = min(100, 60 + sweep_depth_pct * 20 + lower_wick_pct * 0.3)
+                return "BUY", strength
+
+        # Bearish sweep: wick pierces ABOVE resistance, close reverts back below it
+        pierced_resistance = c_high > res and res > 0
+        closed_back_below = c_close < res
+        upper_wick_pct = (c_high - max(c_open, c_close)) / candle_range * 100
+        if pierced_resistance and closed_back_below and upper_wick_pct > 40:
+            if ms["bias"] == "bearish" or ms["choch"]:
+                sweep_depth_pct = abs(c_high - res) / res * 100 if res > 0 else 0
+                strength = min(100, 60 + sweep_depth_pct * 20 + upper_wick_pct * 0.3)
+                return "SELL", strength
+
+    return None, 0
+
+
 def detect_patterns(symbol, klines, price, btc_trend):
     """
     Upgraded pattern detection with:
@@ -961,6 +1093,20 @@ def detect_patterns(symbol, klines, price, btc_trend):
         elif ms_bias == "bullish" and closes[-1] < ms["swing_low"] and alt_bear_ok:
             p.append(("Change of Character (ChoCh)", TIER1_BASE, "SELL"))
 
+    # ── Liquidity Sweep — Tier 1, "exactly when smart money steps in" ──
+    # Institutions engineer a false break beyond a known level to trigger
+    # retail stop losses, then reverse sharply. Detected as: a long wick
+    # piercing the structural level that closes back inside it, combined
+    # with a genuine ChoCh (see detect_liquidity_sweep's docstring for the
+    # zone-vs-structure scope note). Scored slightly above TIER1_BASE since
+    # this is a narrower, higher-conviction condition than ChoCh alone —
+    # it requires the specific sweep-and-reject candle shape on top of it.
+    sweep_dir, sweep_strength = detect_liquidity_sweep(klines, highs, lows, closes, opens, sup, res, ms)
+    if sweep_dir == "BUY" and alt_bull_ok:
+        p.append(("Liquidity Sweep", min(TIER1_BASE + 1.0, 99), "BUY"))
+    elif sweep_dir == "SELL" and alt_bear_ok:
+        p.append(("Liquidity Sweep", min(TIER1_BASE + 1.0, 99), "SELL"))
+
     return p
 
 def is_in_zone(price,direction,zones):
@@ -969,6 +1115,119 @@ def is_in_zone(price,direction,zones):
         if zone["low"]*0.995<=price<=zone["high"]*1.005:
             return True,f"{format_price(zone['low'])}-{format_price(zone['high'])}"
     return False,""
+
+def get_htf_zones(symbol):
+    """
+    Point 2 (HTF Zones): A professional top-down approach establishes true
+    market bias and locates major institutional zones on the 4-Hour chart
+    FIRST, using the 1-Hour as a secondary/backup source — the 15-minute
+    chart is only used afterward to time the specific entry when price
+    taps one of these larger levels.
+
+    Previously detect_supply_demand_zones was called ONLY on 15m klines
+    at every call site — those are structurally weak, low-conviction
+    zones that get run straight through by any real trend, which is
+    exactly the problem reported.
+
+    Returns a merged {"demand":[...], "supply":[...]} dict. 4h zones are
+    listed first (checked first by is_in_zone's [-5:] window, and treated
+    as the "major" levels), with 1h zones appended as secondary/backup
+    coverage when 4h data is thin.
+
+    CACHED (15min TTL, per Point 3 rate-limit fix): this function used to
+    make 2 fresh HTTP requests (4h + 1h klines) EVERY call, with no reuse.
+    If 10 coins passed the filter in the same scan cycle, that's 20
+    simultaneous requests to Binance — real IP-ban risk. 4h zone data
+    genuinely doesn't change meaningfully within 15 minutes, so repeat
+    calls for the same symbol within that window now return the cached
+    result with zero HTTP requests. Chose caching over a time.sleep(0.5)
+    throttle because sleeping still makes the same 2N requests total (just
+    slower), while caching actually reduces request volume — and a sleep
+    would add synchronous delay directly into the signal-scoring path at
+    both call sites, which matters since that path gates whether a signal
+    reaches the user at all.
+    """
+    now = get_ist_datetime()
+    cached = htf_zones_cache.get(symbol)
+    if cached and (now - cached["cached_at"]).total_seconds() < 900:  # 15 min
+        return cached["zones"]
+
+    zones_4h = {"demand": [], "supply": []}
+    zones_1h = {"demand": [], "supply": []}
+    try:
+        klines_4h = get_klines(symbol, "4h", 100)
+        if klines_4h and len(klines_4h) >= 30:
+            zones_4h = detect_supply_demand_zones(klines_4h)
+    except Exception as e:
+        logger.warning(f"get_htf_zones 4h {symbol}: {e}")
+    try:
+        klines_1h = get_klines(symbol, "1h", 100)
+        if klines_1h and len(klines_1h) >= 30:
+            zones_1h = detect_supply_demand_zones(klines_1h)
+    except Exception as e:
+        logger.warning(f"get_htf_zones 1h {symbol}: {e}")
+
+    merged = {
+        "demand": zones_4h["demand"] + zones_1h["demand"],
+        "supply": zones_4h["supply"] + zones_1h["supply"],
+    }
+    htf_zones_cache[symbol] = {"zones": merged, "cached_at": now}
+    return merged
+
+def get_structural_tp(entry, direction, zones, min_tp_dist):
+    """
+    Point 2: Structural Take Profit — targets the nearest mapped
+    institutional Supply/Demand zone in the trade's favor, instead of a
+    generic ATR-derived distance. A human trader takes profit exactly at
+    the next major resistance/support wall, not at an arbitrary
+    mathematical multiple.
+
+    Design decision (not explicitly specified by either instruction, so
+    stating it plainly): this does NOT override Point 1's 1:2 minimum
+    Risk/Reward guarantee. If the nearest structural zone sits CLOSER
+    than min_tp_dist (the SL-derived 1:2 floor), using it as TP would
+    silently produce a worse ratio than Point 1 guarantees — so that zone
+    is skipped, and the search continues outward for the next zone that
+    clears the floor. If NO zone anywhere clears the floor, this returns
+    None and the caller falls back to the existing ATR/min-RR logic
+    unchanged — Point 1's guarantee is never given up in exchange for
+    "aim at a real level."
+
+    For a BUY: target the nearest SUPPLY zone above entry (that's where
+    sellers are expected to defend — natural resistance for a long).
+    For a SELL: target the nearest DEMAND zone below entry (buyers'
+    defense level — natural support for a short).
+
+    Returns the target price (float) or None if no qualifying zone exists.
+    """
+    key = "supply" if direction == "BUY" else "demand"
+    candidates = zones.get(key, [])
+    if not candidates:
+        return None
+
+    qualifying = []
+    for z in candidates:
+        # Use the near edge of the zone (low for supply/BUY-target,
+        # high for demand/SELL-target) — the price a trader would
+        # realistically take profit at first touch, not requiring price
+        # to punch all the way through the zone.
+        if direction == "BUY":
+            zone_price = z["low"]
+            if zone_price <= entry: continue  # zone must be above entry for a long TP
+            dist = zone_price - entry
+        else:
+            zone_price = z["high"]
+            if zone_price >= entry: continue  # zone must be below entry for a short TP
+            dist = entry - zone_price
+        if dist >= min_tp_dist:
+            qualifying.append((dist, zone_price))
+
+    if not qualifying:
+        return None
+    # Nearest qualifying zone — the closest realistic target that still
+    # respects the 1:2 floor, not the farthest/most optimistic one.
+    qualifying.sort(key=lambda x: x[0])
+    return qualifying[0][1]
 
 def detect_market_condition(btc_price,btc_klines):
     try:
@@ -982,7 +1241,18 @@ def detect_market_condition(btc_price,btc_klines):
         return "sideways" if rng<5.0 else ("bull" if btc_price>(e50 or btc_price) else "bear")
     except Exception: return "sideways"
 
-def is_good_trading_session():
+def is_good_trading_session(coin=None):
+    """
+    Point 3: PREMIUM_COINS (BTC, ETH, BNB, SOL, PAXG, XAU, XAG) get VIP
+    immunity from both Dead Hour (2-7AM IST) and scheduled macro-event
+    pauses — these are high-liquidity institutional assets that genuinely
+    trade and respect technicals around the clock, unlike thin altcoins
+    that go quiet or erratic overnight. `coin` defaults to None so
+    existing callers that only want the generic/non-premium session
+    state (e.g. status displays) keep their old behavior unchanged.
+    """
+    if coin in PREMIUM_COINS:
+        return True
     hour=datetime.now(IST).hour
     if DEAD_HOUR_START<=hour<DEAD_HOUR_END:
         logger.info(f"Dead session {hour}:xx IST"); return False
@@ -1031,13 +1301,25 @@ def get_smart_leverage(symbol, atr_pct, score, grade="Grade B"):
 
 def get_signal_grade(score,whale,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,ob_imbalance=None,ms_bias=None,bos=False):
     """
-    Point 6: The grade LABEL is now authoritative directly on the normalized
-    setup_score against GRADE_A_THRESHOLD (92.2) — this is the exact same
-    number the Score Gate uses to decide whether AI gets called. Previously
-    this function computed a separate 0-19 points system that could disagree
-    with the score-based gate (e.g. label "Grade B" on a signal that actually
-    triggered AI review). The points breakdown below is now purely supplementary
-    detail shown in the Telegram message, not what decides the grade name.
+    Unified grading fix: the letter grade is now decided PURELY by the
+    confirmation scorecard (max 21 pts), completely disconnected from the
+    100-point base `score`. Previously the grade was authoritative on
+    `score` alone, which caused the exact bug reported: a trade could earn
+    a perfect scorecard (e.g. 18/21 — every confirmation hit) and still be
+    labeled "Grade C" if its 100-point base happened to be low. That's
+    backwards — "if a trade hits the right confirmations, it earns the A,"
+    regardless of what pattern/base score it started from.
+
+    Thresholds (as specified): 18+ pts = Grade A+, 14+ pts = Grade A.
+    The B/C split (8 pts) was NOT specified in the instruction — I chose
+    8 as a reasonable third-of-max boundary consistent with the existing
+    proportions, flagging this as my own judgment call rather than
+    something explicitly given.
+
+    `score` is still passed in and still contributes ONE line to the
+    scorecard itself (the "🎯 Score >=X" line below, max 3 pts) — so the
+    100-point score still matters as one input among many, it just no
+    longer single-handedly determines the letter grade.
     """
     breakdown=[]
     pts=0
@@ -1076,13 +1358,11 @@ def get_signal_grade(score,whale,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_
     if bos:          pts+=1; breakdown.append(("🔥 BOS Confirm",     1))
     else:            breakdown.append(("🔥 BOS",              0))
 
-    # Grade label — authoritative on normalized score, matches the VIP Gate exactly.
-    if score >= GRADE_A_THRESHOLD:
-        grade = "Grade A+ 🍀" if score >= 96 else "Grade A 🍀"
-    elif score >= MIN_SETUP_SCORE:
-        grade = "Grade B"
-    else:
-        grade = "Grade C"
+    # Grade label — PURELY scorecard-based now, not the 100-point score.
+    if pts >= 18:   grade = "Grade A+ 🍀"
+    elif pts >= 14: grade = "Grade A 🍀"
+    elif pts >= 8:  grade = "Grade B"
+    else:           grade = "Grade C"
     return grade, pts, breakdown
 
 def get_position_size_pct(grade):
@@ -1126,6 +1406,18 @@ def too_many_correlated_active():
     return sum(1 for c in active_trades if c in BTC_CORRELATED)>=2
 
 def get_funding_rate(symbol):
+    """
+    Bypass added for PAXG/XAU/XAG: these trade as Binance "TradFi Perpetual
+    Contracts" under a separate entity (Nest Exchange Limited, ADGM/FSRA
+    regulated) from standard crypto futures, and may not be recognized by
+    the standard fapi.binance.com funding-rate endpoint. NOTE: the existing
+    try/except below already prevents a hard crash on an error response
+    (verified: an error-shaped JSON body raises inside the try block and
+    is caught, returning None) — this bypass's real value is skipping a
+    predictably-failing HTTP call entirely, reducing wasted requests and
+    the rate-limit pressure flagged separately.
+    """
+    if symbol in ("PAXGUSDT","XAUUSDT","XAGUSDT"): return None
     try:
         res=requests.get(BINANCE_FUNDING_URL,params={"symbol":symbol,"limit":1},timeout=10)
         return float(res.json()[0]["fundingRate"]) if res.status_code==200 and res.json() else None
@@ -1140,6 +1432,8 @@ def is_funding_favorable(symbol,direction):
     return True
 
 def get_oi_trend(symbol):
+    """Bypass for PAXG/XAU/XAG — see get_funding_rate's docstring for the reasoning."""
+    if symbol in ("PAXGUSDT","XAUUSDT","XAGUSDT"): return None
     try:
         res=requests.get(BINANCE_OI_URL,params={"symbol":symbol,"period":"15m","limit":5},timeout=10)
         if res.status_code==200 and len(res.json())>=2:
@@ -1181,7 +1475,23 @@ def get_htf_trend(symbol,interval="1h"):
         logger.warning(f"HTF {symbol} {interval}: {e}"); return 0
 
 def get_timeframe_score(symbol,direction):
+    """
+    Point 4 (Daily Macro Filter): a Daily-trend disagreement is now a HARD
+    BLOCK, same treatment as the existing 4h check below — not a score
+    penalty. The instruction is explicit ("permanently block... trades
+    that fight against the heavy daily macro direction"), which is a
+    stronger requirement than the soft/scoring treatment used for some
+    other signals in earlier rounds (e.g. sector correlation, SuperTrend
+    partial lag) — those were deliberately kept as penalties because they
+    can reasonably lag a genuine move. The Daily chart disagreeing is
+    treated the same way the 4h disagreement already was: an absolute
+    veto, checked FIRST (before 4h/1h), since Daily is the highest
+    timeframe and should have final say — a human always checks the 1-Day
+    chart first, per the instruction's own framing.
+    """
     di=1 if direction=="BUY" else -1
+    d1=get_htf_trend(symbol,"1d")
+    if d1!=0 and d1!=di: return -1
     h4=get_htf_trend(symbol,"4h"); h1=get_htf_trend(symbol,"1h")
     if h4!=0 and h4!=di: return -1
     score=0
@@ -1190,13 +1500,54 @@ def get_timeframe_score(symbol,direction):
     return score
 
 def get_structure_sl(klines,direction,entry,atr):
-    lows=[float(k[3]) for k in klines[-20:]]; highs=[float(k[2]) for k in klines[-20:]]
-    min_dist=entry*MIN_SL_PCT
-    if direction=="BUY":
-        sl=min(min(lows)*0.998,entry-atr*ATR_SL_MULTIPLIER)
-        return min(sl,entry-min_dist)
-    sl=max(max(highs)*1.002,entry+atr*ATR_SL_MULTIPLIER)
-    return max(sl,entry+min_dist)
+    """
+    Structural Stop Loss (tighter Risk/Reward), rewritten per instruction.
+
+    PREVIOUS BEHAVIOR (the actual bug): despite being named get_structure_sl,
+    this took the WORSE (wider) of the structural level and the ATR-based
+    level via min()/max() — so ATR still won whenever it produced a wider
+    stop, which defeats the entire point of a structural stop. It also used
+    a raw min/max of the last 20 candles as "structure," not the real
+    swing pivot from detect_market_structure (5-bar-window pivot detection,
+    already used elsewhere in the codebase for zones/BOS/ChoCh).
+
+    NOW: the stop is placed exactly one tick beyond the most recent real
+    swing low (BUY) or swing high (SELL) from detect_market_structure —
+    genuinely tight, not a min/max blend with ATR. ATR is used ONLY as a
+    fallback when structure data is unavailable (e.g. insufficient candles
+    for swing detection), not as a competing wider distance that can
+    override a valid structural level.
+
+    "One tick" — since this codebase doesn't track each symbol's exact
+    exchange tick size, 0.05% of entry price is used as a close, safe
+    approximation (small enough to stay genuinely tight, large enough to
+    not sit exactly on the swing level where noise could tag it instantly).
+    """
+    ONE_TICK_PCT = 0.0005  # 0.05% of entry, approximating "one tick"
+    min_dist = entry * MIN_SL_PCT  # existing minimum stop distance floor
+
+    ms = detect_market_structure(klines)
+    has_valid_swing = ms["swing_low"] > 0 and ms["swing_high"] > 0
+
+    if has_valid_swing:
+        if direction == "BUY":
+            sl = ms["swing_low"] * (1 - ONE_TICK_PCT)
+        else:
+            sl = ms["swing_high"] * (1 + ONE_TICK_PCT)
+    else:
+        # Fallback only — structure data unavailable (e.g. too few candles)
+        logger.info("get_structure_sl: no valid swing data, falling back to ATR")
+        if direction == "BUY":
+            sl = entry - atr * ATR_SL_MULTIPLIER
+        else:
+            sl = entry + atr * ATR_SL_MULTIPLIER
+
+    # Still enforce the existing minimum distance floor — a structural
+    # stop sitting unrealistically close to entry (e.g. noisy micro-swing)
+    # is still bumped out to at least MIN_SL_PCT away.
+    if direction == "BUY":
+        return min(sl, entry - min_dist)
+    return max(sl, entry + min_dist)
 
 def check_circuit_breaker():
     global daily_losses,circuit_breaker_until,last_reset_day
@@ -2197,7 +2548,22 @@ def cmd_hidden_gems():
         atr_1h=calculate_atr(atr_1h_klines) if atr_1h_klines else calculate_atr(klines_15m)
         atr_pct=(atr_1h/entry)*100 if entry>0 else 0
         sl=get_structure_sl(klines_15m,best["direction"],entry,atr_1h)
-        tp=entry+atr_1h*ATR_TP_MULTIPLIER if best["direction"]=="BUY" else entry-atr_1h*ATR_TP_MULTIPLIER
+        # TP anchored to the ACTUAL sl distance, guaranteeing >=1:2 R/R at minimum
+        # (already existed — see format_and_send's identical block). NEW this
+        # round: try the nearest real Supply/Demand zone first via
+        # get_structural_tp — only fires once here (for the single best gem
+        # candidate, not per-scanned-coin), so the extra get_htf_zones call is
+        # cheap and cached.
+        sl_dist=abs(entry-sl)
+        atr_tp_dist=atr_1h*ATR_TP_MULTIPLIER
+        min_rr_tp_dist=sl_dist*MIN_RR_RATIO
+        gem_zones=get_htf_zones(best["symbol"])
+        structural_tp_gem=get_structural_tp(entry,best["direction"],gem_zones,min_rr_tp_dist)
+        if structural_tp_gem is not None:
+            tp=structural_tp_gem
+        else:
+            tp_dist=max(atr_tp_dist,min_rr_tp_dist)
+            tp=entry+tp_dist if best["direction"]=="BUY" else entry-tp_dist
         ms_b=detect_market_structure(klines_15m)
         whale=has_whale_activity(best["symbol"])
         oi_rising=get_oi_trend(best["symbol"])
@@ -2237,7 +2603,7 @@ def cmd_hidden_gems():
             f"  🕐 {get_ist_time()}")
     return msg
 
-def ai_analyze_setup(coin, direction, klines, price, pattern, rsi_val, adx_val, vol_strength, is_volatile=False, penalty_notes=None, htf_4h_trend=None, zone_ok=False, zone_label="", ms_bos=False, ms_choch=False, ms_bias=None):
+def ai_analyze_setup(coin, direction, klines, price, pattern, rsi_val, adx_val, vol_strength, is_volatile=False, penalty_notes=None, htf_4h_trend=None, zone_ok=False, zone_label="", ms_bos=False, ms_choch=False, ms_bias=None, is_sweep=False, sl_pct=None, rr_ratio=None, hist_wr=None, hist_signals=0):
     """
     The Human Narrative upgrade: Claude previously only saw 20 raw 15m
     candles (~5 hours of data) with no idea what the 4h trend was or
@@ -2249,9 +2615,16 @@ def ai_analyze_setup(coin, direction, klines, price, pattern, rsi_val, adx_val, 
     Now the prompt leads with the actual top-down narrative, built from
     real data already computed by the caller (4h trend via get_htf_trend,
     zone status via detect_supply_demand_zones/is_in_zone, structure/BOS/
-    ChoCh via detect_market_structure) — not invented context. Only after
-    establishing that narrative does the prompt hand over the raw candles,
-    the same order a discretionary trader actually works in.
+    ChoCh via detect_market_structure, whether a Liquidity Sweep
+    (detect_liquidity_sweep) just occurred in this trade's direction, the
+    planned sl_pct/rr_ratio so the AI can reject a beautiful pattern if
+    the required stop is too wide for the current volatility, and — Point
+    3 fix — this specific pattern's real historical win rate from
+    pattern_stats, so live price-action reading gets weighed against
+    actual data-driven probability, not evaluated in a vacuum) — not
+    invented context. Only after establishing that narrative does the
+    prompt hand over the raw candles, the same order a discretionary
+    trader actually works in.
 
     Cost ~$0.004 per call (larger prompt now, still Haiku-tier cheap).
     """
@@ -2285,13 +2658,30 @@ def ai_analyze_setup(coin, direction, klines, price, pattern, rsi_val, adx_val, 
 
         narrative = (
             f"THE NARRATIVE (read this first, the way a trader scans top-down):\n"
-            f"- 4-Hour trend: {htf_desc}.\n"
+            + (f"- 🚨 A LIQUIDITY SWEEP just occurred! Price pierced a key structural "
+               f"level to trap retail stop-losses and reversed.\n" if is_sweep else "")
+            + f"- 4-Hour trend: {htf_desc}.\n"
             f"- {zone_line}\n"
             f"- {shift_line}\n"
             f"- On the 15-minute chart, the scanner flagged: {pattern}.\n"
+            + (f"- DATA-DRIVEN PROBABILITY: this pattern has historically won "
+               f"{hist_wr:.0f}% of the time over {hist_signals} tracked signals. "
+               f"Weigh this real track record against what you see in the candles — "
+               f"a clean-looking setup on a historically weak pattern deserves more "
+               f"skepticism, and vice versa.\n" if hist_wr is not None
+               else "- DATA-DRIVEN PROBABILITY: not enough tracked history for this "
+                    "pattern yet to have a reliable win rate — judge on price action alone.\n")
+            + (f"- The planned Stop Loss is {sl_pct:.2f}% away with a 1:{rr_ratio:.1f} "
+               f"Risk/Reward. Reject this trade if the required stop is too wide for "
+               f"the current local volatility.\n" if sl_pct is not None and rr_ratio is not None else "")
         )
 
-        prompt=(f"You are an experienced discretionary crypto trader deciding whether to actually "
+        prompt=(f"You are a veteran prop-firm trader with years on a funded desk — blunt, "
+                f"experienced, and speaking with the raw conviction of someone who has seen "
+                f"this exact setup a hundred times before. You are NOT writing a textbook "
+                f"summary or a balanced research note. You call it like you see it: "
+                f"'Clear retail trap,' 'Heavy accumulation,' 'Chop zone, avoiding,' 'This is "
+                f"a gift,' 'Textbook, but late.' Deciding whether to actually "
                 f"take this trade with real money, the way you would after scanning a chart top-down "
                 f"across multiple timeframes — starting with the big picture, then zooming in.\n\n"
                 f"Setup: {coin}/USDT {dir_word}\n\n"
@@ -2315,7 +2705,9 @@ def ai_analyze_setup(coin, direction, klines, price, pattern, rsi_val, adx_val, 
                 f"VERDICT: [CLEAN/MESSY]\nCONFIDENCE: [HIGH/MEDIUM/LOW]\n"
                 f"STAGE: [EARLY/MID/LATE]\nTRADE: [YES/NO]\n"
                 f"ETA_READ: [short phrase, e.g. 'could take 2-4h to develop' or 'move may already be exhausted']\n"
-                f"REASONING: [2 sentences max, be specific about what you saw]")
+                f"REASONING: [2 sentences max — speak like a trader calling it on the desk, not a "
+                f"textbook. Be specific and blunt about what you saw. Real desk language, not "
+                f"hedge-everything corporate-speak.]")
         res=requests.post("https://api.anthropic.com/v1/messages",
             headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01",
                      "content-type":"application/json"},
@@ -2467,7 +2859,7 @@ def get_ltf_confirmation(symbol, direction):
 def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition="bull"):
     global sent_coins,coin_cooldowns
     if check_circuit_breaker(): return False
-    if not is_good_trading_session(): return False
+    if not is_good_trading_session(coin): return False
     live_price=get_price(setup["symbol"])
     if not live_price: return False
     entry=live_price
@@ -2537,14 +2929,20 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
         logger.info(f"{coin} score adjusted: -{score_penalty} ({', '.join(penalty_notes)}) -> {setup['setup_score']:.1f}")
     # A setup that's now too weak after penalties gets dropped here,
     # instead of earlier — so strong price action had a chance to survive.
-    if setup["setup_score"] < MIN_SETUP_SCORE - 8:
-        logger.info(f"{coin} rejected - score too low after penalties ({setup['setup_score']:.1f})"); return False
+    # ── STRICT HARD FLOOR (Point 2) ─────────────────────────────
+    # Previously this checked MIN_SETUP_SCORE-8 (=82), which is the exact
+    # leak responsible for 88.0-scored signals — some tagged "Instant" —
+    # reaching Telegram. Raised to a literal 92.0 floor as specified: a
+    # signal below 92.0 after penalties is killed here, before any of the
+    # more expensive zone/OI/whale lookups below even run.
+    if setup["setup_score"] < 92.0:
+        logger.info(f"{coin} rejected - score {setup['setup_score']:.1f} below strict floor 92.0"); return False
     vwap=calculate_vwap(klines_15m); vwap_ok=False; vwap_label="N/A"
     if vwap:
         if setup["direction"]=="BUY" and entry>vwap:    vwap_ok=True; vwap_label=f"Above {format_price(vwap)}"
         elif setup["direction"]=="SELL" and entry<vwap: vwap_ok=True; vwap_label=f"Below {format_price(vwap)}"
         else: vwap_label=f"{'Below' if setup['direction']=='BUY' else 'Above'} {format_price(vwap)}"
-    zones=detect_supply_demand_zones(klines_15m)
+    zones=get_htf_zones(setup["symbol"])
     zone_ok,zone_label=is_in_zone(entry,setup["direction"],zones)
     div=detect_rsi_divergence(closes)
     oi_rising=get_oi_trend(setup["symbol"])
@@ -2557,12 +2955,50 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     highs_15m=[float(k[2]) for k in klines_15m]; lows_15m=[float(k[3]) for k in klines_15m]
     res = ms["swing_high"] if ms["swing_high"] > 0 else max(highs_15m[-30:-1])
     sup = ms["swing_low"]  if ms["swing_low"]  > 0 else min(lows_15m[-30:-1])
+    # Point 4: re-check for a Liquidity Sweep here so the result can be passed
+    # into the AI narrative. detect_patterns() already ran this same check
+    # earlier in scan_coins, but its result never propagated past deciding
+    # whether "Liquidity Sweep" got added to the pattern list — the actual
+    # sweep_dir/sweep_strength were local to that function and never reached
+    # here. Re-running it is cheap: pure computation on klines_15m, already
+    # fetched above, no new API calls.
+    opens_15m=[float(k[1]) for k in klines_15m]
+    sweep_dir_chk, sweep_strength_chk = detect_liquidity_sweep(klines_15m, highs_15m, lows_15m, closes, opens_15m, sup, res, ms)
+    is_sweep = sweep_dir_chk is not None and sweep_dir_chk == setup["direction"]
     # Compute grade FIRST so leverage can use it
     grade_result=get_signal_grade(setup["setup_score"],whale,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,ob_imbalance,ms["bias"],ms["bos"])
     grade,pts,breakdown=grade_result
+
+    # Second half of the strict floor: kill Grade C outright, regardless
+    # of the numeric score. A signal could clear 92.0 on the 100-point
+    # score yet still score poorly on the confirmation scorecard (e.g.
+    # a Tier 1 pattern with a big Location bonus but weak everything
+    # else) — that combination is still not good enough to reach Telegram.
+    if grade == "Grade C":
+        logger.info(f"{coin} rejected - Grade C on scorecard ({pts} pts) despite score {setup['setup_score']:.1f}"); return False
+
     lev=get_smart_leverage(setup["symbol"],atr_pct,setup["setup_score"],grade)
     sl=get_structure_sl(klines_15m,setup["direction"],entry,atr_1h)
-    tp=entry+atr_1h*ATR_TP_MULTIPLIER if setup["direction"]=="BUY" else entry-atr_1h*ATR_TP_MULTIPLIER
+    # TP anchored to the ACTUAL sl distance, guaranteeing >=1:2 R/R at minimum
+    # (this part already existed — see cmd_hidden_gems's identical block for
+    # the original reasoning). NEW this round: before falling back to that
+    # generic ATR-based distance, try targeting the nearest real Supply/
+    # Demand zone (get_structural_tp) — a human trader aims at an actual
+    # level, not a mathematical multiple. The structural target is only
+    # used if it clears the same 1:2 floor; otherwise the guaranteed
+    # ATR/min-RR fallback below is used unchanged, so the R:R guarantee is
+    # never weakened by this addition.
+    sl_dist=abs(entry-sl)
+    atr_tp_dist=atr_1h*ATR_TP_MULTIPLIER
+    min_rr_tp_dist=sl_dist*MIN_RR_RATIO
+    structural_tp=get_structural_tp(entry,setup["direction"],zones,min_rr_tp_dist)
+    if structural_tp is not None:
+        tp=structural_tp
+        logger.info(f"{coin} TP anchored to structural zone at {format_price(tp)} "
+                    f"(R:R {abs(tp-entry)/sl_dist:.1f}:1)")
+    else:
+        tp_dist=max(atr_tp_dist,min_rr_tp_dist)
+        tp=entry+tp_dist if setup["direction"]=="BUY" else entry-tp_dist
     profit_target=(abs(tp-entry)/entry)*100*lev
     if profit_target<MIN_PROFIT_TARGET:
         risk=abs(tp-entry)/entry
@@ -2572,17 +3008,32 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
             else: return False
     setup["leverage"]=lev
 
-    # ── SCORE GATE + VIP WATCHLIST (Points 1, 2, 6) ─────────────
-    # Exclusive VIP Gate: Claude is called if and only if
-    #   (1) coin is in VIP_AI_COINS, AND
-    #   (2) setup_score >= GRADE_A_THRESHOLD (92.2)
-    # Every other coin — regardless of score — executes on pure code/math.
-    # This is a strict AND, not an OR: a random altcoin scoring 99 never
-    # calls Claude, and a VIP coin scoring 88 never calls Claude either.
+    # ── SCORE GATE + AI-ELIGIBLE WATCHLIST ──────────────────────
+    # Claude is called if and only if:
+    #   (1) coin is in VIP_AI_COINS OR PREMIUM_COINS, AND
+    #   (2) the letter grade (scorecard-based, see get_signal_grade) is
+    #       "Grade A" or "Grade A+" — NOT a numeric score check.
+    #
+    # This changed from a numeric setup_score>=GRADE_A_THRESHOLD check to
+    # a grade-string check because of today's Point 1: the letter grade
+    # is now purely decided by the 21-point confirmation scorecard,
+    # deliberately disconnected from the 100-point base score. If the AI
+    # gate kept checking the numeric score independently, it could
+    # disagree with the grade shown in the Telegram message (e.g. a
+    # signal displayed as "Grade A" that never actually triggered AI
+    # review, or vice versa) — the exact kind of B/C confusion Point 1
+    # was written to eliminate. Gating on `grade` directly makes the two
+    # agree by construction.
+    #
+    # PREMIUM_COINS (BTC, ETH, BNB, SOL, PAXG, XAU, XAG) were added
+    # alongside the existing VIP_AI_COINS set — high-market-cap assets
+    # carry less noise, making them easier for the AI to read accurately,
+    # per the explicit instruction to stop them "completely skipping
+    # the AI review."
     ai_result=None
-    is_grade_a = setup["setup_score"] >= GRADE_A_THRESHOLD
-    is_vip = coin in VIP_AI_COINS
-    if is_vip and is_grade_a:
+    is_grade_a = grade in ("Grade A 🍀","Grade A+ 🍀")
+    is_ai_eligible_coin = coin in VIP_AI_COINS or coin in PREMIUM_COINS
+    if is_ai_eligible_coin and is_grade_a:
         vols_ai=[float(k[5]) for k in klines_15m]
         avg_vol_ai=sum(vols_ai[-20:])/20 if len(vols_ai)>=20 else 1
         vol_str_ai=vols_ai[-1]/avg_vol_ai if avg_vol_ai>0 else 1.0
@@ -2592,11 +3043,35 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
         # structure data already computed above (zone_ok, zone_label, ms)
         # instead of sending Claude only raw 15m candles with no context.
         htf_4h=get_htf_trend(setup["symbol"],"4h")
-        logger.info(f"{coin} VIP + Grade A ({setup['setup_score']:.1f}) — calling Claude for final verification")
+        # Point 4: sl_pct/rr_ratio computed here specifically for the AI call —
+        # entry/sl/tp are already available at this point (defined above), so
+        # this is a cheap local computation, kept separate from the later
+        # sl_pct/rr_ratio used for message formatting to avoid any risk of
+        # colliding with that existing, independently-scoped calculation.
+        sl_pct_ai = abs(entry-sl)/entry*100 if entry>0 else 0
+        tp_pct_ai = abs(tp-entry)/entry*100 if entry>0 else 0
+        rr_ratio_ai = tp_pct_ai/sl_pct_ai if sl_pct_ai>0 else 0
+        # Point 3 (Market Memory Integration): pull this pattern's real historical
+        # win rate from pattern_stats. NOTE: the instruction named "market_memory"
+        # as the source, but that dict is actually keyed by market condition
+        # (bull/bear/sideways) and only stores which pattern is "best" per
+        # condition — it does not contain per-pattern win rates. pattern_stats is
+        # the actual tracker with wins/losses/signals per pattern name, so that's
+        # what's used here. setup["pattern"] can be a compound string like
+        # "Bull Flag Break + EMA Trend" (primary + confluence patterns) — split
+        # to the primary pattern, matching how trade-close already attributes
+        # wins/losses (see the identical .split(" + ")[0] at trade-close time).
+        primary_pattern = setup["pattern"].split(" + ")[0]
+        pstat = pattern_stats.get(primary_pattern, {})
+        p_signals = pstat.get("signals", 0)
+        hist_wr = (pstat.get("wins", 0) / p_signals * 100) if p_signals >= 3 else None
+        logger.info(f"{coin} AI-eligible + {grade} ({pts}pts) — calling Claude for final verification")
         ai_result=ai_analyze_setup(coin,setup["direction"],klines_15m,entry,
                                    setup["pattern"],rsi_ai,adx_ai,vol_str_ai,is_volatile,penalty_notes,
                                    htf_4h_trend=htf_4h,zone_ok=zone_ok,zone_label=zone_label,
-                                   ms_bos=ms["bos"],ms_choch=ms["choch"],ms_bias=ms["bias"])
+                                   ms_bos=ms["bos"],ms_choch=ms["choch"],ms_bias=ms["bias"],
+                                   is_sweep=is_sweep,sl_pct=sl_pct_ai,rr_ratio=rr_ratio_ai,
+                                   hist_wr=hist_wr,hist_signals=p_signals)
         if ai_result and ai_result["trade"]==False:
             logger.info(f"{coin} rejected by AI — {ai_result['verdict']}/{ai_result['confidence']}")
             return False
@@ -2605,10 +3080,10 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
             highs_r=[float(k[2]) for k in klines_15m]; lows_r=[float(k[3]) for k in klines_15m]
             log_retest_candidate(coin,setup["symbol"],setup["direction"],closes,highs_r,lows_r,setup["pattern"])
             return False
-    elif is_vip and not is_grade_a:
-        logger.info(f"{coin} is VIP but score {setup['setup_score']:.1f} below Grade A ({GRADE_A_THRESHOLD}) — executing on pure code, no AI call")
+    elif is_ai_eligible_coin and not is_grade_a:
+        logger.info(f"{coin} is AI-eligible but grade is {grade} ({pts}pts, not A/A+) — executing on pure code, no AI call")
     else:
-        logger.info(f"{coin} not on VIP watchlist — executing on pure code, no AI call")
+        logger.info(f"{coin} not on VIP/Premium watchlist — executing on pure code, no AI call")
 
     price_range=(max(closes[-10:])-min(closes[-10:]))/10
     eta=int(abs(tp-entry)/(price_range if price_range>0 else 0.001)*15)
@@ -2626,7 +3101,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     tf_label=tf_map.get(tf_score,"N/A")
     cond_em={"bull":"Bullish 📈","bear":"Bearish 📉","sideways":"Sideways ➡️"}.get(market_condition,"")
     if is_instant: sig_type="⚡ INSTANT SIGNAL"
-    elif is_river: sig_type="🌊 RIVER SIGNAL"
+    elif is_river: sig_type="🌊 LAB SIGNAL"
     else:          sig_type="🔥 VERIFIED SETUP"
     dir_arrow="🟢 LONG  ▲" if setup["direction"]=="BUY" else "🔴 SHORT ▼"
     grade_em="🏆" if "A+" in grade else "🍀" if " A" in grade else "🥈" if "B" in grade else "🥉"
@@ -3094,11 +3569,12 @@ def poll_telegram():
                         bt_e=calculate_ema([float(x[4]) for x in btc_k],50) if btc_k else None
                         bt=1 if (btc_p and bt_e and btc_p>bt_e) else -1
                         mc=detect_market_condition(btc_p,btc_k) if btc_p and btc_k else "unknown"
-                        sess=is_good_trading_session(); cb=check_circuit_breaker()
+                        sess=is_good_trading_session(); sess_premium=is_good_trading_session("BTC"); cb=check_circuit_breaker()
                         btc_crash=is_btc_crashing()
                         send_telegram(
                             f"{_H('LIVE BOT STATUS','📡')}\n\n"
-                            f"  {'✅' if sess else '🔴'} Session    : {'ACTIVE' if sess else 'DEAD (2-7AM IST)'}\n"
+                            f"  {'✅' if sess else '🔴'} Session (regular): {'ACTIVE' if sess else 'DEAD (2-7AM IST)'}\n"
+                            f"  {'✅' if sess_premium else '🔴'} Session (premium): {'ACTIVE 24/7' if sess_premium else 'DEAD'}\n"
                             f"  {'✅' if not cb else '🔴'} CB         : {'OK' if not cb else 'ACTIVE — paused'}\n"
                             f"  {'✅' if not btc_crash else '🔴'} BTC Crash  : {'OK' if not btc_crash else 'CRASHING'}\n"
                             f"  {'🟢' if bt==1 else '🔴'} BTC Trend  : {'BULLISH ▲' if bt==1 else 'BEARISH ▼'}\n"
@@ -3237,12 +3713,27 @@ def send_weekly_report():
     send_telegram(msg)
 
 def scan_river(now,market_condition):
+    """
+    NOTE: function/variable names (scan_river, last_river_time, RIVER_INTERVAL)
+    kept as-is — only the actual coin/symbol scanned was retargeted from
+    RIVER to LAB per instruction (RIVER no longer liquid/supported).
+    Renaming every internal identifier was judged out of scope / cosmetic-only.
+
+    SEPARATE FINDING (not fixed here, flagging for visibility): this
+    dedicated scan path builds its own setup dict and calls format_and_send
+    directly, bypassing the SuperTrend/sector/LTF/weekend penalty system
+    that scan_coins applies to every other coin. format_and_send's own
+    92.0 strict floor still applies (so nothing below 92.0 ever reaches
+    Telegram from here), but a setup could reach that floor UNPENALIZED
+    in a way that would have scored lower had it gone through the normal
+    scan_coins path. Pre-existing gap, not introduced by today's changes.
+    """
     global last_river_time
     try:
-        if "RIVER" not in active_trades and "RIVER" not in pending_signals:
-            price=get_price("RIVERUSDT"); klines=get_klines("RIVERUSDT","15m",100)
+        if "LAB" not in active_trades and "LAB" not in pending_signals:
+            price=get_price("LABUSDT"); klines=get_klines("LABUSDT","15m",100)
             if not price or not klines or len(klines)<50: return
-            found=detect_patterns("RIVERUSDT",klines,price,1)+detect_patterns("RIVERUSDT",klines,price,-1)
+            found=detect_patterns("LABUSDT",klines,price,1)+detect_patterns("LABUSDT",klines,price,-1)
             seen=set(); unique=[]
             for pat in found:
                 if (pat[0],pat[2]) not in seen: seen.add((pat[0],pat[2])); unique.append(pat)
@@ -3255,12 +3746,13 @@ def scan_river(now,market_condition):
                 score=min(best[1]+min(len(unique)*0.5,2),99)
                 if score>=82:
                     atr=calculate_atr(klines); atr_pct=(atr/price)*100 if price>0 else 0
-                    setup={"coin":"RIVER","symbol":"RIVERUSDT","direction":best[2],"pattern":pt,
-                           "setup_score":score,"leverage":get_smart_leverage("RIVERUSDT",atr_pct,score),
+                    setup={"coin":"LAB","symbol":"LABUSDT","direction":best[2],"pattern":pt,
+                           "setup_score":score,"leverage":get_smart_leverage("LABUSDT",atr_pct,score),
                            "scan_price":price}
-                    format_and_send(setup,"RIVER",is_river=True,is_instant=score>=INSTANT_SIGNAL_THRESHOLD,market_condition=market_condition)
+                    format_and_send(setup,"LAB",is_river=True,is_instant=score>=INSTANT_SIGNAL_THRESHOLD,market_condition=market_condition)
         last_river_time=now
     except Exception as e: logger.error(f"River: {e}",exc_info=True)
+
 
 def is_move_already_extended(closes, direction):
     """
@@ -3372,7 +3864,11 @@ def scan_coins(btc_trend,fng,market_condition):
                 ob_imb,_=get_orderbook_imbalance(symbol)
                 # Location + Shift: check S/D zone and market structure/BOS/ChoCh before
                 # scoring — these are now the heaviest-weighted confirmations for Tier 1.
-                zones_chk=detect_supply_demand_zones(klines)
+                # Uses get_htf_zones (4h primary, 1h secondary) rather than 15m-only,
+                # since this point already only runs on candidates that survived the
+                # upstream pattern/blacklist/sentiment/counter-trend filters above —
+                # not every coin on every scan tick.
+                zones_chk=get_htf_zones(symbol)
                 zone_ok,_zone_label=is_in_zone(price,direction,zones_chk)
                 ms_chk=detect_market_structure(klines)
                 # base_s is the pattern's own untouched base score (TIER1_BASE=88.0 or
