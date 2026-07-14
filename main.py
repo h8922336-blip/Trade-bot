@@ -15,8 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -103,7 +103,7 @@ last_update_id         = None
 last_river_time        = 0
 last_hourly_time       = time.time()
 last_pnl_update_time   = time.time() + 1800
-last_4h_desk_time      = time.time()
+last_8h_desk_time      = time.time()
 last_weekly_report_day = None
 
 SCAN_INTERVAL            = 90
@@ -2532,9 +2532,9 @@ def cmd_trend(coin_input):
 
 DESK_REPORT_COINS = ["LAB","BTC","ETH","PIPPIN","LINK","NEAR"]
 
-def send_4h_ai_desk_report():
+def send_8h_ai_desk_report():
     """
-    Point 4: The 4-Hour VIP "Prop-Desk" AI Report.
+    Point 4: The 8-Hour VIP "Prop-Desk" AI Report (retimed from 4h to 8h per user request).
 
     Every 4 hours, pulls 4h (macro structure) and 15m (entry timing) data
     for DESK_REPORT_COINS, batches all six into ONE Claude call (single
@@ -2551,7 +2551,7 @@ def send_4h_ai_desk_report():
     instead of live PnL numbers.
     """
     if not ANTHROPIC_API_KEY:
-        logger.info("send_4h_ai_desk_report: ANTHROPIC_API_KEY not set, skipping")
+        logger.info("send_8h_ai_desk_report: ANTHROPIC_API_KEY not set, skipping")
         return
 
     coin_summaries = []
@@ -2593,11 +2593,27 @@ def send_4h_ai_desk_report():
         )
 
     if not coin_summaries:
-        logger.warning("send_4h_ai_desk_report: no coin data available, skipping")
+        logger.warning("send_8h_ai_desk_report: no coin data available, skipping")
         return
 
+    # User-requested addition: a dedicated BTC trend / overall market
+    # regime header, separate from the per-coin list. Reuses
+    # detect_market_condition() — the same function the rest of the bot
+    # already relies on for bull/bear/sideways classification — rather
+    # than inventing a second, possibly-inconsistent regime read. That
+    # function's vocabulary is bull/bear/sideways only (no "mixed"
+    # category exists anywhere else in the codebase to be consistent
+    # with); rather than guess at new "mixed" thresholds, per-coin
+    # disagreement is left to show up naturally in the AI's own per-coin
+    # reads in the report body below, instead of a second invented
+    # classifier layered on top.
+    btc_price_desk = get_price("BTCUSDT")
+    btc_klines_desk = get_klines("BTCUSDT", "1h", 60)
+    market_regime = detect_market_condition(btc_price_desk, btc_klines_desk) if btc_price_desk and btc_klines_desk else "sideways"
+    regime_label = {"bull":"BULLISH 📈","bear":"BEARISH 📉","sideways":"SIDEWAYS ➡️"}.get(market_regime, "UNKNOWN")
+
     prompt = (
-        "You are running the 4-hour desk check for a proprietary trading desk, reviewing "
+        "You are running the 8-hour desk check for a proprietary trading desk, reviewing "
         "a fixed watchlist top-down: 4-Hour macro structure first, then 15-minute entry timing.\n\n"
         "WATCHLIST:\n" + "\n".join(coin_summaries) + "\n\n"
         "For EACH coin with data, give a one-line read: what's the macro bias, and is anything "
@@ -2621,11 +2637,11 @@ def send_4h_ai_desk_report():
             timeout=25
         )
         if res.status_code != 200:
-            logger.warning(f"send_4h_ai_desk_report: API returned {res.status_code}")
+            logger.warning(f"send_8h_ai_desk_report: API returned {res.status_code}")
             return
         text = res.json()["content"][0]["text"].strip()
     except Exception as e:
-        logger.warning(f"send_4h_ai_desk_report: {e}")
+        logger.warning(f"send_8h_ai_desk_report: {e}")
         return
 
     ready_lines = []
@@ -2638,14 +2654,15 @@ def send_4h_ai_desk_report():
         else:
             report_lines.append(line)
 
-    msg = f"{_H('4H PROP-DESK REPORT','🏦')}\n\n"
+    msg = f"{_H('8H PROP-DESK REPORT','🏦')}\n\n"
+    msg += f"  ₿ BTC Trend: <b>{regime_label}</b>\n\n"
     for line in report_lines:
         if ":" in line:
             coin_part, rest = line.split(":", 1)
             msg += f"  🔹 <b>{coin_part.strip()}</b>:{rest}\n"
     msg += f"\n  🕐 {get_ist_time()}"
     send_telegram(msg)
-    logger.info(f"4h desk report sent, {len(ready_lines)} ready candidate(s)")
+    logger.info(f"8h desk report sent, {len(ready_lines)} ready candidate(s)")
 
     # Explicit, distinct ping for anything flagged genuinely trade-ready —
     # not buried inside the regular report, per "specifically ping you to
@@ -3525,12 +3542,37 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
                                    is_sweep=is_sweep,sl_pct=sl_pct_ai,rr_ratio=rr_ratio_ai,
                                    hist_wr=hist_wr,hist_signals=p_signals)
         if ai_result and ai_result["trade"]==False:
-            logger.info(f"{coin} rejected by AI — {ai_result['verdict']}/{ai_result['confidence']}")
-            return False
+            stage = ai_result.get("stage","")
+            if stage == "MID":
+                # User-requested carve-out: STAGE:MID means the AI is
+                # genuinely uncertain (still developing, not clearly bad
+                # like a LATE/exhausted move) — send it anyway rather than
+                # veto outright, with the AI's real verdict/confidence/
+                # reasoning shown in the message so the user can make the
+                # final call themselves. STAGE:LATE keeps its existing
+                # retest-logging behavior below, unchanged — this carve-out
+                # is deliberately scoped to MID only, not a blanket
+                # override of AI rejections.
+                logger.info(f"{coin} AI said TRADE:NO but STAGE:MID — sending anyway per user preference, AI notes will be shown")
+            else:
+                logger.info(f"{coin} rejected by AI — {ai_result['verdict']}/{ai_result['confidence']}/STAGE:{stage}")
+                # Cooldown fix: previously a rejected signal set NO cooldown
+                # at all (the cooldown is only set later, after a successful
+                # send) — meaning the same coin was immediately eligible to
+                # be re-scanned and re-flagged on the very next cycle
+                # (SCAN_INTERVAL=90s), producing the exact "same signal every
+                # ~2 minutes" pattern reported. A shorter cooldown than a
+                # normal successful signal's ETA-based one (which can be
+                # hours) — 20 minutes — since an AI rejection isn't the same
+                # as a completed trade, conditions can genuinely change
+                # faster, but it shouldn't re-fire every single cycle either.
+                coin_cooldowns[coin]=get_ist_datetime()+timedelta(minutes=20)
+                return False
         if ai_result and ai_result.get("stage")=="LATE":
             logger.info(f"{coin} AI flagged stage LATE — logging as retest candidate instead of chasing")
             highs_r=[float(k[2]) for k in klines_15m]; lows_r=[float(k[3]) for k in klines_15m]
             log_retest_candidate(coin,setup["symbol"],setup["direction"],closes,highs_r,lows_r,setup["pattern"])
+            coin_cooldowns[coin]=get_ist_datetime()+timedelta(minutes=20)
             return False
     else:
         logger.info(f"{coin} grade is {grade} ({pts}pts, not A/A+) — executing on pure code, no AI call")
@@ -3680,6 +3722,8 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
         stage_em={"EARLY":"🌱","MID":"🔥","LATE":"⏰"}.get(ai_result.get("stage","UNKNOWN"),"❔")
         msg+=f"\n  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         msg+=f"  🧠 <b>AI ANALYSIS</b>\n"
+        if ai_result.get("trade")==False:
+            msg+=f"  ⚠️ <b>AI said TRADE:NO but STAGE:MID — sent for your review, not an AI approval</b>\n"
         msg+=f"  {v_em} Pattern: <b>{ai_result['verdict']}</b>  {c_em} Confidence: <b>{ai_result['confidence']}</b>\n"
         if ai_result.get("stage") and ai_result["stage"]!="UNKNOWN":
             msg+=f"  {stage_em} Stage: <b>{ai_result['stage']}</b>\n"
@@ -4424,7 +4468,7 @@ def scan_coins(btc_trend,fng,market_condition):
         time.sleep(DELAY_BETWEEN_COINS)
 
 def main():
-    global last_river_time,last_hourly_time,last_pnl_update_time,last_4h_desk_time,last_weekly_report_day
+    global last_river_time,last_hourly_time,last_pnl_update_time,last_8h_desk_time,last_weekly_report_day
     load_alerts(); load_circuit_breaker(); load_pending_signals(); load_retest_watchlist(); load_macro_events()
     cloud_load_all()   # loads journal, pattern_stats, learning, active_trades from Supabase (falls back to local JSON)
     threading.Thread(target=poll_telegram,daemon=True).start()
@@ -4497,7 +4541,7 @@ def main():
             if (now-last_hourly_time)>=3600:          send_hourly_report();   last_hourly_time=now
             if (now-last_pnl_update_time)>=3600:      send_live_pnl_update(); last_pnl_update_time=now
             if (now-last_river_time)>=RIVER_INTERVAL:  scan_river(now,market_condition); last_river_time=now
-            if (now-last_4h_desk_time)>=14400:         send_4h_ai_desk_report(); last_4h_desk_time=now
+            if (now-last_8h_desk_time)>=28800:         send_8h_ai_desk_report(); last_8h_desk_time=now  # 8h = 28800s
             today=datetime.now(IST).date()
             if today.weekday()==6 and last_weekly_report_day!=today:
                 send_weekly_report(); last_weekly_report_day=today
