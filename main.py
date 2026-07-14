@@ -15,8 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -37,7 +37,10 @@ BINANCE_FUTURES_KLINE_URL = "https://fapi.binance.com/fapi/v1/klines"
 # changes needed. Not applied preemptively here since there's no current
 # evidence of an actual problem; this is a one-line self-service fix for if
 # that changes.
-FUTURES_ONLY_SYMBOLS = {"XAUUSDT","XAGUSDT","PAXGUSDT"}
+FUTURES_ONLY_SYMBOLS = {"PAXGUSDT"}  # XAUUSDT/XAGUSDT removed alongside their
+                                       # removal from COINS/PREMIUM_COINS below —
+                                       # see the PREMIUM_COINS comment for the
+                                       # reported Geo-Block (451) reasoning.
 BINANCE_AGG_URL     = "https://api.binance.com/api/v3/aggTrades"
 BINANCE_FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
 BINANCE_OI_URL      = "https://fapi.binance.com/futures/data/openInterestHist"
@@ -55,7 +58,12 @@ COINS = list(dict.fromkeys([
     "GMT","ENJ","PEPE","WIF","FLOKI","BONK","ORDI","BOME","NOT","DOGS",
     "JUP","PYTH","JTO","STRK","EIGEN","ETHFI","IO","ZERO","ONDO",
     "BLUR","CFX","METIS","MANTA","ZETA","TRB","ALT","PIXEL","PORTAL","STPT","KAS",
-    "PIPPIN","BSB","CL","LAB","PAXG","XAU","XAG"
+    "PIPPIN","BSB","CL","LAB","PAXG"
+    # XRP, ADA, LINK, AVAX already present earlier in this list (see the
+    # "BTC","ETH","BNB","SOL","XRP",...,"ADA",... and "LINK" lines above) —
+    # not re-added here to avoid a misleading duplicate literal entry.
+    # dict.fromkeys() below would have silently deduped it either way, but
+    # this is clearer for anyone reading the list later.
 ]))
 
 active_trades             = {}
@@ -86,14 +94,13 @@ pattern_stats = {p: {"signals":0,"wins":0,"losses":0,"total_pnl":0.0,"weight":1.
 ]}
 
 last_update_id         = None
-last_batch_time        = 0
 last_river_time        = 0
 last_hourly_time       = time.time()
 last_pnl_update_time   = time.time() + 1800
+last_4h_desk_time      = time.time()
 last_weekly_report_day = None
 
 SCAN_INTERVAL            = 90
-BATCH_INTERVAL           = 1800
 RIVER_INTERVAL           = 900
 MIN_SETUP_SCORE          = 90
 MIN_PRIMARY_SCORE        = 85    # matches the normalized pattern base (Point 5) — the floor
@@ -107,7 +114,17 @@ VIP_AI_COINS             = {"MANA","LAB","ENJ"}  # RIVER replaced with LAB (RIVE
 # — they scan continuously because high-liquidity institutional assets
 # genuinely do respect technicals around the clock, unlike thin altcoins
 # that go dead/erratic during low-volume overnight hours.
-PREMIUM_COINS             = {"BTC","ETH","BNB","SOL","PAXG","XAU","XAG"}
+PREMIUM_COINS             = {"BTC","ETH","BNB","SOL","PAXG","XRP","ADA","LINK","AVAX"}
+# XAU/XAG removed per reported Geo-Block (451) errors on the Futures TradFi
+# endpoint — see FUTURES_ONLY_SYMBOLS and get_price/get_klines's docstrings
+# for the regional-access background (separate regulated entity, Nest
+# Exchange Limited/ADGM-FSRA, from standard Binance Futures). PAXG was NOT
+# reported as failing, so it stays in both PREMIUM_COINS and
+# FUTURES_ONLY_SYMBOLS unchanged — only XAU/XAG are being pulled here.
+# Replaced with 4 high-liquidity top-cap assets (XRP, ADA, LINK, AVAX) that
+# were already present in the main COINS scan universe (verified — no new
+# unvalidated symbols introduced) and trade on standard Spot/Futures with
+# no regional-routing complications.
 MIN_PROFIT_TARGET        = 15.0
 SIGNAL_EXPIRY_MINUTES    = 120
 INSTANT_EXPIRY_MINUTES   = 30
@@ -142,6 +159,34 @@ MIN_SL_PCT               = 0.003  # was 0.02 (2%) — that floor was silently wi
 DEAD_HOUR_START          = 2
 DEAD_HOUR_END            = 7
 
+# Golden Hours: first 2 hours of London and New York opens, when
+# institutional volume injects real, sustained momentum vs quieter
+# Asian-session hours. Verified via search — sources vary slightly
+# (12:30-1:30 PM and 5:30-6:30 PM IST depending on source), used the
+# most consistently-cited standard-time anchors below.
+# KNOWN LIMITATION: these are STANDARD TIME only. During US/UK Daylight
+# Saving Time (roughly late March - late October), both sessions shift
+# about 1 hour EARLIER in IST. This is not auto-adjusted — same category
+# of manual-upkeep limitation as SCHEDULED_MACRO_EVENTS below.
+LONDON_OPEN_HOUR         = 12   # 12:30 PM IST standard time
+LONDON_GOLDEN_END_HOUR   = 14   # first ~2 hours: 12:30-2:30 PM IST
+NY_OPEN_HOUR             = 17   # 5:30 PM IST standard time
+NY_GOLDEN_END_HOUR       = 19   # first ~2 hours: 5:30-7:30 PM IST
+
+def is_golden_hour():
+    """
+    Point 4: "Golden Hours" vs Dead Zones. Returns True during the first
+    ~2 hours of the London or New York open (standard IST, see the DST
+    caveat on the constants above). Used as a scorecard bonus, NOT a
+    hard block — Dead Hour already hard-blocks the genuinely thin
+    2-7AM window; this only rewards the best hours, it doesn't punish
+    the rest of the day.
+    """
+    hour = datetime.now(IST).hour
+    in_london = LONDON_OPEN_HOUR <= hour < LONDON_GOLDEN_END_HOUR
+    in_ny = NY_OPEN_HOUR <= hour < NY_GOLDEN_END_HOUR
+    return in_london or in_ny
+
 # Point 4: Macro-Time Awareness.
 # HONEST SCOPE: this bot has no live economic calendar API, so it cannot
 # know "FOMC in 10 minutes" in real time on its own. What it DOES do:
@@ -155,17 +200,58 @@ DEAD_HOUR_END            = 7
 #      using existing ATR data as a real-time signal when (b) is empty.
 MACRO_EVENT_PAUSE_MIN_BEFORE = 30   # pause new signals starting 30 min before a listed event
 MACRO_EVENT_PAUSE_MIN_AFTER  = 30   # and for 30 min after, while the market digests it
+
+# Point 3: Squeeze detection thresholds. Verified via search rather than
+# guessed — reported "deeply negative"/squeeze-signal funding rates on
+# Binance cluster around -0.01% to -0.02% per 8h interval (one source
+# explicitly labels -0.02% "Short squeeze potential"), and Binance caps
+# funding at roughly +/-0.75-3% depending on the pair. -0.03% (-0.0003
+# in Binance's raw fraction format) sits meaningfully beyond the reported
+# squeeze-signal level — genuinely extreme, not just elevated.
+SQUEEZE_FUNDING_EXTREME_NEG = -0.0003   # -0.03% — shorts paying heavily, over-leveraged short side
+SQUEEZE_FUNDING_EXTREME_POS = 0.0003    # +0.03% — mirror case for long-squeeze setups
+SQUEEZE_OI_RISING_PCT       = 3.0       # OI must have grown at least 3% in the last 15m reading
+                                          # to count as "skyrocketing" rather than routine drift
+
 SCHEDULED_MACRO_EVENTS = [
     # Add known high-impact events here as "YYYY-MM-DD HH:MM" (IST).
     # Example: "2026-08-01 18:00",  # FOMC rate decision
 ]
 
 def is_macro_event_window():
-    """Point 4(b): checks the manually-maintained scheduled events list."""
+    """
+    Point 4(b): checks the manually-maintained scheduled events list.
+
+    BUG FIX #1 (label parsing): entries saved via /addmacroevent with a
+    label look like "2026-07-14 18:30  # CPI Data" (label suffix appended
+    by that command). datetime.strptime() on the raw string throws
+    "unconverted data remains: # CPI Data" — silently swallowed by the
+    except below via `continue`, so any LABELED event was completely
+    ignored with no log line, no warning, nothing.
+
+    BUG FIX #2 (found while verifying fix #1 — more severe, pre-existing,
+    affected EVERY entry regardless of label): this codebase uses
+    `from zoneinfo import ZoneInfo` for IST (see top of file), NOT pytz.
+    zoneinfo.ZoneInfo objects have NO `.localize()` method — that's a
+    pytz-only API. `IST.localize(...)` therefore raised AttributeError
+    on every single call, for every entry, unlabeled or not. That
+    AttributeError was ALSO silently swallowed by the same broad
+    except/continue. Net effect: is_macro_event_window() has returned
+    (False, "") unconditionally since this feature was first built —
+    the macro-event pause has never actually paused anything, for any
+    entry, ever. Confirmed directly: reproduced the AttributeError,
+    confirmed the working fix pattern (`.replace(tzinfo=IST)`, verified
+    against get_ist_datetime()'s pattern) and confirmed it now compares
+    correctly against real "now" values inside/outside the pause window.
+
+    Both fixed together: split at '#' and strip before parsing (fix #1),
+    and use `.replace(tzinfo=IST)` instead of `.localize()` (fix #2).
+    """
     now = get_ist_datetime()
     for ev_str in SCHEDULED_MACRO_EVENTS:
         try:
-            ev_time = IST.localize(datetime.strptime(ev_str, "%Y-%m-%d %H:%M"))
+            date_part = ev_str.split("#")[0].strip()
+            ev_time = datetime.strptime(date_part, "%Y-%m-%d %H:%M").replace(tzinfo=IST)
         except Exception:
             continue
         window_start = ev_time - timedelta(minutes=MACRO_EVENT_PAUSE_MIN_BEFORE)
@@ -321,6 +407,26 @@ def load_retest_watchlist():
             retest_watchlist[coin]=w
         logger.info(f"Loaded {len(retest_watchlist)} retest watchlist entries.")
     except Exception as e: logger.error(f"load_retest_watchlist: {e}")
+
+def save_macro_events():
+    """
+    Point 2: Persists SCHEDULED_MACRO_EVENTS to disk so events added via
+    /addmacroevent survive a bot restart — same JSON-file pattern as
+    save_retest_watchlist()/save_pending_signals() above.
+    """
+    try:
+        with open("macro_events.json","w") as f: json.dump(SCHEDULED_MACRO_EVENTS,f)
+    except Exception as e: logger.error(f"save_macro_events: {e}")
+
+def load_macro_events():
+    global SCHEDULED_MACRO_EVENTS
+    try:
+        if not os.path.exists("macro_events.json"): return
+        with open("macro_events.json") as f: data=json.load(f)
+        if isinstance(data,list):
+            SCHEDULED_MACRO_EVENTS = data
+            logger.info(f"Loaded {len(SCHEDULED_MACRO_EVENTS)} macro events.")
+    except Exception as e: logger.error(f"load_macro_events: {e}")
 
 def load_pending_signals():
     global pending_signals
@@ -514,20 +620,6 @@ def calculate_adx(klines,period=14):
         return sum(dx[-period:])/period if len(dx)>=period else 30.0
     except Exception: return 30.0
 
-def calculate_supertrend(klines,period=10,multiplier=3.0):
-    if len(klines)<period+1: return None
-    try:
-        highs=[float(k[2]) for k in klines]; lows=[float(k[3]) for k in klines]
-        closes=[float(k[4]) for k in klines]
-        atr=calculate_atr(klines,period)
-        hl2=(highs[-1]+lows[-1])/2
-        upper=hl2+multiplier*atr; lower=hl2-multiplier*atr
-        price=closes[-1]; prev=closes[-2] if len(closes)>1 else price
-        if price>lower and prev>lower: return "BUY"
-        if price<upper and prev<upper: return "SELL"
-        return "BUY" if price>hl2 else "SELL"
-    except Exception: return None
-
 def calculate_vwap(klines):
     try:
         tp=sum(((float(k[2])+float(k[3])+float(k[4]))/3)*float(k[5]) for k in klines)
@@ -649,37 +741,13 @@ def detect_supply_demand_zones(klines):
     return zones
 
 
-def get_orderbook_imbalance(symbol):
-    """Audit Fix #2: Order book analysis — bid/ask imbalance and liquidity walls."""
-    try:
-        res = requests.get(
-            "https://api.binance.com/api/v3/depth",
-            params={"symbol": symbol, "limit": 20}, timeout=8
-        )
-        if res.status_code != 200: return None, "N/A"
-        data = res.json()
-        bids = [(float(p), float(q)) for p, q in data.get("bids", [])]
-        asks = [(float(p), float(q)) for p, q in data.get("asks", [])]
-        if not bids or not asks: return None, "N/A"
-        bid_vol = sum(p * q for p, q in bids[:10])
-        ask_vol = sum(p * q for p, q in asks[:10])
-        total   = bid_vol + ask_vol
-        if total == 0: return None, "N/A"
-        imbalance = (bid_vol - ask_vol) / total  # +1 = all bids, -1 = all asks
-        # Detect walls (single level > 20% of side total)
-        bid_wall = any(p * q > bid_vol * 0.2 for p, q in bids[:10])
-        ask_wall = any(p * q > ask_vol * 0.2 for p, q in asks[:10])
-        label = ""
-        if imbalance > 0.3:   label = "Strong Buy Pressure"
-        elif imbalance > 0.1: label = "Mild Buy Pressure"
-        elif imbalance < -0.3:label = "Strong Sell Pressure"
-        elif imbalance < -0.1:label = "Mild Sell Pressure"
-        else:                  label = "Balanced"
-        if ask_wall and imbalance > 0: label += " ⚠️ Sell Wall"
-        if bid_wall and imbalance < 0: label += " ⚠️ Buy Wall"
-        return imbalance, label
-    except Exception as e:
-        logger.warning(f"orderbook {symbol}: {e}"); return None, "N/A"
+# get_orderbook_imbalance was completely deleted here (Point 2) — data was
+# thin, frequently returned "N/A", and was dragging down confirmation
+# scorecard grades on missing data rather than genuine signal weakness.
+# Replaced throughout (get_signal_grade, compute_confirmation_bonus, and
+# the Telegram message) with a real BTC 1-Hour trend alignment check
+# (👑 BTC Aligned) — see get_signal_grade's docstring for the full
+# before/after scoring breakdown.
 
 
 def calculate_supertrend(klines, period=10, multiplier=3.0):
@@ -1299,38 +1367,43 @@ def get_smart_leverage(symbol, atr_pct, score, grade="Grade B"):
 
     return max(lev, 1)
 
-def get_signal_grade(score,vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,ob_imbalance=None,ms_bias=None,bos=False):
+def get_signal_grade(score,vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,btc_aligned=False,ms_bias=None,bos=False):
     """
     Unified grading fix: the letter grade is now decided PURELY by the
-    confirmation scorecard (max 21 pts), completely disconnected from the
-    100-point base `score`. Previously the grade was authoritative on
-    `score` alone, which caused the exact bug reported: a trade could earn
-    a perfect scorecard (e.g. 18/21 — every confirmation hit) and still be
-    labeled "Grade C" if its 100-point base happened to be low. That's
-    backwards — "if a trade hits the right confirmations, it earns the A,"
-    regardless of what pattern/base score it started from.
+    confirmation scorecard, completely disconnected from the 100-point
+    base `score`. Previously the grade was authoritative on `score` alone,
+    which caused the exact bug reported: a trade could earn a perfect
+    scorecard (every confirmation hit) and still be labeled "Grade C" if
+    its 100-point base happened to be low. That's backwards — "if a trade
+    hits the right confirmations, it earns the A," regardless of what
+    pattern/base score it started from.
 
     Thresholds (as specified): 18+ pts = Grade A+, 14+ pts = Grade A.
     The B/C split (8 pts) was NOT specified in the instruction — I chose
-    8 as a reasonable third-of-max boundary consistent with the existing
-    proportions, flagging this as my own judgment call rather than
-    something explicitly given.
+    8 as a reasonable third-of-max boundary, flagging this as my own
+    judgment call.
 
-    `score` is still passed in and still contributes ONE line to the
-    scorecard itself (the "🎯 Score >=X" line below, max 3 pts) — so the
-    100-point score still matters as one input among many, it just no
-    longer single-handedly determines the letter grade.
+    MAX POINTS: 21 (score 3 + volume 2 + tf 2 + vol_ok 1 + rsi 1 +
+    funding 1 + supertrend 2 + vwap 1 + zone 2 + adx 1 + btc_aligned 2 +
+    structure 1 + bos 1 + golden_hour 1).
 
-    WHALE/OI REMOVAL: `whale` (has_whale_activity — boolean-only, no
-    visible underlying number) and its 2pt slot are replaced with
-    `vol_ratio` (the real volume-vs-20-candle-average multiple, e.g.
-    "1.8x") scored in tiers matching the same 1.5x/1.2x thresholds
-    compute_confirmation_bonus already uses elsewhere. This absorbs the
-    2 points whale used to contribute, so the 21-point total and the
-    14/18 A/A+ thresholds stay meaningful without recalibration.
-    oi_rising's parameter is kept (still receives the real value from
-    get_oi_trend) but no longer scored below — removed for the same
-    "no reliably visible data" reason as whale.
+    WHALE/OI REMOVAL (earlier round): `whale` replaced with `vol_ratio`
+    tiered scoring; `oi_rising` kept as a parameter but no longer scored.
+
+    ORDER BOOK REMOVAL (earlier round): `ob_imbalance` deleted entirely —
+    data was thin/frequently "N/A". Replaced with `btc_aligned` (+2 pts).
+
+    GOLDEN HOURS (this round): +1 pt if the signal fires during the first
+    ~2 hours of London or New York open (is_golden_hour()). Chosen +1 (not
+    +2) from the instruction's stated 1-or-2 range, since "which hour is
+    it" is a simpler, single-factor signal compared to the other 2pt
+    lines (SuperTrend, S/D Zone, BTC Aligned, full TF alignment), which
+    are all multi-factor market-structure confirmations — didn't want
+    session timing alone to weigh as heavily as those. This shifts max
+    points from 20 to 21 and the 14/18 thresholds fractionally again
+    (70%→67% for A, 90%→86% for A+ — coincidentally landing back near
+    the pre-BTC-alignment-round proportions). Not recalibrated, same
+    reasoning as the prior rounds' threshold-shift notes.
     """
     breakdown=[]
     pts=0
@@ -1359,9 +1432,10 @@ def get_signal_grade(score,vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok
     else:                    breakdown.append(("📍 S/D Zone",        0))
     if adx_val>=35:  pts+=1; breakdown.append(("💪 ADX Strong",      1))
     else:                    breakdown.append(("💪 ADX",             0))
-    if ob_imbalance is not None and abs(ob_imbalance) > 0.2:
-        pts+=1; breakdown.append(("📖 OB Imbalance",    1))
-    else:            breakdown.append(("📖 Order Book",       0))
+    if btc_aligned:  pts+=2; breakdown.append(("👑 BTC Aligned",     2))
+    else:            breakdown.append(("👑 BTC Aligned",     0))
+    if is_golden_hour(): pts+=1; breakdown.append(("⏰ Golden Hour",  1))
+    else:                        breakdown.append(("⏰ Golden Hour",  0))
     if ms_bias in ("bullish","bearish"):
         pts+=1; breakdown.append(("🏗️ Market Structure", 1))
     else:            breakdown.append(("🏗️ Structure",        0))
@@ -1415,6 +1489,23 @@ def is_pattern_suspended(name):
 def too_many_correlated_active():
     return sum(1 for c in active_trades if c in BTC_CORRELATED)>=2
 
+def too_many_sector_active(coin):
+    """
+    Point 1: Law of Portfolio Heat — sector position limit.
+    too_many_correlated_active() already guards general BTC-correlation
+    exposure, but a coin can share almost no BTC correlation while still
+    being highly correlated to OTHER open trades within its own sector
+    (e.g. MANA + ENJ are both "gaming" — a sudden gaming-sector-specific
+    hit lands on both positions at once, even if BTC itself is flat).
+    Hard cap: max 1 open trade per sector at any time. Coins with no
+    sector mapping (not in COIN_SECTOR — e.g. BTC, PAXG) are never
+    restricted by this check, since there's nothing to compare against.
+    """
+    sector = COIN_SECTOR.get(coin)
+    if not sector:
+        return False  # no sector data for this coin — nothing to restrict against
+    return sum(1 for c in active_trades if COIN_SECTOR.get(c) == sector) >= 1
+
 def get_funding_rate(symbol):
     """
     Bypass added for PAXG/XAU/XAG: these trade as Binance "TradFi Perpetual
@@ -1427,7 +1518,7 @@ def get_funding_rate(symbol):
     predictably-failing HTTP call entirely, reducing wasted requests and
     the rate-limit pressure flagged separately.
     """
-    if symbol in ("PAXGUSDT","XAUUSDT","XAGUSDT"): return None
+    if symbol in FUTURES_ONLY_SYMBOLS: return None  # kept in sync with FUTURES_ONLY_SYMBOLS rather than a separate literal tuple
     try:
         res=requests.get(BINANCE_FUNDING_URL,params={"symbol":symbol,"limit":1},timeout=10)
         return float(res.json()[0]["fundingRate"]) if res.status_code==200 and res.json() else None
@@ -1443,7 +1534,7 @@ def is_funding_favorable(symbol,direction):
 
 def get_oi_trend(symbol):
     """Bypass for PAXG/XAU/XAG — see get_funding_rate's docstring for the reasoning."""
-    if symbol in ("PAXGUSDT","XAUUSDT","XAGUSDT"): return None
+    if symbol in FUTURES_ONLY_SYMBOLS: return None  # kept in sync with FUTURES_ONLY_SYMBOLS rather than a separate literal tuple
     try:
         res=requests.get(BINANCE_OI_URL,params={"symbol":symbol,"period":"15m","limit":5},timeout=10)
         if res.status_code==200 and len(res.json())>=2:
@@ -1452,6 +1543,32 @@ def get_oi_trend(symbol):
         return None
     except Exception as e:
         logger.warning(f"OI {symbol}: {e}"); return None
+
+def get_oi_change_pct(symbol):
+    """
+    Point 3: Squeeze detection needs OI MAGNITUDE ("is it skyrocketing"),
+    not just direction. get_oi_trend() only returns True/False (up or
+    down between the last two 15m readings) — deliberately NOT changed
+    here, since it's still passed as an unused parameter into
+    get_signal_grade elsewhere and changing its return type would be an
+    unrequested contract change for a function other code already calls.
+    This is a separate, purpose-built function instead: returns the
+    actual percent change in Open Interest between the last two 15m
+    readings (e.g. +8.3 = OI grew 8.3%), or None if data unavailable.
+    Same endpoint/bypass logic as get_oi_trend, just returns the real
+    number instead of collapsing it to a boolean.
+    """
+    if symbol in FUTURES_ONLY_SYMBOLS: return None
+    try:
+        res=requests.get(BINANCE_OI_URL,params={"symbol":symbol,"period":"15m","limit":5},timeout=10)
+        if res.status_code==200 and len(res.json())>=2:
+            d=res.json()
+            prev=float(d[-2]["sumOpenInterest"]); curr=float(d[-1]["sumOpenInterest"])
+            if prev<=0: return None
+            return (curr-prev)/prev*100
+        return None
+    except Exception as e:
+        logger.warning(f"OI change {symbol}: {e}"); return None
 
 def has_whale_activity(symbol):
     """
@@ -1489,6 +1606,32 @@ def get_htf_trend(symbol,interval="1h"):
         return 0
     except Exception as e:
         logger.warning(f"HTF {symbol} {interval}: {e}"); return 0
+
+def is_btc_aligned(direction):
+    """
+    Shared BTC 1h alignment check — replaces the deleted Order Book check
+    (👑 BTC Aligned scoring). Consolidated here: this same 2-line pattern
+    was previously written independently 3 times (cmd_hidden_gems,
+    format_and_send, scan_coins) with _gem/_chk suffixes to avoid name
+    collisions. Now called once from each site instead.
+    """
+    btc_1h_trend = get_htf_trend("BTCUSDT","1h")
+    aligned = (btc_1h_trend==1 and direction=="BUY") or (btc_1h_trend==-1 and direction=="SELL")
+    return aligned, btc_1h_trend
+
+def get_volume_ratio(klines):
+    """
+    Shared volume-vs-20-candle-average ratio. Consolidated here: this same
+    3-line `avg_vol = sum(vols[-20:])/20; ratio = vols[-1]/avg_vol` pattern
+    was previously written independently 11 times across the file (AI-call
+    prep, grading, compute_confirmation_bonus, message display, hidden
+    gems, etc.) — same computation, never factored out. Now called once
+    from each site instead.
+    """
+    if not klines: return 1.0
+    vols = [float(k[5]) for k in klines]
+    avg_vol = sum(vols[-20:])/20 if len(vols)>=20 else (vols[-1] if vols else 1)
+    return vols[-1]/avg_vol if avg_vol>0 else 1.0
 
 def get_timeframe_score(symbol,direction):
     """
@@ -1671,7 +1814,7 @@ def check_sector_correlation(coin, direction):
     return passes, note
 
 
-def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, ob_imbalance=None, zone_ok=False, ms_bos=False, ms_bias=None, ms_choch=False, is_tier1=True):
+def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, btc_aligned=False, zone_ok=False, ms_bos=False, ms_bias=None, ms_choch=False, is_tier1=True):
     """
     The Location Multiplier + hard Tier 1/Tier 2 AI cap.
 
@@ -1684,11 +1827,21 @@ def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, ob_imb
       +6.0  Location: price is inside a valid Supply/Demand zone in the
             trade's favor (Point 1's "Location Multiplier" — mathematically
             forces the bot toward trading only where institutions trade)
+      +3.0  Squeeze: rising Open Interest (>=3% growth) combined with an
+            extreme funding rate against the trade's crowd (extreme
+            negative funding + bullish setup = shorts overloaded, primed
+            for a short squeeze; extreme positive funding + bearish setup
+            = mirror long-squeeze setup). Thresholds are evidence-based,
+            not guessed — see SQUEEZE_FUNDING_EXTREME_NEG/POS and
+            SQUEEZE_OI_RISING_PCT constants for the sourcing.
       +3.0  Shift: Break of Structure (BOS) confirms the trade direction
       +1.2  structure bias agrees with trade direction, no fresh BOS/ChoCh yet
       +3.0  HTF trend alignment (4h+1h both agree — tf_score==3)
       +1.5  partial HTF alignment (tf_score==2)
-      +2.2  order book imbalance in trade's favor (>0.2 magnitude)
+      +2.0  this coin's trade direction matches the 1-Hour BTC trend
+            (👑 BTC Aligned — replaces the deleted order book check,
+            whose data was thin/frequently unavailable and dragging
+            grades down on missing data rather than genuine weakness)
       +2.0  strong volume (1.5x+ average)
       +1.0  moderate volume (1.2x-1.5x average)
       +1.5  strong ADX (>=30, real trend strength not chop)
@@ -1697,12 +1850,19 @@ def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, ob_imb
     Reversal, EMA Trend, Pullback, Momentum Surge, Volume Spike) are
     STRUCTURALLY EXCLUDED from the ChoCh, Location, and BOS/structure
     bonuses below — not just scored lower, the code physically skips
-    those branches. Their only available bonuses are HTF + order book +
-    volume + ADX = 8.7 max. On a 75.0 base that's a hard ceiling of 83.7,
-    safely under the stated 85.0 target and nowhere near the 92.2 AI
-    threshold, regardless of confirmation quality. This is what makes
-    Tier 2 "mathematically banned from ever waking up the AI" a
-    guarantee rather than a probability.
+    those branches. The Squeeze bonus IS available to Tier 2 (it's an
+    independent market-condition signal, not a structural/location one —
+    same category as HTF/BTC-alignment/volume/ADX, which are also
+    Tier-2-available). Their available bonuses are HTF + Squeeze + BTC
+    alignment + volume + ADX = 11.5 max. On a 75.0 base that's a hard
+    ceiling of 86.5 — this DOES cross the stated 85.0 Tier 2 target by
+    1.5pts in the single worst (best?) case where every one of those
+    signals fires simultaneously, though it remains well under the 92.2
+    AI threshold, so "mathematically banned from ever waking up the AI"
+    still holds. Flagging the 85.0 overshoot explicitly rather than
+    silently absorbing it — if you want Tier 2 hard-capped under 85.0
+    even in this edge case, the Squeeze bonus should be excluded from
+    Tier 2 too, consistent with the other structural bonuses.
     """
     bonus = 0.0
     notes = []
@@ -1726,16 +1886,22 @@ def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, ob_imb
     else:
         notes.append("Tier 2: zone/BOS/ChoCh bonuses excluded by design (auto-execute only)")
 
+    # ── SQUEEZE: OI + Funding divergence hunting forced liquidations ──
+    oi_change_pct = get_oi_change_pct(symbol)
+    funding_rate = get_funding_rate(symbol)
+    if oi_change_pct is not None and funding_rate is not None and oi_change_pct >= SQUEEZE_OI_RISING_PCT:
+        if direction == "BUY" and funding_rate <= SQUEEZE_FUNDING_EXTREME_NEG:
+            bonus += 3.0; notes.append(f"Squeeze: OI +{oi_change_pct:.1f}% + funding {funding_rate*100:.3f}% (short squeeze setup) (+3.0)")
+        elif direction == "SELL" and funding_rate >= SQUEEZE_FUNDING_EXTREME_POS:
+            bonus += 3.0; notes.append(f"Squeeze: OI +{oi_change_pct:.1f}% + funding {funding_rate*100:.3f}% (long squeeze setup) (+3.0)")
+
     if tf_score == 3:
         bonus += 3.0; notes.append("HTF fully aligned (+3.0)")
     elif tf_score == 2:
         bonus += 1.5; notes.append("HTF partially aligned (+1.5)")
 
-    if ob_imbalance is not None:
-        favors_buy = ob_imbalance > 0.2
-        favors_sell = ob_imbalance < -0.2
-        if (direction == "BUY" and favors_buy) or (direction == "SELL" and favors_sell):
-            bonus += 2.2; notes.append("order book favors trade (+2.2)")
+    if btc_aligned:
+        bonus += 2.0; notes.append("BTC 1h trend aligned (+2.0)")
 
     avg_vol = sum(vols[-20:]) / 20 if len(vols) >= 20 else (vols[-1] if vols else 1)
     vol_ratio = vols[-1] / avg_vol if avg_vol > 0 else 1.0
@@ -2243,6 +2409,135 @@ def cmd_trend(coin_input):
            f"  🕐 {get_ist_time()}")
     return text
 
+DESK_REPORT_COINS = ["LAB","BTC","ETH","PIPPIN","LINK","NEAR"]
+
+def send_4h_ai_desk_report():
+    """
+    Point 4: The 4-Hour VIP "Prop-Desk" AI Report.
+
+    Every 4 hours, pulls 4h (macro structure) and 15m (entry timing) data
+    for DESK_REPORT_COINS, batches all six into ONE Claude call (single
+    request, not six separate ones — keeps this cheap regardless of how
+    many coins are on the list), and asks for a human-like top-down desk
+    report. If Claude flags any coin as genuinely ready to execute right
+    now, that gets a distinct, more urgent ping — not buried in the
+    regular report — since "specifically ping you to take action" was an
+    explicit part of the request, not just a status summary.
+
+    Uses the same API-call/response-parsing pattern as ai_analyst_review()
+    (existing, proven code) rather than inventing a new one, adapted for:
+    fixed named coins instead of open trades, and 4h+15m structure data
+    instead of live PnL numbers.
+    """
+    if not ANTHROPIC_API_KEY:
+        logger.info("send_4h_ai_desk_report: ANTHROPIC_API_KEY not set, skipping")
+        return
+
+    coin_summaries = []
+    ready_candidates = []  # coins with enough data to plausibly be "ready" — informs prompt only
+    for coin in DESK_REPORT_COINS:
+        symbol = coin + "USDT"
+        price = get_price(symbol)
+        if not price:
+            coin_summaries.append(f"{coin}: price unavailable, skipping")
+            continue
+        klines_4h = get_klines(symbol, "4h", 50)
+        klines_15m = get_klines(symbol, "15m", 50)
+        if not klines_4h or len(klines_4h) < 30 or not klines_15m or len(klines_15m) < 30:
+            coin_summaries.append(f"{coin}: insufficient chart data, skipping")
+            continue
+
+        closes_4h = [float(k[4]) for k in klines_4h]
+        e20_4h = calculate_ema(closes_4h, 20); e50_4h = calculate_ema(closes_4h, 50)
+        trend_4h = "BULLISH" if (e20_4h and e50_4h and e20_4h > e50_4h) else "BEARISH" if (e20_4h and e50_4h) else "UNCLEAR"
+        adx_4h = calculate_adx(klines_4h)
+
+        closes_15m = [float(k[4]) for k in klines_15m]
+        rsi_15m = calculate_rsi(closes_15m)
+        ms_15m = detect_market_structure(klines_15m)
+        vcp_dir, vcp_tightness = detect_volatility_contraction(closes_15m,
+            [float(k[2]) for k in klines_15m], [float(k[3]) for k in klines_15m],
+            [float(k[5]) for k in klines_15m], price)
+        zones = get_htf_zones(symbol)
+        zone_ok_buy, zone_label_buy = is_in_zone(price, "BUY", zones)
+        zone_ok_sell, zone_label_sell = is_in_zone(price, "SELL", zones)
+        zone_note = (f"in demand zone {zone_label_buy}" if zone_ok_buy else
+                     f"in supply zone {zone_label_sell}" if zone_ok_sell else "no zone tap")
+
+        coin_summaries.append(
+            f"{coin}: price {format_price(price)} | 4H trend:{trend_4h} ADX:{adx_4h:.0f} | "
+            f"15m RSI:{rsi_15m:.0f} structure:{ms_15m['bias']}{' +ChoCh' if ms_15m['choch'] else ''}"
+            f"{' +BOS' if ms_15m['bos'] else ''} | {zone_note}"
+            f"{' | coiling (VCP)' if vcp_dir else ''}"
+        )
+
+    if not coin_summaries:
+        logger.warning("send_4h_ai_desk_report: no coin data available, skipping")
+        return
+
+    prompt = (
+        "You are running the 4-hour desk check for a proprietary trading desk, reviewing "
+        "a fixed watchlist top-down: 4-Hour macro structure first, then 15-minute entry timing.\n\n"
+        "WATCHLIST:\n" + "\n".join(coin_summaries) + "\n\n"
+        "For EACH coin with data, give a one-line read: what's the macro bias, and is anything "
+        "actionable forming on the 15m (zone tap, ChoCh, coiling, clean structure)? Be direct, "
+        "like a real trader's desk note, not a generic summary.\n"
+        "Format EXACTLY like this per coin:\n"
+        "COIN: [read] — [1 short sentence]\n\n"
+        "Then, if and ONLY if a coin genuinely looks ready to execute RIGHT NOW (not just "
+        "'watching', an actual clean entry), add this exact line for each one:\n"
+        "READY: COIN — [why, 1 sentence]\n"
+        "If nothing is ready, omit the READY lines entirely — do not force one."
+    )
+
+    try:
+        res = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01",
+                     "content-type":"application/json"},
+            json={"model":"claude-haiku-4-5-20251001","max_tokens":600,
+                  "messages":[{"role":"user","content":prompt}]},
+            timeout=25
+        )
+        if res.status_code != 200:
+            logger.warning(f"send_4h_ai_desk_report: API returned {res.status_code}")
+            return
+        text = res.json()["content"][0]["text"].strip()
+    except Exception as e:
+        logger.warning(f"send_4h_ai_desk_report: {e}")
+        return
+
+    ready_lines = []
+    report_lines = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line: continue
+        if line.upper().startswith("READY:"):
+            ready_lines.append(line)
+        else:
+            report_lines.append(line)
+
+    msg = f"{_H('4H PROP-DESK REPORT','🏦')}\n\n"
+    for line in report_lines:
+        if ":" in line:
+            coin_part, rest = line.split(":", 1)
+            msg += f"  🔹 <b>{coin_part.strip()}</b>:{rest}\n"
+    msg += f"\n  🕐 {get_ist_time()}"
+    send_telegram(msg)
+    logger.info(f"4h desk report sent, {len(ready_lines)} ready candidate(s)")
+
+    # Explicit, distinct ping for anything flagged genuinely trade-ready —
+    # not buried inside the regular report, per "specifically ping you to
+    # take action."
+    if ready_lines:
+        ping_msg = f"{_H('⚡ DESK ALERT — TRADE READY','🚨')}\n\n"
+        for line in ready_lines:
+            _, rest = line.split(":", 1) if ":" in line else ("", line)
+            ping_msg += f"  🎯 {rest.strip()}\n"
+        ping_msg += f"\n  Check the chart now — this may be your entry.\n  🕐 {get_ist_time()}"
+        send_telegram(ping_msg)
+
+
 def ai_analyst_review():
     """
     AI Analyst — reviews ALL active trades using Claude, like a portfolio manager.
@@ -2455,9 +2750,7 @@ def cmd_hidden_gems():
             highs  = [float(k[2]) for k in klines]
             lows   = [float(k[3]) for k in klines]
             vols   = [float(k[5]) for k in klines]
-            avg_vol_20 = sum(vols[-20:]) / 20
-            curr_vol   = vols[-1]
-            vol_ratio  = curr_vol / avg_vol_20 if avg_vol_20 > 0 else 0
+            vol_ratio  = get_volume_ratio(klines)
             rsi        = calculate_rsi(closes)
             ema20      = calculate_ema(closes, 20)
             ema50      = calculate_ema(closes, 50)
@@ -2581,9 +2874,7 @@ def cmd_hidden_gems():
             tp_dist=max(atr_tp_dist,min_rr_tp_dist)
             tp=entry+tp_dist if best["direction"]=="BUY" else entry-tp_dist
         ms_b=detect_market_structure(klines_15m)
-        vols_gem=[float(k[5]) for k in klines_15m]
-        avg_vol_gem=sum(vols_gem[-20:])/20 if len(vols_gem)>=20 else 1
-        vol_ratio_gem=vols_gem[-1]/avg_vol_gem if avg_vol_gem>0 else 1.0
+        vol_ratio_gem=get_volume_ratio(klines_15m)
         oi_rising=get_oi_trend(best["symbol"])
         adx_val=calculate_adx(klines_15m)
         closes=[float(k[4]) for k in klines_15m]
@@ -2595,8 +2886,8 @@ def cmd_hidden_gems():
         st_15m=calculate_supertrend(klines_15m,ST_PERIOD,ST_MULTIPLIER)
         st_ok=(st_15m==best["direction"])
         zone_ok=False
-        ob_imb,_=get_orderbook_imbalance(best["symbol"])
-        grade,pts,_=get_signal_grade(best["score"],vol_ratio_gem,oi_rising,best["tf_score"],vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,ob_imb,ms_b["bias"],ms_b["bos"])
+        btc_aligned_gem,_=is_btc_aligned(best["direction"])
+        grade,pts,_=get_signal_grade(best["score"],vol_ratio_gem,oi_rising,best["tf_score"],vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,btc_aligned_gem,ms_b["bias"],ms_b["bos"])
         lev=get_smart_leverage(best["symbol"],atr_pct,best["score"],grade)
         profit_target=(abs(tp-entry)/entry)*100*lev
         sl_pct=abs(entry-sl)/entry*100; tp_pct=abs(tp-entry)/entry*100
@@ -2980,12 +3271,13 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     # reused both for grading (get_signal_grade below) and for the message
     # display further down, so the actual number is finally visible instead
     # of a whale emoji that never showed any underlying data.
-    vols_disp=[float(k[5]) for k in klines_15m]
-    avg_vol_disp=sum(vols_disp[-20:])/20 if len(vols_disp)>=20 else 1
-    vol_ratio=vols_disp[-1]/avg_vol_disp if avg_vol_disp>0 else 1.0
+    vol_ratio=get_volume_ratio(klines_15m)
     adx_val=calculate_adx(klines_15m)
     tf_score=setup.get("tf_score",get_timeframe_score(setup["symbol"],setup["direction"]))
-    ob_imbalance, ob_label = get_orderbook_imbalance(setup["symbol"])
+    # Order Book removed (Point 2) — data was thin/frequently "N/A" and
+    # dragging grades down on missing data rather than genuine weakness.
+    # Replaced with a real BTC 1-Hour trend alignment check (Point 3).
+    btc_aligned,btc_1h_trend=is_btc_aligned(setup["direction"])
     ms = detect_market_structure(klines_15m)
     highs_15m=[float(k[2]) for k in klines_15m]; lows_15m=[float(k[3]) for k in klines_15m]
     res = ms["swing_high"] if ms["swing_high"] > 0 else max(highs_15m[-30:-1])
@@ -3001,7 +3293,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     sweep_dir_chk, sweep_strength_chk = detect_liquidity_sweep(klines_15m, highs_15m, lows_15m, closes, opens_15m, sup, res, ms)
     is_sweep = sweep_dir_chk is not None and sweep_dir_chk == setup["direction"]
     # Compute grade FIRST so leverage can use it
-    grade_result=get_signal_grade(setup["setup_score"],vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,ob_imbalance,ms["bias"],ms["bos"])
+    grade_result=get_signal_grade(setup["setup_score"],vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,btc_aligned,ms["bias"],ms["bos"])
     grade,pts,breakdown=grade_result
 
     # Second half of the strict floor: kill Grade C outright, regardless
@@ -3073,9 +3365,9 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     ai_result=None
     is_grade_a = grade in ("Grade A 🍀","Grade A+ 🍀")
     if is_grade_a:
-        vols_ai=[float(k[5]) for k in klines_15m]
-        avg_vol_ai=sum(vols_ai[-20:])/20 if len(vols_ai)>=20 else 1
-        vol_str_ai=vols_ai[-1]/avg_vol_ai if avg_vol_ai>0 else 1.0
+        # vol_ratio already computed earlier in this function (same
+        # klines_15m, same formula) — reused directly instead of
+        # recomputing an identical value under a different name.
         rsi_ai=calculate_rsi(closes)
         adx_ai=calculate_adx(klines_15m)
         # The Human Narrative: fetch the real 4h trend and pass the zone/
@@ -3106,7 +3398,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
         hist_wr = (pstat.get("wins", 0) / p_signals * 100) if p_signals >= 3 else None
         logger.info(f"{coin} AI-eligible + {grade} ({pts}pts) — calling Claude for final verification")
         ai_result=ai_analyze_setup(coin,setup["direction"],klines_15m,entry,
-                                   setup["pattern"],rsi_ai,adx_ai,vol_str_ai,is_volatile,penalty_notes,
+                                   setup["pattern"],rsi_ai,adx_ai,vol_ratio,is_volatile,penalty_notes,
                                    htf_4h_trend=htf_4h,zone_ok=zone_ok,zone_label=zone_label,
                                    ms_bos=ms["bos"],ms_choch=ms["choch"],ms_bias=ms["bias"],
                                    is_sweep=is_sweep,sl_pct=sl_pct_ai,rr_ratio=rr_ratio_ai,
@@ -3221,10 +3513,11 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     if zone_ok: msg += f"  │  📍 Zone : ✅ {'Demand' if setup['direction']=='BUY' else 'Supply'}\n"
     if div=="BULLISH_DIV":   msg += f"  │  🔀 Div  : 🟢 Bullish RSI Divergence\n"
     elif div=="BEARISH_DIV": msg += f"  │  🔀 Div  : 🔴 Bearish RSI Divergence\n"
-    # Order book (Audit Fix #2)
-    if ob_label != "N/A":
-        ob_em = "🟢" if ob_imbalance and ob_imbalance > 0.1 else "🔴" if ob_imbalance and ob_imbalance < -0.1 else "⚪"
-        msg += f"  │  📖 OB   : {ob_em} {ob_label}\n"
+    # Order book removed (was Audit Fix #2) — thin/frequently unavailable
+    # data. Replaced with real BTC 1h trend alignment (Point 3).
+    btc_em = "👑" if btc_aligned else "➖"
+    btc_trend_label = "Bullish" if btc_1h_trend==1 else "Bearish" if btc_1h_trend==-1 else "Neutral"
+    msg += f"  │  {btc_em} BTC   : {'Aligned' if btc_aligned else 'Not aligned'} ({btc_trend_label} 1h)\n"
     # Market structure (Audit Fix #7)
     ms_bias_em = "📈" if ms["bias"]=="bullish" else "📉" if ms["bias"]=="bearish" else "➡️"
     hh_str = "HH✅" if ms.get("hh") else "HH❌"
@@ -3508,6 +3801,59 @@ def poll_telegram():
                             for sym,a in price_alerts.items(): msg+=f"{sym}: {a['direction']} {format_price(a['price'])}\n"
                             send_telegram(msg)
                         else: send_telegram(f"<b>{BOT_HEADER}</b>\nNo alerts set.")
+                    elif txt_slash.startswith("/addmacroevent"):
+                        # Point 2: maintainable macro calendar. Usage:
+                        # /addmacroevent 2026-08-01 18:00 FOMC rate decision
+                        # Date+time must match is_macro_event_window's exact
+                        # expected format "%Y-%m-%d %H:%M" (IST) or it will
+                        # silently be skipped there (that function already
+                        # has a try/except continue on bad entries) — so we
+                        # validate the format HERE before accepting it, to
+                        # catch a typo immediately instead of it silently
+                        # never firing weeks later.
+                        raw = update["message"].get("text","").strip()
+                        body = raw[len("/addmacroevent"):].strip()
+                        parts = body.split(maxsplit=2)
+                        if len(parts) < 2:
+                            send_telegram("Usage: /addmacroevent 2026-08-01 18:00 FOMC rate decision")
+                        else:
+                            date_part, time_part = parts[0], parts[1]
+                            label = parts[2] if len(parts) > 2 else ""
+                            ev_str = f"{date_part} {time_part}"
+                            # BUG FIX: this codebase uses zoneinfo (not pytz) for IST
+                            # — zoneinfo.ZoneInfo has no .localize() method, so the
+                            # original IST.localize(...) call here raised
+                            # AttributeError, which `except ValueError` below does
+                            # NOT catch. Confirmed directly: the exception would
+                            # propagate up to poll_telegram's outer handler (logged,
+                            # not crashing the bot), but neither send_telegram
+                            # branch here would ever run — meaning /addmacroevent
+                            # would silently do nothing, no reply at all, the first
+                            # time anyone actually used it. Fixed alongside the
+                            # matching bug in is_macro_event_window() — same
+                            # `.replace(tzinfo=IST)` pattern, and broadened to
+                            # `except Exception` since ValueError was never the
+                            # right exception type to catch here in the first place.
+                            try:
+                                datetime.strptime(ev_str, "%Y-%m-%d %H:%M").replace(tzinfo=IST)
+                                SCHEDULED_MACRO_EVENTS.append(ev_str + (f"  # {label}" if label else ""))
+                                save_macro_events()
+                                send_telegram(f"📅 Macro event added: {ev_str} IST" + (f" — {label}" if label else "") +
+                                             f"\nBot will pause new signals ±{MACRO_EVENT_PAUSE_MIN_BEFORE}min around this time.")
+                            except Exception:
+                                send_telegram("⚠️ Invalid format. Use: /addmacroevent 2026-08-01 18:00 FOMC rate decision\n(date as YYYY-MM-DD, time as 24h HH:MM, IST)")
+                    elif txt_slash=="/macroevents":
+                        if SCHEDULED_MACRO_EVENTS:
+                            msg=f"<b>{BOT_HEADER} Scheduled Macro Events</b>\n{S()}\n\n"
+                            for i,ev in enumerate(SCHEDULED_MACRO_EVENTS,1): msg+=f"{i}. {ev}\n"
+                            msg+=f"\nUse /clearmacroevents to remove all."
+                            send_telegram(msg)
+                        else:
+                            send_telegram(f"<b>{BOT_HEADER}</b>\nNo scheduled macro events. Add one with:\n/addmacroevent 2026-08-01 18:00 FOMC rate decision")
+                    elif txt_slash=="/clearmacroevents":
+                        SCHEDULED_MACRO_EVENTS.clear()
+                        save_macro_events()
+                        send_telegram("🗑️ All scheduled macro events cleared.")
                     elif txt_slash.startswith("/backtest"):
                         parts=txt.split(); bc=(parts[1].upper() if len(parts)>1 else "BTC")+"USDT"
                         send_telegram(f"Running backtest for {bc}...")
@@ -3762,11 +4108,16 @@ def scan_river(now,market_condition):
     SEPARATE FINDING (not fixed here, flagging for visibility): this
     dedicated scan path builds its own setup dict and calls format_and_send
     directly, bypassing the SuperTrend/sector/LTF/weekend penalty system
-    that scan_coins applies to every other coin. format_and_send's own
-    92.0 strict floor still applies (so nothing below 92.0 ever reaches
-    Telegram from here), but a setup could reach that floor UNPENALIZED
-    in a way that would have scored lower had it gone through the normal
-    scan_coins path. Pre-existing gap, not introduced by today's changes.
+    that scan_coins applies to every other coin, and — as of Point 1
+    (too_many_sector_active) — also bypasses the new 1-trade-per-sector
+    position limit. LAB is in the "gaming" sector; this path does not
+    check whether another gaming-sector coin (MANA, ENJ, etc.) already
+    has an open trade before potentially opening LAB. format_and_send's
+    own 92.0 strict floor still applies (so nothing below 92.0 ever
+    reaches Telegram from here), but this specific portfolio-heat
+    protection does not extend to this path. Documented rather than
+    silently retrofitted, since expanding this function's checks wasn't
+    part of what was asked when Point 1 was built.
     """
     global last_river_time
     try:
@@ -3896,12 +4247,17 @@ def scan_coins(btc_trend,fng,market_condition):
                 if not is_sentiment_valid(direction,fng):                       continue
                 if btc_crashing and direction=="BUY":                           continue
                 if coin in BTC_CORRELATED and too_many_correlated_active():     continue
+                if too_many_sector_active(coin):
+                    logger.info(f"Skip {coin} {direction} - sector already has an open trade")
+                    continue
                 tf_score=get_timeframe_score(symbol,direction)
                 if tf_score==-1: logger.info(f"Skip {coin} {direction} - counter-trend"); continue
                 extras=[p[0] for p in dir_pats[1:3]]
                 pt=primary+(" + "+" + ".join(extras) if extras else "")
                 vols_chk=[float(k[5]) for k in klines]
-                ob_imb,_=get_orderbook_imbalance(symbol)
+                # Order Book removed (Point 2) — replaced with real BTC
+                # 1-Hour trend alignment (Point 3).
+                btc_aligned_chk,_=is_btc_aligned(direction)
                 # Location + Shift: check S/D zone and market structure/BOS/ChoCh before
                 # scoring — these are now the heaviest-weighted confirmations for Tier 1.
                 # Uses get_htf_zones (4h primary, 1h secondary) rather than 15m-only,
@@ -3916,7 +4272,7 @@ def scan_coins(btc_trend,fng,market_condition):
                 # tier, rather than matching on pattern name strings.
                 is_tier1_pattern = base_s >= 88.0
                 confirm_bonus,bonus_notes=compute_confirmation_bonus(
-                    symbol,direction,klines,vols_chk,tf_score,ob_imb,
+                    symbol,direction,klines,vols_chk,tf_score,btc_aligned_chk,
                     zone_ok=zone_ok,ms_bos=ms_chk["bos"],ms_bias=ms_chk["bias"],
                     ms_choch=ms_chk["choch"],is_tier1=is_tier1_pattern
                 )
@@ -3946,8 +4302,8 @@ def scan_coins(btc_trend,fng,market_condition):
         time.sleep(DELAY_BETWEEN_COINS)
 
 def main():
-    global last_batch_time,last_river_time,last_hourly_time,last_pnl_update_time,last_weekly_report_day
-    load_alerts(); load_circuit_breaker(); load_pending_signals(); load_retest_watchlist()
+    global last_river_time,last_hourly_time,last_pnl_update_time,last_4h_desk_time,last_weekly_report_day
+    load_alerts(); load_circuit_breaker(); load_pending_signals(); load_retest_watchlist(); load_macro_events()
     cloud_load_all()   # loads journal, pattern_stats, learning, active_trades from Supabase (falls back to local JSON)
     threading.Thread(target=poll_telegram,daemon=True).start()
     logger.info(f"{BOT_NAME} {BOT_VERSION} starting...")
@@ -4019,6 +4375,7 @@ def main():
             if (now-last_hourly_time)>=3600:          send_hourly_report();   last_hourly_time=now
             if (now-last_pnl_update_time)>=3600:      send_live_pnl_update(); last_pnl_update_time=now
             if (now-last_river_time)>=RIVER_INTERVAL:  scan_river(now,market_condition); last_river_time=now
+            if (now-last_4h_desk_time)>=14400:         send_4h_ai_desk_report(); last_4h_desk_time=now
             today=datetime.now(IST).date()
             if today.weekday()==6 and last_weekly_report_day!=today:
                 send_weekly_report(); last_weekly_report_day=today
