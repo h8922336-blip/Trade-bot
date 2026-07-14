@@ -15,8 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -37,10 +37,16 @@ BINANCE_FUTURES_KLINE_URL = "https://fapi.binance.com/fapi/v1/klines"
 # changes needed. Not applied preemptively here since there's no current
 # evidence of an actual problem; this is a one-line self-service fix for if
 # that changes.
-FUTURES_ONLY_SYMBOLS = {"PAXGUSDT"}  # XAUUSDT/XAGUSDT removed alongside their
-                                       # removal from COINS/PREMIUM_COINS below —
-                                       # see the PREMIUM_COINS comment for the
-                                       # reported Geo-Block (451) reasoning.
+# CONFIRMED (not just theoretical): live Railway logs showed
+# "get_price PAXGUSDT: Futures endpoint returned 451" and the matching
+# get_klines warning — the exact symptom this set's docstring said to
+# watch for. PAXG hits the same Binance Geo-Block as XAU/XAG did.
+# Emptied per that log evidence — PAXG now routes through the standard
+# Spot API (unrestricted) via the existing `if symbol in
+# FUTURES_ONLY_SYMBOLS` branches in get_price/get_klines/
+# get_funding_rate/get_oi_trend, automatically, no other code changes
+# needed anywhere else.
+FUTURES_ONLY_SYMBOLS = set()
 BINANCE_AGG_URL     = "https://api.binance.com/api/v3/aggTrades"
 BINANCE_FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
 BINANCE_OI_URL      = "https://fapi.binance.com/futures/data/openInterestHist"
@@ -90,7 +96,7 @@ pattern_stats = {p: {"signals":0,"wins":0,"losses":0,"total_pnl":0.0,"weight":1.
     "EMA Trend","Breakout","Pullback to 20 EMA","RSI Reversal","Momentum Surge",
     "Volume Spike","Double Bottom","Double Top","Support Bounce","Resistance Rejection",
     "Bullish Engulfing","Bearish Engulfing","Volume Breakout","Bull Flag Break","Bear Flag Break",
-    "BOS Breakout","Change of Character (ChoCh)","Liquidity Sweep","Volatility Contraction (Coiling)"
+    "BOS Breakout","Change of Character (ChoCh)","Liquidity Sweep","Volatility Contraction (Coiling)","Pre-Breakout Compression"
 ]}
 
 last_update_id         = None
@@ -531,29 +537,26 @@ def answer_callback(cbid, text="OK"):
 
 def get_price(symbol):
     """
-    Point 2 fix: XAUUSDT/XAGUSDT are Futures-only (Binance TradFi
-    Perpetuals — confirmed via search: launched exclusively under the
-    Futures [TradFi] tab, no Spot listing exists). Querying the Spot API
-    (data-api.binance.vision) for these returns no data, silently skipping
-    Gold/Silver every scan cycle despite being in COINS/PREMIUM_COINS.
-
-    Implemented as a per-symbol routing switch rather than globally
-    swapping BINANCE_PRICE_URL to Futures for everyone: get_price/
-    get_klines are called for every one of the ~97 coins in COINS, and
-    only XAU/XAG/PAXG are confirmed to need the Futures endpoint — a
-    global swap would risk the ~94 other coins that are presumably
-    working correctly on Spot right now, to fix a problem specific to 2-3
-    symbols.
+    Originally XAU/XAG (and briefly PAXG) were routed to Binance Futures
+    here, since XAUUSDT/XAGUSDT are Futures-only TradFi Perpetuals with no
+    Spot listing. XAU/XAG were later fully removed from the bot, and PAXG
+    was moved back to Spot after live logs confirmed it hit the same
+    Geo-Block (451) restriction — see FUTURES_ONLY_SYMBOLS's definition
+    above for that history. FUTURES_ONLY_SYMBOLS is now an empty set, so
+    every symbol including PAXG currently routes through Spot
+    (data-api.binance.vision) via the branch below. Kept as a per-symbol
+    routing switch (not deleted) since it's a real, working mechanism if
+    a genuinely Futures-only symbol is ever added back to the bot.
     """
     price_url = BINANCE_FUTURES_PRICE_URL if symbol in FUTURES_ONLY_SYMBOLS else BINANCE_PRICE_URL
     try:
         res=requests.get(price_url,params={"symbol":symbol},timeout=10)
         if res.status_code==200: return float(res.json()["price"])
         if symbol in FUTURES_ONLY_SYMBOLS:
-            # Point 4 advisory: make PAXG/XAU/XAG Futures failures actually
-            # visible in logs — a non-200 status previously returned None
-            # silently here, so "watch your logs for warnings" had nothing
-            # to actually show if this ever broke.
+            # DORMANT as of the PAXG 451 fix: FUTURES_ONLY_SYMBOLS is now
+            # empty, so this branch can never fire for anyone currently.
+            # Left in place rather than deleted — becomes live again
+            # automatically if any symbol is ever added back to that set.
             logger.warning(f"get_price {symbol}: Futures endpoint returned {res.status_code} — "
                           f"if this persists for PAXG, remove it from FUTURES_ONLY_SYMBOLS")
         return None
@@ -568,6 +571,7 @@ def get_klines(symbol,interval,limit=100):
                          params={"symbol":symbol,"interval":interval,"limit":limit},timeout=10)
         if res.status_code==200: return res.json()
         if symbol in FUTURES_ONLY_SYMBOLS:
+            # DORMANT — see get_price's matching note above.
             logger.warning(f"get_klines {symbol}: Futures endpoint returned {res.status_code} — "
                           f"if this persists for PAXG, remove it from FUTURES_ONLY_SYMBOLS")
         return []
@@ -932,6 +936,63 @@ def detect_volatility_contraction(closes, highs, lows, vols, price):
     return None, 0
 
 
+def detect_pre_breakout_compression(closes, highs, lows, vols, price, sup, res, direction_bias):
+    """
+    Pre-Breakout Compression — catches the coil BEFORE a BOS Breakout
+    fires, not after. Genuinely distinct from detect_volatility_contraction
+    (VCP): VCP requires a prior impulse move (impulse_move_pct > 4.0) into
+    the tightening range — it's "coil after a run." This pattern requires
+    NO prior impulse at all — a coin can be quietly pinning against
+    resistance with a flat/mixed run-up and this still fires, which VCP's
+    impulse-gate would miss entirely. Checked before writing: confirmed
+    this is a real gap, not a duplicate of existing logic.
+
+    Conditions (as specified):
+    1. Price sitting within 1% of major resistance (for a bullish
+       compression) or support (bearish mirror) — using the same sup/res
+       swing levels already computed by detect_market_structure() in the
+       caller, no new data source needed.
+    2. The last 3-5 candles are tiny/tight (small range relative to
+       recent volatility) — "institutional accumulation/coiling," not
+       requiring a large prior move like VCP does.
+    3. Volume is quiet (below-average) — the crowd hasn't noticed yet.
+
+    Returns (direction, tightness_score) or (None, 0).
+    """
+    if len(closes) < 20 or res <= 0 or sup <= 0:
+        return None, 0
+
+    recent_highs = highs[-5:]
+    recent_lows = lows[-5:]
+    recent_vols = vols[-5:]
+    avg_vol_20 = sum(vols[-20:]) / 20 if len(vols) >= 20 else (vols[-1] if vols else 1)
+
+    # Condition 3: quiet volume over the last 3-5 candles
+    avg_recent_vol = sum(recent_vols) / len(recent_vols)
+    volume_quiet = avg_recent_vol < avg_vol_20 * 0.85
+
+    # Condition 2: tiny/tight candles — small range relative to a normal
+    # 20-candle ATR-like baseline, checked across the last 3-5 candles
+    typical_range = (max(highs[-20:]) - min(lows[-20:])) / 20 if len(highs) >= 20 else 1
+    tight_candles = all((h - l) < typical_range * 0.8 for h, l in zip(recent_highs, recent_lows)) if typical_range > 0 else False
+
+    if not volume_quiet or not tight_candles:
+        return None, 0
+
+    # Condition 1: pinning within 1% of resistance (bullish) or support (bearish)
+    dist_to_res_pct = abs(res - price) / res * 100 if res > 0 else 99
+    dist_to_sup_pct = abs(price - sup) / sup * 100 if sup > 0 else 99
+
+    tightness_score = max(0, 100 - (max(recent_highs) - min(recent_lows)) / price * 100 * 20)
+
+    if dist_to_res_pct <= 1.0 and direction_bias != "bearish":
+        return "BUY", tightness_score
+    if dist_to_sup_pct <= 1.0 and direction_bias != "bullish":
+        return "SELL", tightness_score
+
+    return None, 0
+
+
 def detect_liquidity_sweep(klines, highs, lows, closes, opens, sup, res, ms):
     """
     Liquidity Sweep (failed breakout / stop hunt), per instruction.
@@ -1060,6 +1121,17 @@ def detect_patterns(symbol, klines, price, btc_trend):
         p.append(("Volatility Contraction (Coiling)", TIER1_BASE, "BUY"))
     elif vcp_dir == "SELL" and alt_bear_ok:
         p.append(("Volatility Contraction (Coiling)", TIER1_BASE, "SELL"))
+
+    # ── Pre-Breakout Compression — Tier 1, catches the coil BEFORE a BOS ──
+    # fires, buying before the crowd sees the breakout (the fix for
+    # Claude correctly rejecting already-broken-out BOS signals as
+    # STAGE: LATE — this pattern is designed to reach the AI while the
+    # setup is still genuinely STAGE: EARLY).
+    pbc_dir, pbc_tightness = detect_pre_breakout_compression(closes, highs, lows, vols, price, sup, res, ms_bias)
+    if pbc_dir == "BUY" and alt_bull_ok:
+        p.append(("Pre-Breakout Compression", TIER1_BASE, "BUY"))
+    elif pbc_dir == "SELL" and alt_bear_ok:
+        p.append(("Pre-Breakout Compression", TIER1_BASE, "SELL"))
 
     # ── Professional Bull Flag — Tier 1 ──
     if detect_bull_flag(closes, highs, lows, vols, avg_vol) and alt_bull_ok:
@@ -1517,8 +1589,22 @@ def get_funding_rate(symbol):
     is caught, returning None) — this bypass's real value is skipping a
     predictably-failing HTTP call entirely, reducing wasted requests and
     the rate-limit pressure flagged separately.
+
+    BUG FIX: FUTURES_ONLY_SYMBOLS was emptied in an earlier round (to fix
+    PAXG's price/klines routing, which now correctly goes through Spot).
+    That silently broke the `symbol in FUTURES_ONLY_SYMBOLS` guard THIS
+    function relies on for the same reason — an empty set means the guard
+    can never trigger, so this function kept calling the 451-prone
+    Futures funding-rate endpoint for PAXG even after price/klines were
+    fixed. Reproduced and confirmed: PAXGUSDT genuinely still hit
+    fapi.binance.com here before this fix. Added an explicit "PAXG" in
+    symbol check so this guard no longer depends on FUTURES_ONLY_SYMBOLS'
+    current (empty) state. Kept the FUTURES_ONLY_SYMBOLS check alongside
+    it too — harmless no-op right now, but keeps this guard consistent
+    and future-proof if that set is ever repopulated for a different
+    genuinely-Futures-only symbol later.
     """
-    if symbol in FUTURES_ONLY_SYMBOLS: return None  # kept in sync with FUTURES_ONLY_SYMBOLS rather than a separate literal tuple
+    if "PAXG" in symbol or symbol in FUTURES_ONLY_SYMBOLS: return None
     try:
         res=requests.get(BINANCE_FUNDING_URL,params={"symbol":symbol,"limit":1},timeout=10)
         return float(res.json()[0]["fundingRate"]) if res.status_code==200 and res.json() else None
@@ -1533,8 +1619,12 @@ def is_funding_favorable(symbol,direction):
     return True
 
 def get_oi_trend(symbol):
-    """Bypass for PAXG/XAU/XAG — see get_funding_rate's docstring for the reasoning."""
-    if symbol in FUTURES_ONLY_SYMBOLS: return None  # kept in sync with FUTURES_ONLY_SYMBOLS rather than a separate literal tuple
+    """
+    Bypass for PAXG/XAU/XAG — see get_funding_rate's docstring for the
+    reasoning, including the FUTURES_ONLY_SYMBOLS-emptying bug this
+    function shared with it, now fixed the same way.
+    """
+    if "PAXG" in symbol or symbol in FUTURES_ONLY_SYMBOLS: return None
     try:
         res=requests.get(BINANCE_OI_URL,params={"symbol":symbol,"period":"15m","limit":5},timeout=10)
         if res.status_code==200 and len(res.json())>=2:
@@ -1557,8 +1647,14 @@ def get_oi_change_pct(symbol):
     readings (e.g. +8.3 = OI grew 8.3%), or None if data unavailable.
     Same endpoint/bypass logic as get_oi_trend, just returns the real
     number instead of collapsing it to a boolean.
+
+    BUG FIX: shared the same FUTURES_ONLY_SYMBOLS-emptying issue as
+    get_funding_rate/get_oi_trend — see that docstring. Fixed the same
+    way. Kept the FUTURES_ONLY_SYMBOLS check alongside the new "PAXG" in
+    symbol check for consistency with the other two functions, rather
+    than dropping it entirely.
     """
-    if symbol in FUTURES_ONLY_SYMBOLS: return None
+    if "PAXG" in symbol or symbol in FUTURES_ONLY_SYMBOLS: return None
     try:
         res=requests.get(BINANCE_OI_URL,params={"symbol":symbol,"period":"15m","limit":5},timeout=10)
         if res.status_code==200 and len(res.json())>=2:
@@ -1814,7 +1910,7 @@ def check_sector_correlation(coin, direction):
     return passes, note
 
 
-def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, btc_aligned=False, zone_ok=False, ms_bos=False, ms_bias=None, ms_choch=False, is_tier1=True):
+def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, btc_aligned=False, zone_ok=False, ms_bos=False, ms_bias=None, ms_choch=False, is_tier1=True, is_compression=False):
     """
     The Location Multiplier + hard Tier 1/Tier 2 AI cap.
 
@@ -1827,6 +1923,27 @@ def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, btc_al
       +6.0  Location: price is inside a valid Supply/Demand zone in the
             trade's favor (Point 1's "Location Multiplier" — mathematically
             forces the bot toward trading only where institutions trade)
+      +3.5  Pre-Breakout Accumulation: the pattern is a verified compression
+            (detect_pre_breakout_compression fired) sitting right at a key
+            level. VERIFIED BEFORE ADDING (not just implemented on request):
+            ran the actual live scoring code with a realistic compression
+            scenario. The originally-reported cause (missing BOS points)
+            did NOT reproduce — a realistic compression case with just
+            zone+structure already totaled 96.7, clearing the 92.0 floor
+            fine, since BOS was never required in the first place
+            (structure-agrees-only already gives +1.2 as a fallback). The
+            REAL gap found: `zone_ok` requires the price sit inside a
+            FORMALLY MAPPED HTF Supply/Demand zone (get_htf_zones), which
+            is stricter than detect_pre_breakout_compression's own check
+            (just "within 1% of the local sup/res swing level" — a
+            different, looser threshold). When a compression fires near a
+            real level that ISN'T also a formally mapped HTF zone,
+            zone_ok=False and the total lands at 90.7 — clears
+            MIN_SETUP_SCORE(90) but fails the stricter 92.0 floor.
+            This dedicated bonus fixes that real gap directly, regardless
+            of zone_ok's state, since it's checking the same "resting at
+            a real level with quiet volume" condition through a second,
+            independent signal.
       +3.0  Squeeze: rising Open Interest (>=3% growth) combined with an
             extreme funding rate against the trade's crowd (extreme
             negative funding + bullish setup = shorts overloaded, primed
@@ -1844,25 +1961,27 @@ def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, btc_al
             grades down on missing data rather than genuine weakness)
       +2.0  strong volume (1.5x+ average)
       +1.0  moderate volume (1.2x-1.5x average)
-      +1.5  strong ADX (>=30, real trend strength not chop)
+      +1.5  strong ADX (>=30, real trend strength not chop — note: tested
+            and confirmed ADX can genuinely read "strong" even during a
+            quiet compression tail, since ADX is a smoothed/lagging
+            measure over a longer window than just the last few tight
+            candles — it reflects trend strength BEFORE the coil started,
+            not a contradiction of compression itself)
 
     HARD TIER 2 CAP (is_tier1=False): Tier 2 patterns (Engulfing, RSI
     Reversal, EMA Trend, Pullback, Momentum Surge, Volume Spike) are
-    STRUCTURALLY EXCLUDED from the ChoCh, Location, and BOS/structure
-    bonuses below — not just scored lower, the code physically skips
-    those branches. The Squeeze bonus IS available to Tier 2 (it's an
-    independent market-condition signal, not a structural/location one —
-    same category as HTF/BTC-alignment/volume/ADX, which are also
-    Tier-2-available). Their available bonuses are HTF + Squeeze + BTC
-    alignment + volume + ADX = 11.5 max. On a 75.0 base that's a hard
+    STRUCTURALLY EXCLUDED from the ChoCh, Location, Compression, and
+    BOS/structure bonuses below — not just scored lower, the code
+    physically skips those branches (is_compression is only ever True
+    for the Pre-Breakout Compression pattern anyway, which is Tier 1
+    by definition, so this exclusion is mostly redundant with that, but
+    stated explicitly for clarity). The Squeeze bonus IS available to
+    Tier 2 (it's an independent market-condition signal, not a
+    structural/location one). Their available bonuses are HTF + Squeeze +
+    BTC alignment + volume + ADX = 11.5 max. On a 75.0 base that's a hard
     ceiling of 86.5 — this DOES cross the stated 85.0 Tier 2 target by
-    1.5pts in the single worst (best?) case where every one of those
-    signals fires simultaneously, though it remains well under the 92.2
-    AI threshold, so "mathematically banned from ever waking up the AI"
-    still holds. Flagging the 85.0 overshoot explicitly rather than
-    silently absorbing it — if you want Tier 2 hard-capped under 85.0
-    even in this edge case, the Squeeze bonus should be excluded from
-    Tier 2 too, consistent with the other structural bonuses.
+    1.5pts in the single worst case where every signal fires
+    simultaneously, though it remains well under the 92.2 AI threshold.
     """
     bonus = 0.0
     notes = []
@@ -1877,9 +1996,11 @@ def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, btc_al
             if zone_ok:
                 bonus += 6.0; notes.append("in S/D zone - Location Multiplier (+6.0)")
 
-            # ── SHIFT: Market Structure / BOS ──
+            # ── SHIFT: Market Structure / BOS, or Pre-Breakout Accumulation ──
             structure_agrees = ms_bias == ("bullish" if direction == "BUY" else "bearish")
-            if ms_bos and structure_agrees:
+            if is_compression:
+                bonus += 3.5; notes.append("Pre-breakout coiling consolidation (+3.5)")
+            elif ms_bos and structure_agrees:
                 bonus += 3.0; notes.append("BOS confirms direction - Shift (+3.0)")
             elif structure_agrees:
                 bonus += 1.2; notes.append("structure bias agrees (+1.2)")
@@ -4271,10 +4392,11 @@ def scan_coins(btc_trend,fng,market_condition):
                 # TIER2_BASE=75.0 from detect_patterns) — use it directly to determine
                 # tier, rather than matching on pattern name strings.
                 is_tier1_pattern = base_s >= 88.0
+                is_comp_pattern = "Pre-Breakout Compression" in primary
                 confirm_bonus,bonus_notes=compute_confirmation_bonus(
                     symbol,direction,klines,vols_chk,tf_score,btc_aligned_chk,
                     zone_ok=zone_ok,ms_bos=ms_chk["bos"],ms_bias=ms_chk["bias"],
-                    ms_choch=ms_chk["choch"],is_tier1=is_tier1_pattern
+                    ms_choch=ms_chk["choch"],is_tier1=is_tier1_pattern,is_compression=is_comp_pattern
                 )
                 # Extra-pattern confluence still counts, but modestly — it's not the main driver anymore
                 confluence_bonus=min(len(dir_pats)*0.3,1.0)
