@@ -8,6 +8,21 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from collections import Counter
 
+# Chart generation (visual entry/SL/TP alerts) — wrapped in try/except
+# since this is a single-file bot with no existing optional-dependency
+# pattern. A missing/failed install (e.g. Railway hasn't yet picked up
+# the updated requirements.txt) would otherwise crash the ENTIRE bot on
+# startup, not just lose the chart feature. Degrades gracefully instead:
+# CHARTS_AVAILABLE=False means charts silently don't send, but every
+# other existing feature (scanning, signals, AI analysis, etc.) keeps
+# working exactly as before.
+try:
+    import mplfinance as mpf
+    import pandas as pd
+    CHARTS_AVAILABLE = True
+except ImportError:
+    CHARTS_AVAILABLE = False
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -15,8 +30,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+if not CHARTS_AVAILABLE:
+    logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -494,6 +512,90 @@ def format_price(p):
 
 def get_ist_time():     return datetime.now(IST).strftime("%I:%M:%S %p IST")
 def get_ist_datetime(): return datetime.now(IST)
+
+def generate_signal_chart(symbol, klines, entry, sl, tp, direction, coin):
+    """
+    Visual chart alerts: renders the last 60 candles with colored
+    horizontal lines for Entry (cyan), Stop Loss (red), and Take Profit
+    (green), matching the requested color scheme. Returns the saved
+    file path, or None if charts are unavailable/generation fails —
+    callers must handle None gracefully (chart is a nice-to-have, never
+    blocks the existing text signal from sending).
+
+    klines uses the same raw Binance kline array format already used
+    everywhere else in this file: [open_time, open, high, low, close,
+    volume, ...] — converted to the OHLC DataFrame shape mplfinance
+    requires. DPI/figsize tuned to keep file size small (~35KB in
+    testing) for fast Telegram delivery.
+    """
+    if not CHARTS_AVAILABLE:
+        return None
+    try:
+        recent = klines[-60:] if len(klines) >= 60 else klines
+        df = pd.DataFrame(
+            [[float(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])] for k in recent],
+            columns=["time","Open","High","Low","Close","Volume"]
+        )
+        df["time"] = pd.to_datetime(df["time"], unit="ms")
+        df.set_index("time", inplace=True)
+
+        hlines = dict(
+            hlines=[entry, sl, tp],
+            colors=["cyan","red","#00cc44"],
+            linewidths=[1.4,1.4,1.4],
+            linestyle="--"
+        )
+        dir_word = "LONG" if direction == "BUY" else "SHORT"
+        title = f"{coin}/USDT  {dir_word}  Entry:{format_price(entry)}"
+
+        save_path = f"/tmp/chart_{coin}_{int(time.time())}.png"
+        mpf.plot(
+            df, type="candle", style="charles", hlines=hlines,
+            savefig=dict(fname=save_path, dpi=100, bbox_inches="tight"),
+            volume=False, figsize=(8,5), title=title
+        )
+        return save_path
+    except Exception as e:
+        logger.warning(f"generate_signal_chart {coin}: {e}")
+        return None
+
+
+def send_telegram_photo(photo_path, caption=""):
+    """
+    Sends an image via Telegram's sendPhoto endpoint (multipart file
+    upload), NOT sendMessage — Telegram enforces a strict ~1024 char
+    caption limit on photos, far too small for the bot's full scorecard/
+    AI-analysis text, so caption is deliberately left short/empty here.
+    The full detailed text message is sent separately via the existing
+    send_telegram() immediately after, matching the requested "photo
+    first, then full text underneath" behavior.
+
+    Cleans up the temp PNG file after sending (or on failure) — these
+    charts are transient, not meant to accumulate on disk across a
+    long-running bot process.
+    """
+    try:
+        with open(photo_path, "rb") as f:
+            files = {"photo": f}
+            data = {"chat_id": CHAT_ID}
+            if caption: data["caption"] = caption
+            res = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+                data=data, files=files, timeout=20
+            )
+        if res.status_code != 200:
+            logger.warning(f"send_telegram_photo [{res.status_code}]: {res.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        logger.warning(f"send_telegram_photo: {e}")
+        return False
+    finally:
+        try:
+            if os.path.exists(photo_path): os.remove(photo_path)
+        except Exception as e:
+            logger.warning(f"send_telegram_photo cleanup: {e}")
+
 
 def send_telegram(text, parse_mode="HTML", reply_markup=None, disable_web_page_preview=True):
     payload={"chat_id":CHAT_ID,"text":text,"parse_mode":parse_mode,
@@ -3745,6 +3847,17 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
         {"text":"✅ Activate Trade","callback_data":f"ACTIVATE_{coin}"},
         {"text":"❌ Ignore","callback_data":f"IGNORE_{coin}"}
     ]]}
+    # Visual chart alert: photo sent first, full text message immediately
+    # after (matches Telegram's ~1024 char photo-caption limit, far too
+    # small for the scorecard/AI-analysis text below — so caption is left
+    # empty and the real content goes in the separate text message).
+    # Wrapped defensively: a chart failure (missing dependency, plotting
+    # error, network issue) never blocks the existing text signal, which
+    # is the actual trade alert and must always still go out.
+    if CHARTS_AVAILABLE:
+        chart_path = generate_signal_chart(setup["symbol"], klines_15m, entry, sl, tp, setup["direction"], coin)
+        if chart_path:
+            send_telegram_photo(chart_path)
     result=send_telegram(msg,reply_markup=reply_markup)
     if result:
         sent_coins.append(coin)
