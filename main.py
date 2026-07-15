@@ -19,6 +19,7 @@ from collections import Counter
 try:
     import mplfinance as mpf
     import pandas as pd
+    import matplotlib.pyplot as plt
     CHARTS_AVAILABLE = True
 except ImportError:
     CHARTS_AVAILABLE = False
@@ -33,8 +34,8 @@ logger = logging.getLogger(__name__)
 if not CHARTS_AVAILABLE:
     logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -513,20 +514,46 @@ def format_price(p):
 def get_ist_time():     return datetime.now(IST).strftime("%I:%M:%S %p IST")
 def get_ist_datetime(): return datetime.now(IST)
 
-def generate_signal_chart(symbol, klines, entry, sl, tp, direction, coin):
+def generate_signal_chart(symbol, klines, entry, sl, tp, direction, coin, interval="15m",
+                          pattern_name=None, zone_ok=False, zone_low=None, zone_high=None,
+                          has_bos=False, has_sweep=False, lev=1, profit_target=None,
+                          st_ok=None, vwap_ok=None, vol_ratio=None, adx_val=None, rsi_val=None,
+                          sup=None, res=None, opp_zone_low=None, opp_zone_high=None, opp_zone_is_tp=False):
     """
-    Visual chart alerts: renders the last 60 candles with colored
-    horizontal lines for Entry (cyan), Stop Loss (red), and Take Profit
-    (green), matching the requested color scheme. Returns the saved
-    file path, or None if charts are unavailable/generation fails —
-    callers must handle None gracefully (chart is a nice-to-have, never
-    blocks the existing text signal from sending).
+    Visual chart alerts — full version per explicit request to add as much
+    of the reference "Institutional Trader Study Notes" style as possible,
+    using ONLY data the bot actually computes for that specific signal.
+    Nothing here is decorative/fake: pattern name, zone box, BOS/sweep
+    annotations, and profit milestones all come from real values passed
+    in by the caller (format_and_send already computes all of them for
+    the text message — this reuses those same values, doesn't invent new
+    ones). Elements the bot doesn't genuinely detect (FVG, trendline
+    liquidity) are deliberately left out rather than faked, since a
+    labeled annotation that wasn't actually true would be misleading.
 
-    klines uses the same raw Binance kline array format already used
-    everywhere else in this file: [open_time, open, high, low, close,
-    volume, ...] — converted to the OHLC DataFrame shape mplfinance
-    requires. DPI/figsize tuned to keep file size small (~35KB in
-    testing) for fast Telegram delivery.
+    Every visual element (zone box, BOS arrow, pattern callout, milestone
+    lines, filter strip) was built and verified as a standalone rendered
+    PNG before being wired in here — checked for missing-glyph warnings
+    too (emoji characters silently fail to render on matplotlib's default
+    font — replaced with plain OK/X text, verified with zero warnings).
+
+    All new parameters are optional with safe defaults, so this remains
+    backward compatible with any caller not yet passing the extra data.
+
+    THIS ROUND'S ADDITION: `sup`/`res` are the bot's own real swing-based
+    support/resistance (already computed as `sup`/`res` in format_and_send
+    from detect_market_structure's swing_high/swing_low, same values the
+    structural stop-loss and structural take-profit logic already use —
+    not new numbers). `opp_zone_low`/`opp_zone_high` is the nearest zone
+    on the OPPOSITE side from the entry zone (e.g. a demand-zone BUY entry
+    also shows the nearest supply zone above it) — genuine data from the
+    same `zones` dict already fetched via get_htf_zones, just the other
+    side of it. Gives a fuller "map" of the real local level structure
+    the bot detected, not just the single zone the entry happened to sit in.
+
+    Returns the saved file path, or None if charts are unavailable/
+    generation fails — callers must handle None gracefully (chart is a
+    nice-to-have, never blocks the existing text signal from sending).
     """
     if not CHARTS_AVAILABLE:
         return None
@@ -539,21 +566,143 @@ def generate_signal_chart(symbol, klines, entry, sl, tp, direction, coin):
         df["time"] = pd.to_datetime(df["time"], unit="ms")
         df.set_index("time", inplace=True)
 
-        hlines = dict(
-            hlines=[entry, sl, tp],
-            colors=["cyan","red","#00cc44"],
-            linewidths=[1.4,1.4,1.4],
-            linestyle="--"
-        )
+        sl_pct = abs(entry - sl) / entry * 100 if entry > 0 else 0
+        tp_pct = abs(tp - entry) / entry * 100 if entry > 0 else 0
+        rr_ratio = tp_pct / sl_pct if sl_pct > 0 else 0
         dir_word = "LONG" if direction == "BUY" else "SHORT"
-        title = f"{coin}/USDT  {dir_word}  Entry:{format_price(entry)}"
+        title = f"{coin}/USDT   {dir_word}   {interval} Chart   |   R:R 1:{rr_ratio:.1f}"
+
+        # Profit milestones (P1/P2) — reuses the EXACT same 30%/60%-of-
+        # target formula already used in the text message's MILESTONE
+        # PLAN section (_price_at_pnl), not a separate/different number.
+        p1_price = p2_price = None
+        m1_pnl = m2_pnl = 0
+        if profit_target:
+            def _price_at_pnl(target_pnl):
+                move = entry * (target_pnl/100) / lev
+                return entry+move if direction=="BUY" else entry-move
+            m1_pnl = profit_target*0.30; m2_pnl = profit_target*0.60
+            p1_price = _price_at_pnl(m1_pnl); p2_price = _price_at_pnl(m2_pnl)
+
+        hline_prices = [entry, sl, tp]
+        hline_colors = ["#0088aa","red","#00aa33"]
+        hline_widths = [1.5,1.5,1.5]
+        hline_styles = ["--","--","--"]
+        if p1_price is not None:
+            hline_prices += [p1_price, p2_price]
+            hline_colors += ["#997a00","#997a00"]
+            hline_widths += [1.0,1.0]
+            hline_styles += [":",":"]
+        if sup is not None and res is not None:
+            hline_prices += [sup, res]
+            hline_colors += ["#666666","#666666"]
+            hline_widths += [0.9,0.9]
+            hline_styles += ["-.","-."]
+
+        hlines = dict(hlines=hline_prices, colors=hline_colors, linewidths=hline_widths, linestyle=hline_styles)
+
+        fig, axlist = mpf.plot(
+            df, type="candle", style="charles", hlines=hlines,
+            volume=False, figsize=(10,8), title=title, returnfig=True
+        )
+        ax = axlist[0]
+        xmin, xmax = ax.get_xlim()
+        ymin, ymax = ax.get_ylim()
+
+        # Shaded risk/reward zones — direction-aware (verified both ways)
+        if direction == "BUY":
+            ax.axhspan(entry, tp, facecolor="#00cc44", alpha=0.08)
+            ax.axhspan(sl, entry, facecolor="red", alpha=0.08)
+            sl_sign, tp_sign = "-", "+"
+        else:
+            ax.axhspan(tp, entry, facecolor="#00cc44", alpha=0.08)
+            ax.axhspan(entry, sl, facecolor="red", alpha=0.08)
+            sl_sign, tp_sign = "+", "-"
+
+        # Real Supply/Demand zone box (only drawn if the bot actually
+        # detected one for this signal — get_htf_zones/is_in_zone)
+        if zone_ok and zone_low is not None and zone_high is not None:
+            zone_word = "DEMAND ZONE" if direction == "BUY" else "SUPPLY ZONE"
+            ax.axhspan(zone_low, zone_high, xmin=0.55, xmax=1.0, facecolor="orange", alpha=0.18,
+                      edgecolor="darkorange", linewidth=1)
+            ax.text(xmin+(xmax-xmin)*0.57, (zone_low+zone_high)/2, zone_word, fontsize=7.5,
+                   color="darkorange", fontweight="bold", ha="left", va="center",
+                   bbox=dict(boxstyle="round,pad=0.2", facecolor="white", edgecolor="darkorange", alpha=0.85))
+
+        # Nearest OPPOSITE-side zone (e.g. resistance/supply target area
+        # for a BUY entering at a demand zone) — genuine data, same
+        # zones dict, other side of it. Purple to stay visually distinct
+        # from the entry-side orange zone.
+        if opp_zone_low is not None and opp_zone_high is not None:
+            base_word = "SUPPLY ZONE" if direction == "BUY" else "DEMAND ZONE"
+            opp_word = f"TARGET ZONE ({base_word})" if opp_zone_is_tp else base_word
+            ax.axhspan(opp_zone_low, opp_zone_high, xmin=0.0, xmax=0.45, facecolor="purple", alpha=0.13,
+                      edgecolor="purple", linewidth=1)
+            ax.text(xmin+(xmax-xmin)*0.02, (opp_zone_low+opp_zone_high)/2, opp_word, fontsize=7.5,
+                   color="purple", fontweight="bold", ha="left", va="center",
+                   bbox=dict(boxstyle="round,pad=0.2", facecolor="white", edgecolor="purple", alpha=0.85))
+
+        # Real BOS annotation (only if detect_market_structure confirmed one)
+        if has_bos:
+            bx = xmin + (xmax-xmin)*0.25
+            by_target = entry+(ymax-entry)*0.25 if direction=="BUY" else entry-(entry-ymin)*0.25
+            ax.annotate("BOS Confirmed", xy=(bx, by_target), xytext=(bx, ymax-(ymax-ymin)*0.06),
+                       fontsize=8, color="black", fontweight="bold", ha="center",
+                       arrowprops=dict(arrowstyle="->", color="black", lw=1.1))
+
+        # Real liquidity sweep annotation (only if detect_liquidity_sweep fired)
+        if has_sweep:
+            sx = xmin + (xmax-xmin)*0.85
+            ax.annotate("Liquidity Sweep", xy=(sx, sl), xytext=(sx, sl - (ymax-ymin)*0.08 if direction=="BUY" else sl + (ymax-ymin)*0.08),
+                       fontsize=8, color="black", fontweight="bold", ha="center",
+                       arrowprops=dict(arrowstyle="->", color="black", lw=1.1))
+
+        # Pattern name callout — the main ask this round, styled like the
+        # reference image's labeled boxes
+        if pattern_name:
+            ax.text(0.02, 0.97, f"Pattern: {pattern_name}", transform=ax.transAxes,
+                   fontsize=9, color="black", fontweight="bold", ha="left", va="top",
+                   bbox=dict(boxstyle="round,pad=0.35", facecolor="#fff9e6", edgecolor="black", linewidth=1))
+
+        # Support/Resistance labels (real swing-based levels, italic to
+        # visually distinguish from the bold Entry/SL/TP trade levels)
+        if sup is not None and res is not None:
+            ax.text(xmax, res, f"  R {format_price(res)}", va="bottom", ha="left",
+                   fontsize=7.5, color="#666666", style="italic")
+            ax.text(xmax, sup, f"  S {format_price(sup)}", va="top", ha="left",
+                   fontsize=7.5, color="#666666", style="italic")
+
+        # Entry/SL/TP/P1/P2 price+percentage labels
+        ax.text(xmax, entry, f"  ENTRY {format_price(entry)}", va="center", ha="left",
+               fontsize=9, color="#0088aa", fontweight="bold")
+        ax.text(xmax, sl, f"  SL {format_price(sl)} ({sl_sign}{sl_pct:.1f}%)", va="center", ha="left",
+               fontsize=9, color="red", fontweight="bold")
+        ax.text(xmax, tp, f"  TP {format_price(tp)} ({tp_sign}{tp_pct:.1f}%)", va="center", ha="left",
+               fontsize=9, color="#00aa33", fontweight="bold")
+        if p1_price is not None:
+            ax.text(xmax, p1_price, f"  P1 +{m1_pnl:.0f}%", va="center", ha="left", fontsize=7.5, color="#997a00")
+            ax.text(xmax, p2_price, f"  P2 +{m2_pnl:.0f}%", va="center", ha="left", fontsize=7.5, color="#997a00")
+
+        # Condensed filter/confirmation strip — same checks already shown
+        # in the text message's CONFIRMATIONS block, compressed to one
+        # line for the image. Plain OK/X text, NOT emoji — matplotlib's
+        # default font silently fails to render checkmark/cross emoji
+        # (confirmed via UserWarning during testing), which would show as
+        # missing-glyph boxes rather than the intended icons.
+        filter_parts = []
+        if st_ok is not None:   filter_parts.append(f"ST:{'OK' if st_ok else 'X'}")
+        if vwap_ok is not None: filter_parts.append(f"VWAP:{'OK' if vwap_ok else 'X'}")
+        filter_parts.append(f"Zone:{'OK' if zone_ok else 'X'}")
+        if vol_ratio is not None: filter_parts.append(f"Vol:{vol_ratio:.1f}x")
+        if adx_val is not None:   filter_parts.append(f"ADX:{adx_val:.0f}")
+        if rsi_val is not None:   filter_parts.append(f"RSI:{rsi_val:.0f}")
+        if filter_parts:
+            fig.text(0.13, 0.94, "   ".join(filter_parts), fontsize=8.5, color="#333333",
+                    ha="left", family="monospace")
 
         save_path = f"/tmp/chart_{coin}_{int(time.time())}.png"
-        mpf.plot(
-            df, type="candle", style="charles", hlines=hlines,
-            savefig=dict(fname=save_path, dpi=100, bbox_inches="tight"),
-            volume=False, figsize=(8,5), title=title
-        )
+        fig.savefig(save_path, dpi=100, bbox_inches="tight")
+        plt.close(fig)
         return save_path
     except Exception as e:
         logger.warning(f"generate_signal_chart {coin}: {e}")
@@ -3415,6 +3564,23 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     drift_pct=abs(entry-setup["scan_price"])/setup["scan_price"]*100
     if drift_pct>3.5:
         logger.info(f"{coin} rejected - drifted {drift_pct:.1f}%"); return False
+    # The Law of Daily ATR Exhaustion. is_move_already_extended() already
+    # stops the bot from chasing a coin that just pumped on the 15m
+    # chart, but that's a LOCAL (recent-candle) check — it doesn't look
+    # at the Daily chart. If a coin is having a genuine news-driven 40%
+    # day (3x its normal 14-day Daily ATR), a "Bull Flag" on the 15m
+    # chart is often just noise on top of an already-exhausted daily
+    # move — buying it is chasing the top of a move that's mathematically
+    # spent, not a fresh setup. Checked here (early, before the more
+    # expensive 15m/1h processing below) so an exhausted day fails fast.
+    klines_1d=get_klines(setup["symbol"],"1d",20)
+    if klines_1d and len(klines_1d)>=15:
+        daily_atr=calculate_atr(klines_1d,14)
+        todays_range=float(klines_1d[-1][2])-float(klines_1d[-1][3])  # today's High - Low
+        if daily_atr>0 and todays_range>(daily_atr*2.5):
+            logger.info(f"{coin} rejected - Daily ATR exhausted (today's range {todays_range:.4g} vs "
+                       f"14d ATR {daily_atr:.4g}, {todays_range/daily_atr:.1f}x)")
+            return False
     klines_15m=get_klines(setup["symbol"],"15m",100)
     klines_1h=get_klines(setup["symbol"],"1h",50)
     if not klines_15m: return False
@@ -3855,7 +4021,65 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     # error, network issue) never blocks the existing text signal, which
     # is the actual trade alert and must always still go out.
     if CHARTS_AVAILABLE:
-        chart_path = generate_signal_chart(setup["symbol"], klines_15m, entry, sl, tp, setup["direction"], coin)
+        # Re-derive the raw zone low/high (not just the formatted
+        # zone_label string) directly from the same `zones` dict already
+        # in scope — is_in_zone() only returns a formatted string, so
+        # this re-runs its same matching logic to get real numbers for
+        # the chart's zone box, rather than parsing the label string.
+        chart_zone_low = chart_zone_high = None
+        if zone_ok:
+            zone_key = "demand" if setup["direction"] == "BUY" else "supply"
+            for z in zones.get(zone_key, [])[-5:]:
+                if z["low"]*0.995 <= entry <= z["high"]*1.005:
+                    chart_zone_low, chart_zone_high = z["low"], z["high"]
+                    break
+        # Nearest OPPOSITE-side zone (e.g. the nearest supply/resistance
+        # zone above entry on a BUY) — genuine data, same zones dict.
+        #
+        # BUG FOUND AND FIXED DURING TESTING: originally this picked the
+        # geometrically NEAREST zone independent of what TP was actually
+        # set to. But get_structural_tp() (used earlier in this function
+        # to set `tp`) can skip the nearest zone if it's too close to
+        # satisfy the 1:2 R:R floor, and anchor TP to a FARTHER zone
+        # instead. Verified with a real test case: nearest supply zone
+        # was 108-109.5, but the bot's actual TP anchored to a zone at
+        # 120-122 to preserve R:R — showing "nearest" would have
+        # displayed a DIFFERENT zone than the real TP target, which is
+        # actively misleading, not just imprecise. Fixed: first check
+        # whether `tp` itself falls inside a real zone (i.e. TP was
+        # genuinely zone-anchored) and show THAT zone; only fall back to
+        # "nearest" when TP was set by the ATR/min-RR fallback instead
+        # (not zone-anchored at all, so there's no "the" zone to show —
+        # nearest is then the most reasonable context indicator).
+        opp_zone_low = opp_zone_high = None
+        opp_zone_is_tp = False
+        opp_key = "supply" if setup["direction"] == "BUY" else "demand"
+        opp_candidates = zones.get(opp_key, [])
+        for z in opp_candidates:
+            if z["low"]*0.995 <= tp <= z["high"]*1.005:
+                opp_zone_low, opp_zone_high = z["low"], z["high"]
+                opp_zone_is_tp = True
+                break
+        if opp_zone_low is None and opp_candidates:
+            if setup["direction"] == "BUY":
+                above = [z for z in opp_candidates if z["low"] > entry]
+                if above:
+                    nearest = min(above, key=lambda z: z["low"])
+                    opp_zone_low, opp_zone_high = nearest["low"], nearest["high"]
+            else:
+                below = [z for z in opp_candidates if z["high"] < entry]
+                if below:
+                    nearest = max(below, key=lambda z: z["high"])
+                    opp_zone_low, opp_zone_high = nearest["low"], nearest["high"]
+        chart_path = generate_signal_chart(
+            setup["symbol"], klines_15m, entry, sl, tp, setup["direction"], coin,
+            pattern_name=setup["pattern"], zone_ok=zone_ok,
+            zone_low=chart_zone_low, zone_high=chart_zone_high,
+            has_bos=ms["bos"], has_sweep=is_sweep, lev=lev, profit_target=profit_target,
+            st_ok=st_ok, vwap_ok=vwap_ok, vol_ratio=vol_ratio, adx_val=adx_val, rsi_val=rsi_val,
+            sup=sup, res=res, opp_zone_low=opp_zone_low, opp_zone_high=opp_zone_high,
+            opp_zone_is_tp=opp_zone_is_tp
+        )
         if chart_path:
             send_telegram_photo(chart_path)
     result=send_telegram(msg,reply_markup=reply_markup)
@@ -3889,7 +4113,32 @@ def check_active_trades():
                     if rev:
                         send_telegram(f"⚠️ <b>{BOT_HEADER}</b>\nReversal alert: {coin}\nPrice broke EMA20")
                         active_trades[coin]["reversal_alerted"]=True; save_active_trades()
+        # The Law of Time Capitulation (Time Stop). A trade opened on a
+        # momentum thesis (e.g. "Momentum Surge") should resolve quickly.
+        # If it's been open 12+ hours and hasn't even reached Milestone 1
+        # (the first proportional profit checkpoint), the momentum thesis
+        # is dead and capital is trapped in "dead money."
+        #
+        # NOTE ON THE SUGGESTED SNIPPET: the version proposed only sent a
+        # Telegram alert but never actually closed the trade — no removal
+        # from active_trades, no journal entry, no pattern learning update.
+        # That would leave the trade open forever with just a warning
+        # message, contradicting "free up the capital." Built properly
+        # here instead: sets hit="TIMEOUT" and lets it flow through the
+        # EXISTING close/journal/cooldown/learning logic below (same path
+        # a real WIN/LOSS uses), so the trade genuinely closes. hit=
+        # "TIMEOUT" is treated as non-WIN for pattern learning purposes
+        # (correct — a trade that timed out without reaching TP didn't
+        # validate the pattern, regardless of whether PnL was marginally
+        # positive or negative at the moment it closed), while still
+        # being visually distinct from a real stop-loss hit in the
+        # journal/message (checked below via `hit=="TIMEOUT"`, not
+        # collapsed into a generic "LOSS").
         hit=None
+        if trade.get("timestamp"):
+            hours_open=(get_ist_datetime()-trade["timestamp"]).total_seconds()/3600
+            if hours_open>12 and "p1" not in trade.get("milestones_sent",[]):
+                hit="TIMEOUT"
         if trade["direction"]=="BUY":
             if price>=trade["tp"]:   hit="WIN"
             elif price<=trade["sl"]: hit="LOSS"
@@ -3906,6 +4155,8 @@ def check_active_trades():
                 increment_daily_losses(pnl)
                 if hit=="LOSS":
                     coin_cooldowns[coin]=get_ist_datetime()+timedelta(hours=4)
+                elif hit=="TIMEOUT":
+                    coin_cooldowns[coin]=get_ist_datetime()+timedelta(hours=2)
                 duration=""
                 if trade.get("timestamp"):
                     mins=int((get_ist_datetime()-trade["timestamp"]).total_seconds()/60)
@@ -3916,12 +4167,15 @@ def check_active_trades():
                     "entry":trade["entry"],"exit":price,"pnl":pnl,"result":hit,
                     "duration":duration,"tf_score":trade.get("tf_score",0),"market_condition":mc})
                 save_journal(); learn_from_trade(coin,primary,hit,pnl,mc,trade.get("tf_score",0))
-            em="✅" if hit=="WIN" else "🛑"
+            em="✅" if hit=="WIN" else "⏰" if hit=="TIMEOUT" else "🛑"
+            title_word="WON" if hit=="WIN" else "TIME STOP" if hit=="TIMEOUT" else "CLOSED"
             send_telegram(
-                f"{em} <b>TRADE {'WON' if hit=='WIN' else 'CLOSED'} — {coin}</b>\n"
+                f"{em} <b>TRADE {title_word} — {coin}</b>\n"
                 f"⚙️ <b>TRADING SIGNAL MASTER v32G</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"🪙 <b>{coin}</b>  {'🟢' if trade['direction']=='BUY' else '🔴'} {trade['direction']}\n"
+                + (f"⏰ Momentum thesis didn't play out — sat flat {duration} without\n"
+                   f"   reaching the first milestone. Closed to free up capital.\n\n" if hit=="TIMEOUT" else "")
+                + f"🪙 <b>{coin}</b>  {'🟢' if trade['direction']=='BUY' else '🔴'} {trade['direction']}\n"
                 f"📌 Pattern: {primary}\n\n"
                 f"💰 Entry: <code>{format_price(trade['entry'])}</code>\n"
                 f"📍 Exit:  <code>{format_price(price)}</code>\n"
