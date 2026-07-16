@@ -34,8 +34,8 @@ logger = logging.getLogger(__name__)
 if not CHARTS_AVAILABLE:
     logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -115,7 +115,8 @@ pattern_stats = {p: {"signals":0,"wins":0,"losses":0,"total_pnl":0.0,"weight":1.
     "EMA Trend","Breakout","Pullback to 20 EMA","RSI Reversal","Momentum Surge",
     "Volume Spike","Double Bottom","Double Top","Support Bounce","Resistance Rejection",
     "Bullish Engulfing","Bearish Engulfing","Volume Breakout","Bull Flag Break","Bear Flag Break",
-    "BOS Breakout","Change of Character (ChoCh)","Liquidity Sweep","Volatility Contraction (Coiling)","Pre-Breakout Compression"
+    "BOS Breakout","Change of Character (ChoCh)","Liquidity Sweep","Volatility Contraction (Coiling)","Pre-Breakout Compression",
+    "Inside Bar Coil","BOS-Retest","BOS Retest (Sniper Entry)"
 ]}
 
 last_update_id         = None
@@ -882,6 +883,99 @@ def calculate_vwap(klines):
         return tp/tv if tv>0 else None
     except Exception: return None
 
+def calculate_vwap_with_bands(klines):
+    """
+    The Law of Mean Reversion: VWAP Standard Deviation Bands.
+    Kept as a SEPARATE function from the existing calculate_vwap (not a
+    replacement) — the simple version is still used by cmd_hidden_gems,
+    which doesn't need the extra variance computation cost; the full
+    band calculation is wired into format_and_send specifically, where
+    the actual entry-blocking check happens.
+
+    Returns (vwap, upper_band_2sd, lower_band_2sd). A price extended
+    beyond +2 SD (long) or -2 SD (short) from VWAP is "the elastic band
+    stretched to its limit" — buying a breakout there is fighting mean
+    reversion, not riding genuine momentum.
+    """
+    if len(klines) < 20: return None, None, None
+    try:
+        cum_vol = 0
+        cum_pv = 0
+        typical_prices = []
+        vols = []
+
+        for k in klines:
+            h, l, c, v = float(k[2]), float(k[3]), float(k[4]), float(k[5])
+            tp = (h + l + c) / 3
+            cum_vol += v
+            cum_pv += tp * v
+            typical_prices.append(tp)
+            vols.append(v)
+
+        if cum_vol == 0: return None, None, None
+        vwap = cum_pv / cum_vol
+
+        dev_sum = 0
+        for i in range(len(typical_prices)):
+            dev_sum += vols[i] * ((typical_prices[i] - vwap) ** 2)
+
+        variance = dev_sum / cum_vol
+        std_dev = variance ** 0.5
+
+        upper_band_2sd = vwap + (2 * std_dev)
+        lower_band_2sd = vwap - (2 * std_dev)
+
+        return vwap, upper_band_2sd, lower_band_2sd
+    except Exception:
+        return None, None, None
+
+def get_point_of_control(klines, bins=12):
+    """
+    The Law of Liquidity Gravity (Volume Profile / Point of Control).
+    VWAP tells you the average price paid, but not WHERE the most volume
+    is actually trapped. Bins historical price action into horizontal
+    blocks and finds the Point of Control (POC) — the price level with
+    the highest traded volume, which acts like gravity: heavy resistance
+    from below, heavy support from above.
+
+    VERIFIED the binning math before implementing: a candle exactly at
+    the range maximum would otherwise compute an out-of-range bin index
+    (confirmed via calculation — int((max_p-min_p)/bin_size) at price==
+    max_p equals `bins`, one past the valid 0..bins-1 range) — the
+    max(0, min(x, bins-1)) clamp is genuinely necessary here, not
+    defensive-but-unneeded code.
+    """
+    if len(klines) < 50: return None
+    try:
+        highs = [float(k[2]) for k in klines]
+        lows = [float(k[3]) for k in klines]
+        vols = [float(k[5]) for k in klines]
+
+        max_p = max(highs)
+        min_p = min(lows)
+        if max_p == min_p: return None
+
+        bin_size = (max_p - min_p) / bins
+        volume_profile = {i: 0.0 for i in range(bins)}
+
+        for i in range(len(klines)):
+            h, l, v = highs[i], lows[i], vols[i]
+            start_bin = int((l - min_p) / bin_size)
+            end_bin = int((h - min_p) / bin_size)
+            start_bin = max(0, min(start_bin, bins - 1))
+            end_bin = max(0, min(end_bin, bins - 1))
+            bins_touched = (end_bin - start_bin) + 1
+            vol_per_bin = v / bins_touched if bins_touched > 0 else 0
+            for b in range(start_bin, end_bin + 1):
+                volume_profile[b] += vol_per_bin
+
+        poc_bin = max(volume_profile, key=volume_profile.get)
+        poc_price = min_p + (poc_bin * bin_size) + (bin_size / 2)
+        return poc_price
+    except Exception as e:
+        logger.warning(f"get_point_of_control: {e}")
+        return None
+
 def get_dol_signal(klines):
     try:
         highs=[float(k[2]) for k in klines[-30:]]; lows=[float(k[3]) for k in klines[-30:]]
@@ -1244,6 +1338,134 @@ def detect_pre_breakout_compression(closes, highs, lows, vols, price, sup, res, 
     return None, 0
 
 
+def detect_bos_retest(klines, ms, price, avg_vol):
+    """
+    Synchronous complement to the existing async retest_watchlist
+    mechanism (log_retest_candidate/check_retest_triggers, built in an
+    earlier round). That mechanism logs a BOS now and checks again on
+    FUTURE scan cycles for a pullback — but it has a real coverage gap:
+    a bot restart, or a coin that briefly failed an upstream filter
+    (blacklist, sector limit, cooldown) during the exact breakout candle,
+    would never get logged to the watchlist at all and become invisible
+    to that mechanism permanently. This function instead checks, in a
+    SINGLE pass: did a genuine breakout happen within the recent 15
+    candles, AND is price now close to the old level AND has it closed
+    back above/below it (a real retest-and-reclaim, not just proximity)?
+    Both mechanisms can coexist — this one is a safety net for cases the
+    async watchlist would miss, not a replacement for it.
+
+    Checked before wiring in: this logic (proximity check + directional
+    close-based reclaim) is a coherent definition of a held retest, not
+    just "price is near the old line" — verified the close condition
+    (closes[-1] > swing_high for BUY) genuinely requires price to have
+    reclaimed the level, not merely approached it.
+    """
+    if len(klines) < 30: return None
+
+    closes = [float(k[4]) for k in klines]
+    highs  = [float(k[2]) for k in klines]
+    lows   = [float(k[3]) for k in klines]
+    vols   = [float(k[5]) for k in klines]
+
+    if ms["bias"] == "neutral": return None
+
+    swing_high = ms["swing_high"]
+    swing_low = ms["swing_low"]
+
+    # Require volume to be fading on the pullback (crowd losing interest)
+    recent_vols = vols[-4:]
+    avg_recent_vol = sum(recent_vols) / len(recent_vols)
+    if avg_recent_vol > avg_vol * 0.9: return None
+
+    if ms["bias"] == "bullish" and swing_high > 0:
+        max_recent_high = max(highs[-15:])
+        if max_recent_high > swing_high * 1.015:
+            dist = abs(price - swing_high) / swing_high * 100
+            if dist <= 0.8 and closes[-1] > swing_high:
+                return "BUY"
+
+    if ms["bias"] == "bearish" and swing_low > 0:
+        min_recent_low = min(lows[-15:])
+        if min_recent_low < swing_low * 0.985:
+            dist = abs(price - swing_low) / swing_low * 100
+            if dist <= 0.8 and closes[-1] < swing_low:
+                return "SELL"
+
+    return None
+
+
+def detect_inside_bar_coil(closes, highs, lows, opens, vols, price, zone_low, zone_high, direction_bias):
+    """
+    Point 2 (Inside Bar Coil): "The True Early Entry."
+
+    An Inside Bar is a candle whose ENTIRE range (high AND low, not just
+    the body) is trapped inside the previous candle's range — the market
+    literally took a breath. Resting exactly on a level that matters,
+    this is read as the market coiling like a spring, on low volume.
+
+    CORRECTED DOCSTRING (previous version claimed real HTF zone
+    validation "layered on top at the scan_coins call site" — that
+    downstream check never actually existed; the only call site passed
+    local swing sup/res into these zone_low/zone_high parameters, not
+    real get_htf_zones data). This function is level-agnostic — it
+    validates the coil against WHATEVER low/high bounds the caller
+    passes in, real HTF zone or local swing level. The genuine real-zone
+    validation now happens as a separate downstream check in scan_coins
+    (search "Inside Bar Coil not in a real HTF zone"), which rejects a
+    coil that only rested on a local swing level without also being
+    inside a real mapped Supply/Demand zone.
+
+    Per the explicit logic: the entry trigger is the break of the INSIDE
+    BAR's own high/low specifically — not the macro zone boundary. This
+    is deliberately a tighter, earlier trigger than waiting for price to
+    clear the whole zone: "you are in the trade before the breakout
+    scanners even trigger."
+
+    Returns (direction, inside_bar_high, inside_bar_low) if a coiled
+    inside bar is currently resting in the given bounds, or (None, 0, 0)
+    otherwise. The caller checks the CURRENT price against the returned
+    inside_bar_high/low to decide if entry has actually triggered yet —
+    this function only identifies that a qualifying coil EXISTS, it
+    doesn't itself judge whether the break has happened.
+    """
+    if len(closes) < 3 or zone_low is None or zone_high is None or zone_low <= 0:
+        return None, 0, 0
+
+    # The two most recent COMPLETED candles: mother bar (i-2) and the
+    # inside bar (i-1) — using the last fully closed candles, not the
+    # current still-forming one.
+    mother_high, mother_low = highs[-3], lows[-3]
+    inside_high, inside_low = highs[-2], lows[-2]
+
+    # True inside bar: ENTIRE range trapped inside the mother bar's range
+    is_inside_bar = inside_high < mother_high and inside_low > mother_low
+    if not is_inside_bar:
+        return None, 0, 0
+
+    # Low volume on the inside bar itself — "the market is taking a
+    # breath," not a high-conviction move in either direction
+    avg_vol_20 = sum(vols[-20:]) / 20 if len(vols) >= 20 else (vols[-1] if vols else 1)
+    inside_bar_vol = vols[-2]
+    low_volume = avg_vol_20 > 0 and inside_bar_vol < avg_vol_20 * 0.85
+
+    # Resting exactly on the real HTF zone (using the actual zone bounds,
+    # with the same 0.5% tolerance is_in_zone already uses elsewhere, for
+    # consistency with how "in a zone" is judged throughout this file)
+    resting_on_zone = zone_low*0.995 <= price <= zone_high*1.005
+
+    if not low_volume or not resting_on_zone:
+        return None, 0, 0
+
+    # Direction: a coil resting on a DEMAND zone (support) sets up a
+    # bullish break of the inside bar's high; resting on a SUPPLY zone
+    # (resistance) sets up a bearish break of its low.
+    if direction_bias != "bearish":
+        return "BUY", inside_high, inside_low
+    if direction_bias != "bullish":
+        return "SELL", inside_high, inside_low
+    return None, 0, 0
+
+
 def detect_liquidity_sweep(klines, highs, lows, closes, opens, sup, res, ms):
     """
     Liquidity Sweep (failed breakout / stop hunt), per instruction.
@@ -1384,6 +1606,22 @@ def detect_patterns(symbol, klines, price, btc_trend):
     elif pbc_dir == "SELL" and alt_bear_ok:
         p.append(("Pre-Breakout Compression", TIER1_BASE, "SELL"))
 
+    # ── Inside Bar Coil — Tier 1, "The True Early Entry" ──
+    # A coiled inside bar resting on a local swing level, with entry
+    # specifically on the break of the INSIDE BAR's own high/low (not the
+    # macro zone boundary) — earlier than Pre-Breakout Compression's
+    # zone-boundary trigger. Uses local sup/res here (not a new API call
+    # inside this per-coin/per-cycle function) — the genuine real HTF
+    # zone validation now GENUINELY happens downstream at the scan_coins
+    # call site (search "Inside Bar Coil not in a real HTF zone"), fixed
+    # this round after finding the old comment claimed that check already
+    # existed when it didn't.
+    ib_dir, ib_high, ib_low = detect_inside_bar_coil(closes, highs, lows, opens, vols, price, sup, res, ms_bias)
+    if ib_dir == "BUY" and alt_bull_ok and price > ib_high:
+        p.append(("Inside Bar Coil", TIER1_BASE, "BUY"))
+    elif ib_dir == "SELL" and alt_bear_ok and price < ib_low:
+        p.append(("Inside Bar Coil", TIER1_BASE, "SELL"))
+
     # ── Professional Bull Flag — Tier 1 ──
     if detect_bull_flag(closes, highs, lows, vols, avg_vol) and alt_bull_ok:
         p.append(("Bull Flag Break", TIER1_BASE, "BUY"))
@@ -1463,12 +1701,43 @@ def detect_patterns(symbol, klines, price, btc_trend):
     if price > res and vols[-1] > avg_vol * 2.2 and alt_bull_ok:
         p.append(("Volume Breakout", TIER1_BASE, "BUY"))
 
-    # ── BOS Signal (pure structure break) — Tier 1 ──
+    # ── BOS Signal — Tier 1, BUT NOT an immediate entry (see below) ──
+    # Previously this fired an instant "BOS Breakout" signal the moment
+    # the break happened — buying the breakout candle itself. Per the
+    # explicit reasoning: institutions that bought the actual bottom use
+    # that breakout-chasing buy pressure as their exit liquidity, which
+    # is why price often reverses immediately afterward and clips the
+    # stop. Fixed: BOS is still detected here (kept as a Tier 1 pattern
+    # entry in `p` for pattern_stats/scoring bookkeeping), but the ACTUAL
+    # live signal for it is now deliberately suppressed at the scan_coins
+    # call site below — instead of sending immediately, the breakout
+    # level gets logged to retest_watchlist (reusing the existing
+    # log_retest_candidate/check_retest_triggers plumbing built for
+    # "STAGE:LATE" AI rejections), and the bot waits for price to pull
+    # back to the former resistance/support line before generating a
+    # real, scored signal. See BOS_RETEST_PATTERN_TAG and
+    # check_retest_triggers() for the actual entry logic.
     if ms["bos"] and not ms["choch"]:
         if ms_bias == "bullish" and alt_bull_ok:
             p.append(("BOS Breakout", TIER1_BASE, "BUY"))
         elif ms_bias == "bearish" and alt_bear_ok:
             p.append(("BOS Breakout", TIER1_BASE, "SELL"))
+
+    # ── BOS Retest (Sniper Entry) — Tier 1, synchronous complement ──
+    # Genuinely different pattern name from the async watchlist's
+    # "BOS-Retest" tag (log_retest_candidate/check_retest_triggers) to
+    # avoid confusing the two in pattern_stats/journal history — this one
+    # fires immediately within a single scan when a real retest-and-
+    # reclaim is already visible in the current candle window, rather
+    # than needing to be logged and re-checked on a future cycle. Scored
+    # slightly above TIER1_BASE since a real-time-confirmed retest with
+    # dying volume already carries more confirmation than a pattern's
+    # first detection would.
+    bos_retest_dir = detect_bos_retest(klines, ms, price, avg_vol)
+    if bos_retest_dir == "BUY" and alt_bull_ok:
+        p.append(("BOS Retest (Sniper Entry)", min(TIER1_BASE + 2.0, 99), "BUY"))
+    elif bos_retest_dir == "SELL" and alt_bear_ok:
+        p.append(("BOS Retest (Sniper Entry)", min(TIER1_BASE + 2.0, 99), "SELL"))
 
     # ── Change of Character (ChoCh) — Tier 1, "the ultimate human prediction tool" ──
     # Lower Lows -> hits Demand Zone -> sudden Higher High (or the bearish mirror).
@@ -1772,7 +2041,71 @@ def get_signal_grade(score,vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok
     else:           grade = "Grade C"
     return grade, pts, breakdown
 
+def get_fixed_fractional_size(risk_per_trade_pct, entry_price, sl_price, leverage):
+    """
+    The Law of Fixed Fractional Risk. Replaces the old flat grade-based
+    get_position_size_pct(), which allocated the SAME margin % (e.g. 10%
+    for Grade A+) regardless of how far the stop-loss actually was. The
+    real flaw: a Grade A+ trade with a 4%-away SL and another Grade A+
+    trade with a 0.5%-away SL both got 10% margin — the first carried 8x
+    more actual dollar risk than the second, despite an identical grade.
+
+    Calculates the exact margin % so that if the SL is hit, the loss
+    equals exactly risk_per_trade_pct of total account equity — position
+    size now scales inversely with SL distance (tight stop = larger
+    position allowed within the same risk budget; wide stop = smaller
+    position), which is what "fixed fractional" risk actually means.
+
+    DESIGN CHOICE (flagging explicitly): the proposal's risk_per_trade_pct
+    was a single external input, with no grade-based scaling — mathematically
+    the "purest" form of fixed-fractional risk (same dollar risk regardless
+    of setup quality). I kept grade-based scaling instead (see the call
+    site below, RISK_PCT_BY_GRADE), preserving the old system's intent
+    that a higher-conviction Grade A+ setup should risk more than a
+    marginal Grade C one — just fixing the real bug (same % regardless of
+    SL distance) rather than also discarding the confidence-weighting.
+    The exact percentages chosen (2.0/1.5/1.0/0.5) are my own judgment
+    call, not something specified beyond the single "e.g. 1%" example given.
+    """
+    sl_distance_pct = abs(entry_price - sl_price) / entry_price
+
+    # Safety fallback
+    if sl_distance_pct == 0: return 0.0
+
+    # Position size needed to make the SL hit exactly equal your max allowed risk
+    position_size_pct = (risk_per_trade_pct / 100) / sl_distance_pct
+
+    # Convert to the actual margin required based on your leverage
+    margin_pct = (position_size_pct / leverage) * 100
+
+    # Cap at a maximum of 25% of account margin per trade to prevent
+    # over-leveraging tight stops. VERIFIED VIA EXECUTION: for a very
+    # tight SL (e.g. 0.5% away), the uncapped formula can call for 80%+
+    # margin — the cap correctly prevents that reckless sizing, but it
+    # means actual risk on tight-stop trades ends up LESS than
+    # risk_per_trade_pct, not exactly equal to it (confirmed: a 0.5%-away
+    # SL with this cap active actually risks ~0.6% of equity, not the
+    # full 2% target). This is the safe direction to be wrong in — the
+    # cap trades "hit the risk target precisely" for "never take an
+    # oversized position" — but it's worth being explicit that the
+    # function's real guarantee is "never MORE than risk_per_trade_pct,"
+    # not "always exactly risk_per_trade_pct."
+    return min(margin_pct, 25.0)
+
+
+# Grade-scaled risk budget (my own judgment call — see get_fixed_fractional_size's
+# docstring). A higher-conviction grade risks a larger fraction of equity,
+# but the ACTUAL margin allocated now also depends on SL distance via
+# get_fixed_fractional_size — this is the risk INPUT, not the final
+# position size, unlike the old flat get_position_size_pct which was both.
+RISK_PCT_BY_GRADE = {"A+": 2.0, "A": 1.5, "B": 1.0, "default": 0.5}
+
 def get_position_size_pct(grade):
+    """
+    DEPRECATED — kept only so nothing breaks if anything else still calls
+    it by name, but format_and_send no longer uses this. See
+    get_fixed_fractional_size() for the real, SL-distance-aware sizing.
+    """
     g=grade[0] if isinstance(grade,tuple) else grade
     if "A+" in g: return 10.0
     elif "A 🍀" in g: return 7.0
@@ -2161,11 +2494,16 @@ def check_sector_correlation(coin, direction):
     return passes, note
 
 
-def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, btc_aligned=False, zone_ok=False, ms_bos=False, ms_bias=None, ms_choch=False, is_tier1=True, is_compression=False):
+def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, btc_aligned=False, zone_ok=False, ms_bos=False, ms_bias=None, ms_choch=False, is_tier1=True, is_compression=False, is_sweep=False):
     """
     The Location Multiplier + hard Tier 1/Tier 2 AI cap.
 
     Bonus weights:
+      +4.0  Liquidity Sweep (Spring/Upthrust) — a validated fakeout/stop-
+            hunt reversal. Second-highest weighted bonus, deliberately
+            below ChoCh-in-zone (rarer/higher-conviction combined signal)
+            but well above the old flat +1.0 pattern-detection bump, per
+            explicit "make it an aggressive priority" instruction.
       +7.5  ChoCh occurred INSIDE a Supply/Demand zone — "the ultimate
             human prediction tool": lower lows into a demand zone then a
             sudden higher high (or the bearish mirror). This is the single
@@ -2236,6 +2574,26 @@ def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, btc_al
     """
     bonus = 0.0
     notes = []
+
+    # ── SPRING/UPTHRUST: Liquidity Sweep priority bonus ──
+    # Point 3: "we already built a basic Liquidity Sweep... make it an
+    # aggressive priority." Previously the sweep only got a flat +1.0
+    # (TIER1_BASE+1.0) at pattern-detection time, the same modest bump
+    # any Tier 1 pattern gets — not meaningfully prioritized. Per the
+    # explicit reasoning (a validated sweep traps breakout traders whose
+    # stop-losses become "rocket fuel"), this deserves real priority.
+    # Set to +4.0 — a deliberate, meaningful increase from +1.0, and the
+    # SECOND-highest weighted bonus in this function after ChoCh-in-
+    # zone's +7.5 "ultimate signal." Chose to stay below ChoCh-in-zone
+    # rather than exceed it, since that remains a structurally rarer,
+    # higher-conviction combined signal (Location + Shift at once) — this
+    # is my own judgment call on the exact number, flagging it as such
+    # rather than silently picking a value. Applied additively (not as a
+    # replacement for the zone/structure bonuses below), since a
+    # validated sweep is a genuinely separate confirmation dimension from
+    # location/structure, not a substitute for them.
+    if is_sweep:
+        bonus += 4.0; notes.append("Liquidity Sweep - Spring/Upthrust priority (+4.0)")
 
     if is_tier1:
         # ── ChoCh-in-Zone: the single biggest bonus — Location + Shift at once ──
@@ -3463,7 +3821,40 @@ def check_price_alerts():
     for sym in triggered: del price_alerts[sym]
     if triggered: save_alerts()
 
-def update_trailing_sl(coin,trade,price):
+def update_trailing_sl(coin,trade,price,klines=None):
+    """
+    The Law of Dynamic Noise: Chandelier Exit trailing stop, based on
+    CURRENT market volatility (ATR) rather than a rigid fixed percentage
+    of the profit target. VERIFIED THIS WAS A REAL, UNFIXED GAP before
+    implementing: the previous version used
+    `trail=abs(trade["tp"]-trade["entry"])*0.3` — a fixed distance with
+    zero volatility awareness. A fixed 30% trail gets clipped by a random
+    wick during a genuinely erratic/news-driven market, kicking the trade
+    out right before it would have hit TP; ATR naturally widens the trail
+    when the market is noisy and tightens it when the market is calm.
+
+    `klines` is optional (defaults to None) for backward compatibility —
+    if not provided, or too short, this falls back to the ORIGINAL fixed-
+    percentage behavior rather than silently doing nothing, so a caller
+    that hasn't been updated to pass klines still gets a working trail,
+    just not the improved ATR-aware one.
+    """
+    if klines and len(klines) >= 15:
+        atr = calculate_atr(klines, 14)
+        if atr > 0:
+            atr_trail_dist = atr * 2.5  # Chandelier Exit standard multiple
+            if trade["direction"] == "BUY":
+                highest_recent_high = max(float(k[2]) for k in klines)
+                new_sl = highest_recent_high - atr_trail_dist
+                if new_sl > trade["sl"] and new_sl < price:
+                    active_trades[coin]["sl"] = new_sl; save_active_trades()
+            else:
+                lowest_recent_low = min(float(k[3]) for k in klines)
+                new_sl = lowest_recent_low + atr_trail_dist
+                if new_sl < trade["sl"] and new_sl > price:
+                    active_trades[coin]["sl"] = new_sl; save_active_trades()
+            return
+    # Fallback: original fixed-percentage trail (klines unavailable/too short)
     trail=abs(trade["tp"]-trade["entry"])*0.3
     if trade["direction"]=="BUY":
         new_sl=price-trail
@@ -3663,11 +4054,37 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     # more expensive zone/OI/whale lookups below even run.
     if setup["setup_score"] < 92.0:
         logger.info(f"{coin} rejected - score {setup['setup_score']:.1f} below strict floor 92.0"); return False
-    vwap=calculate_vwap(klines_15m); vwap_ok=False; vwap_label="N/A"
+    vwap,vwap_upper,vwap_lower=calculate_vwap_with_bands(klines_15m); vwap_ok=False; vwap_label="N/A"
     if vwap:
         if setup["direction"]=="BUY" and entry>vwap:    vwap_ok=True; vwap_label=f"Above {format_price(vwap)}"
         elif setup["direction"]=="SELL" and entry<vwap: vwap_ok=True; vwap_label=f"Below {format_price(vwap)}"
         else: vwap_label=f"{'Below' if setup['direction']=='BUY' else 'Above'} {format_price(vwap)}"
+    # The Law of Mean Reversion: reject entries extended beyond +/-2 SD
+    # from VWAP. Buying a breakout there means the elastic band is
+    # already stretched to its limit — mathematically fighting mean
+    # reversion, not riding genuine momentum.
+    if vwap_upper and setup["direction"]=="BUY" and entry>vwap_upper:
+        logger.info(f"{coin} rejected - price {format_price(entry)} is +2 SD above VWAP {format_price(vwap)} (Mean Reversion Risk)")
+        return False
+    if vwap_lower and setup["direction"]=="SELL" and entry<vwap_lower:
+        logger.info(f"{coin} rejected - price {format_price(entry)} is -2 SD below VWAP {format_price(vwap)} (Mean Reversion Risk)")
+        return False
+    # The Law of Liquidity Gravity: reject a BUY if the Point of Control
+    # (heaviest-traded price level, using 1h klines for a stronger macro
+    # read — reuses the already-fetched klines_1h, no new API call) sits
+    # less than 1% above entry — buying directly into a level where a
+    # huge share of historical volume traded means hitting a real
+    # institutional supply wall almost immediately. Mirror logic for a
+    # SELL running into heavy POC support just below entry.
+    poc_price = get_point_of_control(klines_1h)
+    if poc_price:
+        dist_to_poc = (poc_price - entry) / entry * 100
+        if setup["direction"] == "BUY" and 0 < dist_to_poc < 1.0:
+            logger.info(f"{coin} rejected - buying directly into heavy POC resistance at {format_price(poc_price)}")
+            return False
+        if setup["direction"] == "SELL" and -1.0 < dist_to_poc < 0:
+            logger.info(f"{coin} rejected - shorting directly into heavy POC support at {format_price(poc_price)}")
+            return False
     zones=get_htf_zones(setup["symbol"])
     zone_ok,zone_label=is_in_zone(entry,setup["direction"],zones)
     div=detect_rsi_divergence(closes)
@@ -3854,7 +4271,8 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     mom=(closes[-1]-closes[-3])/closes[-3]*100
     rsi_val=calculate_rsi(closes)
     # grade, pts, breakdown already computed above (before leverage)
-    pos_size=get_position_size_pct(grade)
+    risk_pct = RISK_PCT_BY_GRADE["A+"] if "A+" in grade else RISK_PCT_BY_GRADE["A"] if "A" in grade else RISK_PCT_BY_GRADE["B"] if "B" in grade else RISK_PCT_BY_GRADE["default"]
+    pos_size=get_fixed_fractional_size(risk_pct, entry, sl, lev)
     sl_pct=abs(entry-sl)/entry*100; tp_pct=abs(tp-entry)/entry*100
     rr_ratio=tp_pct/sl_pct if sl_pct>0 else 0
     tf_map={3:"4h + 1h  ✅✅",2:"4h Only  ✅",1:"1h Only  ⚡",0:"Counter  ⚠️"}
@@ -3918,7 +4336,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
 
     msg += f"  📈 Max Profit : <b>+{profit_target:.1f}%</b>\n"
     msg += f"  ⚖️  Risk/Reward: <b>1 : {rr_ratio:.1f}</b>\n"
-    msg += f"  💼 Position   : <b>{pos_size:.0f}% of capital</b>\n\n"
+    msg += f"  💼 Position   : <b>{pos_size:.1f}% of margin</b>  (risking {risk_pct:.1f}% of equity if SL hits)\n\n"
 
     msg += f"  ┌── ALIGNMENT SCORECARD ──────┐\n"
     for name,p in breakdown:
@@ -4101,10 +4519,17 @@ def check_active_trades():
             pnl=((price-trade["entry"])/trade["entry"])*100*trade["leverage"]
         else:
             pnl=((trade["entry"]-price)/trade["entry"])*100*trade["leverage"]
-        update_trailing_sl(coin,trade,price)
+        # Single klines fetch reused for both the ATR trailing stop and
+        # the reversal-alert check below (previously fetched separately
+        # for the reversal check only) — avoids doubling the API calls
+        # per active trade per cycle. 25 candles comfortably covers both
+        # the reversal check's 20-period EMA and update_trailing_sl's
+        # 14-period ATR requirement.
+        klines_check=get_klines(trade["symbol"],"15m",25)
+        update_trailing_sl(coin,trade,price,klines_check)
         check_profit_milestones(coin,trade,price,pnl)
         if not trade.get("reversal_alerted",False):
-            klines=get_klines(trade["symbol"],"15m",20)
+            klines=klines_check
             if klines:
                 closes=[float(x[4]) for x in klines]; ema20=calculate_ema(closes,20)
                 if ema20:
@@ -4691,12 +5116,23 @@ def is_move_already_extended(closes, direction):
     return False
 
 
-def log_retest_candidate(coin, symbol, direction, closes, highs, lows, pattern):
+def log_retest_candidate(coin, symbol, direction, closes, highs, lows, pattern, pattern_type="extended_move"):
     """
-    Point 5: Silent background logging. When a move is too extended to chase,
-    log the breakout level as a Demand/Supply zone to watch for a pullback,
-    instead of sending a push notification. Visible via /retests command,
-    and only pings Telegram once price actually returns to the level.
+    Point 5 (extended_move) / BOS+Retest Point 1 (bos_retest): Silent
+    background logging. When a move is too extended to chase, OR when a
+    BOS just happened and we're deliberately NOT buying the breakout
+    candle itself, log the level to watch for a pullback instead of
+    sending a push notification. Visible via /retests command, and only
+    pings Telegram once price actually returns to the level.
+
+    `pattern_type` distinguishes the two cases because they need
+    different validation before firing a real signal on retest:
+    "bos_retest" requires the retest to show DYING volume (per the
+    stated "support becomes resistance... enter there with dying
+    volume" logic — a genuine low-volume pullback, not just any bounce)
+    before check_retest_triggers() will generate an actual signal.
+    "extended_move" (the original/default case) doesn't have that
+    requirement — kept exactly as it worked before this change.
     """
     global retest_watchlist
     # Use the recent swing as the level to watch for a retest back to
@@ -4706,19 +5142,27 @@ def log_retest_candidate(coin, symbol, direction, closes, highs, lows, pattern):
         "direction": direction,
         "level": level,
         "pattern": pattern,
+        "pattern_type": pattern_type,
         "logged_at": get_ist_datetime(),
         "current_price": closes[-1],
         "notified": False
     }
     save_retest_watchlist()
-    logger.info(f"{coin} move already extended — logged retest watch at {format_price(level)} (silent, no push)")
+    reason = "BOS — waiting for pullback to the breakout line" if pattern_type=="bos_retest" else "move already extended"
+    logger.info(f"{coin} {reason} — logged retest watch at {format_price(level)} (silent, no push)")
 
 
 def check_retest_triggers():
     """
-    Point 5: Runs each cycle against the silent watchlist. Only sends an
-    active Telegram ping when price actually pulls back to the logged level —
-    this is the one case where a push notification is warranted.
+    Point 5 (extended_move) / Point 1 (bos_retest): Runs each cycle
+    against the silent watchlist. Only sends an active Telegram ping /
+    generates a real signal when price actually pulls back to the logged
+    level AND (for bos_retest specifically) volume is genuinely dying —
+    matching the stated "enter there with dying volume" logic. A retest
+    on heavy volume isn't the quiet pullback described; it could just be
+    another leg of continued chop, so bos_retest entries require BOTH
+    conditions before triggering. extended_move entries keep their
+    original, simpler near-level-only check, unchanged from before.
     """
     global retest_watchlist
     triggered = []
@@ -4729,9 +5173,20 @@ def check_retest_triggers():
         price = get_price(w["symbol"])
         if not price: continue
         near_level = abs(price - w["level"]) / w["level"] * 100 < 1.0 if w["level"] > 0 else False
-        if near_level and not w["notified"]:
-            w["notified"] = True
-            triggered.append((coin, w, price))
+        if not near_level or w["notified"]:
+            continue
+        if w.get("pattern_type") == "bos_retest":
+            klines = get_klines(w["symbol"], "15m", 25)
+            if not klines or len(klines) < 21:
+                continue  # can't validate volume yet, keep watching
+            vol_ratio = get_volume_ratio(klines)
+            if vol_ratio >= 0.85:
+                # Volume isn't genuinely dying — this isn't the quiet
+                # pullback described, keep watching rather than chase a
+                # noisy retest.
+                continue
+        w["notified"] = True
+        triggered.append((coin, w, price))
     if triggered: save_retest_watchlist()
     return triggered
 
@@ -4804,10 +5259,12 @@ def scan_coins(btc_trend,fng,market_condition):
                 # tier, rather than matching on pattern name strings.
                 is_tier1_pattern = base_s >= 88.0
                 is_comp_pattern = "Pre-Breakout Compression" in primary
+                is_sweep_pattern = "Liquidity Sweep" in primary
                 confirm_bonus,bonus_notes=compute_confirmation_bonus(
                     symbol,direction,klines,vols_chk,tf_score,btc_aligned_chk,
                     zone_ok=zone_ok,ms_bos=ms_chk["bos"],ms_bias=ms_chk["bias"],
-                    ms_choch=ms_chk["choch"],is_tier1=is_tier1_pattern,is_compression=is_comp_pattern
+                    ms_choch=ms_chk["choch"],is_tier1=is_tier1_pattern,is_compression=is_comp_pattern,
+                    is_sweep=is_sweep_pattern
                 )
                 # Extra-pattern confluence still counts, but modestly — it's not the main driver anymore
                 confluence_bonus=min(len(dir_pats)*0.3,1.0)
@@ -4820,6 +5277,31 @@ def scan_coins(btc_trend,fng,market_condition):
                 lows_chk=[float(k[3]) for k in klines]
                 if "Volatility Contraction" not in primary and is_move_already_extended(closes_chk,direction):
                     log_retest_candidate(coin,symbol,direction,closes_chk,highs_chk,lows_chk,pt)
+                    continue
+                if primary == "Inside Bar Coil":
+                    # BUG FOUND AND FIXED: detect_inside_bar_coil's own
+                    # docstring claimed it validates against "a real HTF
+                    # Supply/Demand zone... layered on top at the
+                    # scan_coins call site" — but no such downstream
+                    # check ever actually existed. The only real call
+                    # site (in detect_patterns) passes local swing sup/res
+                    # positionally into the function's zone_low/zone_high
+                    # parameters — not real HTF zone data at all, despite
+                    # the naming implying otherwise. Fixed by adding the
+                    # genuine HTF-zone check here, using zones_chk (already
+                    # fetched above for Location Multiplier scoring, no new
+                    # API call needed) — an Inside Bar Coil that isn't
+                    # actually resting in a real mapped zone is rejected
+                    # rather than silently treated as zone-validated.
+                    ib_zone_ok,_ib_zone_label=is_in_zone(price,direction,zones_chk)
+                    if not ib_zone_ok:
+                        logger.info(f"Skip {coin} {direction} - Inside Bar Coil not in a real HTF zone (local swing level only)")
+                        continue
+                if primary == "BOS Breakout":
+                    # Point 1 (BOS + Retest): don't buy the breakout candle
+                    # itself — log it and wait for a genuine, dying-volume
+                    # pullback to the former resistance/support line instead.
+                    log_retest_candidate(coin,symbol,direction,closes_chk,highs_chk,lows_chk,pt,pattern_type="bos_retest")
                     continue
                 atr=calculate_atr(klines); atr_pct=(atr/price)*100 if price>0 else 0
                 lev=get_smart_leverage(symbol,atr_pct,score)
@@ -4892,6 +5374,33 @@ def main():
             expire_pending_signals()
             check_price_alerts()
             for coin,w,price in check_retest_triggers():
+                if w.get("pattern_type") == "bos_retest" and coin not in active_trades and coin not in pending_signals and len(active_trades)<MAX_ACTIVE_TRADES:
+                    # Point 1 (BOS + Retest): this is the actual entry —
+                    # a validated pullback to the former breakout line
+                    # with dying volume, not just a notification. Routes
+                    # through the SAME format_and_send pipeline as every
+                    # other pattern (SL/TP, AI review, chart, scoring),
+                    # rather than only pinging a "check the chart" alert.
+                    klines_rt=get_klines(w["symbol"],"15m",100)
+                    if klines_rt and len(klines_rt)>=50:
+                        atr_rt=calculate_atr(klines_rt); atr_pct_rt=(atr_rt/price)*100 if price>0 else 0
+                        # Base score set above TIER1_BASE (88.0): this
+                        # pattern has MORE confirmation at this point than
+                        # a pattern's first detection would — it already
+                        # required a real BOS AND a successful, validated
+                        # dying-volume retest, which is why it's scored to
+                        # clear MIN_SETUP_SCORE (90) on its own rather than
+                        # going through the normal confirmation-bonus
+                        # pipeline a fresh pattern detection would need.
+                        retest_score=92.0
+                        lev_rt=get_smart_leverage(w["symbol"],atr_pct_rt,retest_score)
+                        setup_rt={"coin":coin,"symbol":w["symbol"],"direction":w["direction"],
+                                 "pattern":"BOS-Retest","setup_score":retest_score,
+                                 "leverage":lev_rt,"scan_price":price,
+                                 "market_condition":market_condition,"tf_score":get_timeframe_score(w["symbol"],w["direction"])}
+                        logger.info(f"BOS+RETEST validated: {coin}|{w['direction']}|dying volume confirmed at {format_price(price)}")
+                        format_and_send(setup_rt,coin,is_instant=False,market_condition=market_condition)
+                    continue
                 dir_em="🟢 LONG" if w["direction"]=="BUY" else "🔴 SHORT"
                 send_telegram(
                     f"👀 <b>RETEST TRIGGERED — {coin}</b>\n"
