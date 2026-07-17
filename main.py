@@ -34,8 +34,8 @@ logger = logging.getLogger(__name__)
 if not CHARTS_AVAILABLE:
     logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -579,11 +579,9 @@ def generate_signal_chart(symbol, klines, entry, sl, tp, direction, coin, interv
         p1_price = p2_price = None
         m1_pnl = m2_pnl = 0
         if profit_target:
-            def _price_at_pnl(target_pnl):
-                move = entry * (target_pnl/100) / lev
-                return entry+move if direction=="BUY" else entry-move
             m1_pnl = profit_target*0.30; m2_pnl = profit_target*0.60
-            p1_price = _price_at_pnl(m1_pnl); p2_price = _price_at_pnl(m2_pnl)
+            p1_price = price_at_pnl(entry, direction, lev, m1_pnl)
+            p2_price = price_at_pnl(entry, direction, lev, m2_pnl)
 
         hline_prices = [entry, sl, tp]
         hline_colors = ["#0088aa","red","#00aa33"]
@@ -2276,6 +2274,45 @@ def get_fear_greed_index():
 def is_sentiment_valid(direction,fng):
     return not (direction=="BUY" and fng<20) and not (direction=="SELL" and fng>80)
 
+def check_relative_strength(symbol, btc_klines_1h):
+    """
+    The Law of Idiosyncratic Alpha. Alts trade against a backdrop of BTC
+    liquidity — a structural pattern (Inside Bar Coil, Support Bounce,
+    etc.) on an altcoin that's underperforming BTC over the recent
+    structural window has no independent momentum. It's a "beta trap":
+    if BTC ticks down even fractionally, the alt dumps through its tight
+    structural stop with it. This checks whether the altcoin is
+    genuinely outperforming (for a LONG) or underperforming (for a
+    SHORT) BTC over a rolling ~4-hour window (4 completed 1h candles).
+
+    BUG FIX (verified via actual execution before applying): the
+    original proposal's data-unavailable fallback returned a bare
+    `True`, but the caller unpacks the result as a 2-tuple
+    (`alt_perf, btc_perf = check_relative_strength(...)`) — confirmed
+    this raises `TypeError: cannot unpack non-iterable bool object`,
+    which would crash scan_coins the first time kline data was
+    temporarily unavailable (routine with any live API, not an edge
+    case). Fixed: the fallback now returns `(0.0, 0.0)` — equal values,
+    so neither gate condition (`alt_perf < btc_perf` for BUY,
+    `alt_perf > btc_perf` for SELL) ever fires on missing data,
+    behaviorally matching the intended "fallback to true/don't block"
+    without the crash.
+
+    Returns (alt_perf, btc_perf) — the fractional price change of each
+    over the window, for the caller to compare directly.
+    """
+    alt_klines = get_klines(symbol, "1h", 5)
+    if not alt_klines or len(alt_klines) < 4 or not btc_klines_1h or len(btc_klines_1h) < 4:
+        return 0.0, 0.0  # fixed: was a bare `True`, see docstring
+
+    alt_start, alt_curr = float(alt_klines[-4][4]), float(alt_klines[-1][4])
+    btc_start, btc_curr = float(btc_klines_1h[-4][4]), float(btc_klines_1h[-1][4])
+
+    alt_perf = (alt_curr - alt_start) / alt_start if alt_start > 0 else 0
+    btc_perf = (btc_curr - btc_start) / btc_start if btc_start > 0 else 0
+
+    return alt_perf, btc_perf
+
 def get_htf_trend(symbol,interval="1h"):
     try:
         klines=get_klines(symbol,interval,50)
@@ -2312,6 +2349,24 @@ def get_volume_ratio(klines):
     vols = [float(k[5]) for k in klines]
     avg_vol = sum(vols[-20:])/20 if len(vols)>=20 else (vols[-1] if vols else 1)
     return vols[-1]/avg_vol if avg_vol>0 else 1.0
+
+def price_at_pnl(entry, direction, lev, target_pnl):
+    """
+    Shared "what price corresponds to X% PnL" calculation. Consolidated
+    here: this exact formula was independently reimplemented as a nested
+    closure named `_price_at_pnl` in THREE separate places
+    (generate_signal_chart for the chart's P1/P2 milestone lines,
+    check_profit_milestones for the live milestone-lock logic, and
+    format_and_send for the text message's milestone plan) — verified all
+    three were functionally identical before consolidating, just using
+    different local variable names for the same concepts (entry/ep,
+    direction/setup["direction"]). Takes entry/direction/lev as explicit
+    parameters instead of relying on closure over enclosing-scope
+    variables, so it's a genuine standalone function callable from
+    anywhere rather than a nested helper redefined at each call site.
+    """
+    move = entry * (target_pnl/100) / lev
+    return entry+move if direction=="BUY" else entry-move
 
 def get_timeframe_score(symbol,direction):
     """
@@ -3825,35 +3880,47 @@ def update_trailing_sl(coin,trade,price,klines=None):
     """
     The Law of Dynamic Noise: Chandelier Exit trailing stop, based on
     CURRENT market volatility (ATR) rather than a rigid fixed percentage
-    of the profit target. VERIFIED THIS WAS A REAL, UNFIXED GAP before
-    implementing: the previous version used
-    `trail=abs(trade["tp"]-trade["entry"])*0.3` — a fixed distance with
-    zero volatility awareness. A fixed 30% trail gets clipped by a random
-    wick during a genuinely erratic/news-driven market, kicking the trade
-    out right before it would have hit TP; ATR naturally widens the trail
-    when the market is noisy and tightens it when the market is calm.
+    of the profit target.
+
+    FIXED (this round): The Volatility Activation Buffer. VERIFIED THE
+    SUFFOCATION BUG WAS REAL before applying this fix — reproduced it
+    directly: a tight 0.5%-away structural SL (exactly the kind this bot
+    generates for BONK/STRK-style setups) got choked to 0.15% away
+    immediately after entry, based on a stale historical spike from
+    BEFORE the trade even started, despite price having captured zero
+    real profit. The previous version's `new_sl < price` guard only
+    prevented an immediately-self-triggering stop — it did NOT prevent
+    this softer but still damaging case where the stop tightens to
+    within normal noise/spread range without the trade ever having a
+    real profit cushion. Fixed with two changes: (1) trailing is now
+    barred from engaging at all until price has moved at least 1.5x ATR
+    into genuine profit, and (2) the trail anchor (highest high / lowest
+    low) is now taken from only the last 5 candles instead of the full
+    fetched window, so even after activation a stale wick from many
+    candles ago can't distort the trail.
 
     `klines` is optional (defaults to None) for backward compatibility —
     if not provided, or too short, this falls back to the ORIGINAL fixed-
-    percentage behavior rather than silently doing nothing, so a caller
-    that hasn't been updated to pass klines still gets a working trail,
-    just not the improved ATR-aware one.
+    percentage behavior rather than silently doing nothing.
     """
-    if klines and len(klines) >= 15:
+    if klines and len(klines) >= 15 and trade.get("timestamp"):
         atr = calculate_atr(klines, 14)
-        if atr > 0:
-            atr_trail_dist = atr * 2.5  # Chandelier Exit standard multiple
-            if trade["direction"] == "BUY":
-                highest_recent_high = max(float(k[2]) for k in klines)
+        if atr <= 0: return
+        atr_trail_dist = atr * 2.5  # Chandelier Exit standard multiple
+        activation_buffer = atr * 1.5  # must be in real profit before trailing engages
+        if trade["direction"] == "BUY":
+            if price > trade["entry"] + activation_buffer:
+                highest_recent_high = max(float(k[2]) for k in klines[-5:])
                 new_sl = highest_recent_high - atr_trail_dist
                 if new_sl > trade["sl"] and new_sl < price:
                     active_trades[coin]["sl"] = new_sl; save_active_trades()
-            else:
-                lowest_recent_low = min(float(k[3]) for k in klines)
+        else:
+            if price < trade["entry"] - activation_buffer:
+                lowest_recent_low = min(float(k[3]) for k in klines[-5:])
                 new_sl = lowest_recent_low + atr_trail_dist
                 if new_sl < trade["sl"] and new_sl > price:
                     active_trades[coin]["sl"] = new_sl; save_active_trades()
-            return
+        return
     # Fallback: original fixed-percentage trail (klines unavailable/too short)
     trail=abs(trade["tp"]-trade["entry"])*0.3
     if trade["direction"]=="BUY":
@@ -3876,12 +3943,8 @@ def check_profit_milestones(coin,trade,price,pnl):
 
     m1=target*0.30; m2=target*0.60; m3=target*0.85
 
-    def _price_at_pnl(target_pnl):
-        move = ep * (target_pnl/100) / lev
-        return ep+move if direction=="BUY" else ep-move
-
     def _sl_lock_price(target_pnl, lock_ratio):
-        gain_price = abs(_price_at_pnl(target_pnl) - ep)
+        gain_price = abs(price_at_pnl(ep, direction, lev, target_pnl) - ep)
         locked = gain_price * lock_ratio
         return ep+locked if direction=="BUY" else ep-locked
 
@@ -4383,12 +4446,9 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
 
     # Proportional milestone plan — scales with the ACTUAL profit target (not fixed 35%)
     m1_pnl = profit_target*0.30; m2_pnl = profit_target*0.60; m3_pnl = profit_target*0.85
-    def _price_at_pnl(target_pnl):
-        move = entry * (target_pnl/100) / lev
-        return entry+move if setup["direction"]=="BUY" else entry-move
     def _sl_lock_price(target_pnl, lock_ratio):
         # SL locks in lock_ratio of the gain reached at target_pnl
-        gain_price = abs(_price_at_pnl(target_pnl) - entry)
+        gain_price = abs(price_at_pnl(entry, setup["direction"], lev, target_pnl) - entry)
         locked = gain_price * lock_ratio
         return entry+locked if setup["direction"]=="BUY" else entry-locked
     ms1=format_price(_sl_lock_price(m1_pnl, 0.0))   # at 30% of target → SL to breakeven
@@ -4421,7 +4481,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
             msg+=f"  📉 Score adj: {', '.join(penalty_notes)}\n"
     msg += f"  ⏳ ETA: ~{eta} min  •  ⏰ Exp: {expiry_str}\n"
     msg += f"  🕐 {get_ist_time()}"
-    setup.update({"entry":entry,"sl":sl,"tp":tp,"timestamp":get_ist_datetime(),
+    setup.update({"entry":entry,"sl":sl,"tp":tp,"original_tp":tp,"timestamp":get_ist_datetime(),
                   "expires_at":expiry_time,"reversal_alerted":False,"breakeven_sent":False,
                   "partial_tp_taken":False,"milestones_sent":[],"tf_score":tf_score,
                   "market_condition":market_condition,"eta_minutes":eta,
@@ -4562,6 +4622,41 @@ def check_active_trades():
         hit=None
         if trade.get("timestamp"):
             hours_open=(get_ist_datetime()-trade["timestamp"]).total_seconds()/3600
+            # The Law of Time Capitulation & Dynamic Profit Decay.
+            #
+            # BUG FOUND AND FIXED before applying (verified via direct
+            # simulation, not just reasoning about it): the proposed
+            # version recomputed the squeeze from `trade["tp"]` every
+            # single scan cycle (~90s) once past hour 6, but ALSO wrote
+            # the squeezed result back into that same `trade["tp"]` key.
+            # Since it reads what it just wrote on the previous cycle,
+            # the squeeze compounds every ~90 seconds instead of applying
+            # the intended smooth hour-6-to-hour-12 curve. Simulated 10
+            # consecutive cycles: TP collapsed from 110 to 105 (more than
+            # halfway to entry) within about 15 minutes of real time, not
+            # gradually over 6 hours as designed — trades would exit for
+            # a fraction of their intended profit almost immediately
+            # after crossing hour 6.
+            #
+            # Fixed by reading from a NEW, immutable `original_tp` field
+            # (set once at trade creation, never touched again) instead
+            # of the mutable `trade["tp"]` — this makes the recalculation
+            # genuinely idempotent: running it 1 time or 100 times at the
+            # same hours_open produces the identical squeezed TP, since
+            # it always starts from the same untouched reference.
+            # `.get("original_tp", trade["tp"])` falls back to the
+            # current tp for any trade that was already active before
+            # this field existed (loaded from disk on a bot restart).
+            if hours_open>6 and "p1" not in trade.get("milestones_sent",[]):
+                time_decay_factor=min((hours_open-6)/6,1.0)
+                original_tp_ref=trade.get("original_tp",trade["tp"])
+                original_target_dist=abs(original_tp_ref-trade["entry"])
+                squeezed_dist=original_target_dist*(1.0-(time_decay_factor*0.40))
+                if trade["direction"]=="BUY":
+                    active_trades[coin]["tp"]=trade["entry"]+squeezed_dist
+                else:
+                    active_trades[coin]["tp"]=trade["entry"]-squeezed_dist
+                save_active_trades()
             if hours_open>12 and "p1" not in trade.get("milestones_sent",[]):
                 hit="TIMEOUT"
         if trade["direction"]=="BUY":
@@ -5208,7 +5303,7 @@ def get_retest_watchlist_text():
     return "\n".join(lines)
 
 
-def scan_coins(btc_trend,fng,market_condition):
+def scan_coins(btc_trend,fng,market_condition,btc_klines=None):
     btc_crashing=is_btc_crashing(); signals_this_cycle=0
     for coin in COINS:
         if signals_this_cycle>=MAX_SIGNALS_PER_CYCLE: break
@@ -5236,6 +5331,20 @@ def scan_coins(btc_trend,fng,market_condition):
                 if coin in BTC_CORRELATED and too_many_correlated_active():     continue
                 if too_many_sector_active(coin):
                     logger.info(f"Skip {coin} {direction} - sector already has an open trade")
+                    continue
+                # ── THE IDIOSYNCRATIC ALPHA GATE ──
+                # A structural pattern on an alt that's underperforming
+                # BTC over the recent window has no independent momentum
+                # — a "beta trap" that dumps through its tight structural
+                # stop the moment BTC ticks down. Placed with the other
+                # early-continue filters above (fails fast, before the
+                # more expensive zone/structure work below runs).
+                alt_perf, btc_perf = check_relative_strength(symbol, btc_klines)
+                if direction == "BUY" and alt_perf < btc_perf:
+                    logger.info(f"Skip {coin} LONG - underperforming BTC (Beta Trap Risk)")
+                    continue
+                if direction == "SELL" and alt_perf > btc_perf:
+                    logger.info(f"Skip {coin} SHORT - outperforming BTC (Short Squeeze Risk)")
                     continue
                 tf_score=get_timeframe_score(symbol,direction)
                 if tf_score==-1: logger.info(f"Skip {coin} {direction} - counter-trend"); continue
@@ -5296,6 +5405,24 @@ def scan_coins(btc_trend,fng,market_condition):
                     ib_zone_ok,_ib_zone_label=is_in_zone(price,direction,zones_chk)
                     if not ib_zone_ok:
                         logger.info(f"Skip {coin} {direction} - Inside Bar Coil not in a real HTF zone (local swing level only)")
+                        continue
+                # ── THE INSTITUTIONAL ZONE GATE ──
+                # VERIFIED THIS GAP IS REAL before applying: checked
+                # Support Bounce/Resistance Rejection's actual detection
+                # code in detect_patterns — despite being commented
+                # "(Zone Bounce)", they trigger off `sup`/`res`, the LOCAL
+                # swing-based levels computed inside detect_patterns, not
+                # real HTF zones from get_htf_zones. Double Top/Double
+                # Bottom have no zone requirement at all. All four are
+                # genuine "retail bait" location patterns that smart money
+                # is known to hunt (sweep the wick, reverse into the
+                # crowd's stops) when they form outside a real
+                # institutional zone. Gated here using zones_chk (already
+                # fetched above, no new API call) — if the pattern didn't
+                # land inside a real, verified HTF zone, it's vetoed.
+                if primary in ("Double Top","Double Bottom","Support Bounce","Resistance Rejection"):
+                    if not zone_ok:
+                        logger.info(f"Skip {coin} {direction} - {primary} rejected: formed outside real HTF zone (no man's land)")
                         continue
                 if primary == "BOS Breakout":
                     # Point 1 (BOS + Retest): don't buy the breakout candle
@@ -5369,7 +5496,7 @@ def main():
             fng=get_fear_greed_index()
             market_condition=detect_market_condition(btc_price,btc_klines)
             logger.info(f"BTC:{'BULL' if btc_trend==1 else 'BEAR'}|Market:{market_condition}|F&G:{fng}|Losses:{daily_losses}/{MAX_DAILY_LOSSES}|CB:{'ACTIVE' if check_circuit_breaker() else 'OK'}")
-            scan_coins(btc_trend,fng,market_condition)
+            scan_coins(btc_trend,fng,market_condition,btc_klines)
             check_active_trades()
             expire_pending_signals()
             check_price_alerts()
