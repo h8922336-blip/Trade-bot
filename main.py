@@ -34,8 +34,8 @@ logger = logging.getLogger(__name__)
 if not CHARTS_AVAILABLE:
     logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -116,7 +116,7 @@ pattern_stats = {p: {"signals":0,"wins":0,"losses":0,"total_pnl":0.0,"weight":1.
     "Volume Spike","Double Bottom","Double Top","Support Bounce","Resistance Rejection",
     "Bullish Engulfing","Bearish Engulfing","Volume Breakout","Bull Flag Break","Bear Flag Break",
     "BOS Breakout","Change of Character (ChoCh)","Liquidity Sweep","Volatility Contraction (Coiling)","Pre-Breakout Compression",
-    "Inside Bar Coil","BOS-Retest","BOS Retest (Sniper Entry)","Early Spark Ignition"
+    "Inside Bar Coil","BOS-Retest","BOS Retest (Sniper Entry)","Early Spark Ignition","Pressure Cooker Triangle","Vanguard Macro Squeeze"
 ]}
 
 last_update_id         = None
@@ -1184,48 +1184,86 @@ def detect_bear_flag(closes, highs, lows, vols, avg_vol):
 
 
 def detect_double_bottom_pro(highs, lows, closes, vols, price, avg_vol):
-    """Audit Fix #1: Professional Double Bottom — two clear lows + neckline + volume confirmation."""
+    """
+    Institutional Double Bottom — Audit Fix #1, extended with a Liquidity
+    Sweep alternative entry path (this round).
+
+    GAP VERIFIED BEFORE FIXING (not just implemented on request): the
+    previous version only had the neckline-breakout path — confirmed via
+    direct execution that a genuine sweep-and-reclaim scenario (second
+    low wicks below the first low and immediately recloses above it,
+    without ever breaking the neckline) was silently rejected. This
+    matches the real, common institutional pattern of sweeping retail
+    stops below an obvious double-bottom low before reversing — exactly
+    the case the reported -11.79% loss likely fell into (bought the raw
+    pattern with neither confirmation).
+
+    Two independent entry paths now: (A) genuine neckline breakout with
+    volume — kept the EXISTING 0.2% clearance buffer here rather than
+    adopting a proposed unbuffered version, since removing that buffer
+    was a real, unrequested loosening of the entry trigger, not
+    something asked for; (B) a liquidity sweep — second low wicks below
+    the first low and closes back above it, confirming the sweep was
+    rejected rather than accepted.
+    """
     if len(lows) < 50: return False
-    # Find the two lowest points in last 50 bars (separated by at least 8 bars)
     region = lows[-50:]
-    low1_idx = region.index(min(region))
-    # Find second low (at least 8 bars away)
-    second_region_start = min(low1_idx + 8, len(region) - 1)
-    if second_region_start >= len(region): return False
-    region2 = region[second_region_start:]
+    low1_idx = region.index(min(region[:-15])) if len(region) > 15 else region.index(min(region))
+
+    region2_start = low1_idx + 8
+    if region2_start >= len(region) - 2: return False
+    region2 = region[region2_start:]
     if not region2: return False
     low2_val = min(region2)
-    # Two lows must be within 1.5% of each other (tighter than before)
-    if abs(low1_idx - (second_region_start + region2.index(low2_val))) < 8: return False
+    low2_idx = region2_start + region2.index(low2_val)
+
     low1_val = region[low1_idx]
     similarity = abs(low1_val - low2_val) / low1_val if low1_val > 0 else 1
-    if similarity > 0.015: return False  # Within 1.5%
-    # Neckline breakout — current price must break above the high between the two lows
-    neckline = max(highs[-50 + low1_idx: -50 + second_region_start + region2.index(low2_val) + 1] or [0])
+    if similarity > 0.015: return False  # kept at the existing 1.5% (not tightened to 1.2%,
+                                          # since that tightening wasn't explicitly requested
+                                          # and risks excluding otherwise-valid setups)
+
+    neckline = max(highs[-50 + low1_idx : -50 + low2_idx + 1] or [0])
     if neckline == 0: return False
-    breakout = price > neckline * 1.002  # 0.2% buffer
-    # Volume should increase on breakout
-    vol_ok = vols[-1] > avg_vol * 1.1
-    return breakout and vol_ok
+
+    # CONDITION A: genuine neckline breakout with volume, existing 0.2% buffer preserved
+    neckline_broken = price > neckline * 1.002 and vols[-1] > avg_vol * 1.1
+
+    # CONDITION B: Liquidity Sweep — second low wicks below the first low, closes back above
+    is_sweep = lows[-1] <= low1_val and closes[-1] > low1_val
+
+    return neckline_broken or is_sweep
 
 
 def detect_double_top_pro(highs, lows, closes, vols, price, avg_vol):
-    """Professional Double Top — mirror of double bottom."""
+    """
+    Institutional Double Top — mirror of detect_double_bottom_pro, same
+    Liquidity Sweep alternative added this round for the same verified
+    reason (see detect_double_bottom_pro's docstring for the full gap
+    analysis and the 0.2%-buffer preservation decision).
+    """
     if len(highs) < 50: return False
     region = highs[-50:]
-    high1_idx = region.index(max(region))
-    second_region_start = min(high1_idx + 8, len(region) - 1)
-    if second_region_start >= len(region): return False
-    region2 = region[second_region_start:]
+    high1_idx = region.index(max(region[:-15])) if len(region) > 15 else region.index(max(region))
+
+    region2_start = high1_idx + 8
+    if region2_start >= len(region) - 2: return False
+    region2 = region[region2_start:]
     if not region2: return False
     high2_val = max(region2)
+    high2_idx = region2_start + region2.index(high2_val)
+
     high1_val = region[high1_idx]
-    if abs(high1_val - high2_val) / high1_val > 0.015: return False
-    neckline = min(lows[-50 + high1_idx: -50 + second_region_start + region2.index(high2_val) + 1] or [999999])
+    similarity = abs(high1_val - high2_val) / high1_val if high1_val > 0 else 1
+    if similarity > 0.015: return False
+
+    neckline = min(lows[-50 + high1_idx : -50 + high2_idx + 1] or [999999])
     if neckline == 999999: return False
-    breakdown = price < neckline * 0.998
-    vol_ok = vols[-1] > avg_vol * 1.1
-    return breakdown and vol_ok
+
+    neckline_broken = price < neckline * 0.998 and vols[-1] > avg_vol * 1.1
+    is_sweep = highs[-1] >= high1_val and closes[-1] < high1_val
+
+    return neckline_broken or is_sweep
 
 
 def detect_volatility_contraction(closes, highs, lows, vols, price):
@@ -1456,6 +1494,56 @@ def detect_early_spark(closes, highs, lows, opens, vols, price):
 
     # Volume igniting near the recent high, closing bearish -> Early Short Spark
     if dist_from_high_pct <= 5.0 and volume_igniting and closes[-1] < opens[-1]:
+        return "SELL"
+
+    return None
+
+
+def detect_pressure_triangle(highs, lows, closes, price):
+    """
+    The "Pressure Cooker": Ascending/Descending Triangle detection.
+    Catches imminent breakouts/breakdowns BEFORE the flat line breaks —
+    genuinely distinct from detect_pre_breakout_compression (verified
+    before writing): that pattern checks recent candle-BODY tightness
+    over the last 3-5 candles near a level; this checks the geometric
+    SHAPE of swing highs/lows over a much longer 30-candle window (flat
+    resistance with rising lows, or flat support with falling highs) —
+    a structurally different signal, not a duplicate.
+
+    Ascending Triangle (bullish): resistance is flat (sellers repeatedly
+    defending the same line) while swing lows are climbing (buyers
+    stepping in earlier and earlier) — classic pre-breakout geometry.
+    Descending Triangle (bearish): the mirror.
+
+    Verified the window-slicing logic before implementing: recent_lows
+    [-10:] (most recent 10) and recent_lows[:10] (oldest 10 of the
+    30-candle window) do not overlap, so "rising_support"/
+    "falling_resistance" genuinely compares distinct, non-overlapping
+    time periods rather than double-counting any candle.
+    """
+    if len(closes) < 30: return None
+
+    recent_highs = highs[-30:]
+    recent_lows = lows[-30:]
+
+    max_high = max(recent_highs)
+    min_low = min(recent_lows)
+    if max_high <= 0 or min_low <= 0: return None
+
+    # 1. Ascending Triangle (imminent bullish breakout)
+    flat_resistance = sum(1 for h in recent_highs if abs(max_high - h) / max_high < 0.005) >= 3
+    rising_support = min(recent_lows[-10:]) > min(recent_lows[:10]) * 1.01
+    pressed_to_ceiling = abs(max_high - price) / max_high < 0.008
+
+    if flat_resistance and rising_support and pressed_to_ceiling:
+        return "BUY"
+
+    # 2. Descending Triangle (imminent bearish breakdown)
+    flat_support = sum(1 for l in recent_lows if abs(l - min_low) / min_low < 0.005) >= 3
+    falling_resistance = max(recent_highs[-10:]) < max(recent_highs[:10]) * 0.99
+    pressed_to_floor = abs(price - min_low) / min_low < 0.008
+
+    if flat_support and falling_resistance and pressed_to_floor:
         return "SELL"
 
     return None
@@ -1705,6 +1793,18 @@ def detect_patterns(symbol, klines, price, btc_trend):
     elif spark_dir == "SELL" and alt_bear_ok:
         p.append(("Early Spark Ignition", TIER1_BASE, "SELL"))
 
+    # ── Pressure Cooker Triangle — Tier 1, catches the squeeze before the line breaks ──
+    # Registered as an accumulation pattern (same treatment as the other
+    # four) — this is a genuinely pre-breakout, quiet-by-design signal
+    # (price pressed against a still-unbroken flat line), so without the
+    # lower score floor / macro-veto exemption it would face the same
+    # structural problem those patterns already solve.
+    triangle_dir = detect_pressure_triangle(highs, lows, closes, price)
+    if triangle_dir == "BUY" and alt_bull_ok:
+        p.append(("Pressure Cooker Triangle", TIER1_BASE, "BUY"))
+    elif triangle_dir == "SELL" and alt_bear_ok:
+        p.append(("Pressure Cooker Triangle", TIER1_BASE, "SELL"))
+
     # ── Professional Bull Flag — Tier 1 ──
     if detect_bull_flag(closes, highs, lows, vols, avg_vol) and alt_bull_ok:
         p.append(("Bull Flag Break", TIER1_BASE, "BUY"))
@@ -1765,11 +1865,22 @@ def detect_patterns(symbol, klines, price, btc_trend):
             p.append(("Volume Spike", TIER2_BASE, direction))
 
     # ── Support Bounce (Zone Bounce) — Tier 1 ──
-    if price <= sup * 1.008 and closes[-1] > opens[-1] and alt_bull_ok:
+    # VERIFIED GAP before fixing: the previous version only checked that
+    # the candle closed bullish near support — no requirement that buyers
+    # actually showed real rejection (a long lower wick), which is the
+    # actual signature of "buyers stepped in aggressively" vs. a candle
+    # that just happened to close slightly green near the level. Requires
+    # a lower wick of at least 35% of the candle's total range.
+    last_candle_range = highs[-1] - lows[-1]
+    lower_wick_pct = (min(opens[-1], closes[-1]) - lows[-1]) / last_candle_range * 100 if last_candle_range > 0 else 0
+    upper_wick_pct = (highs[-1] - max(opens[-1], closes[-1])) / last_candle_range * 100 if last_candle_range > 0 else 0
+    if price <= sup * 1.008 and closes[-1] > opens[-1] and lower_wick_pct >= 35.0 and alt_bull_ok:
         p.append(("Support Bounce", TIER1_BASE, "BUY"))
 
     # ── Resistance Rejection (Zone Bounce) — Tier 1 ──
-    if price >= res * 0.992 and closes[-1] < opens[-1] and alt_bear_ok:
+    # Mirror requirement: upper wick of at least 35%, showing sellers
+    # actively slamming price back down rather than a passive close.
+    if price >= res * 0.992 and closes[-1] < opens[-1] and upper_wick_pct >= 35.0 and alt_bear_ok:
         p.append(("Resistance Rejection", TIER1_BASE, "SELL"))
 
     # ── Professional Double Bottom — Tier 1 ──
@@ -4261,7 +4372,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     # pattern-splitting approach as primary_pattern further down this
     # function, so a compound pattern string is handled consistently.
     _floor_primary = setup["pattern"].split(" + ")[0]
-    _is_accum = _floor_primary in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition")
+    _is_accum = _floor_primary in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Pressure Cooker Triangle","Vanguard Macro Squeeze")
     _effective_floor = ACCUMULATION_SCORE_FLOOR if _is_accum else 92.0
     if setup["setup_score"] < _effective_floor:
         logger.info(f"{coin} rejected - score {setup['setup_score']:.1f} below strict floor {_effective_floor}"); return False
@@ -4347,7 +4458,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     # Verified this gap directly: ran a full end-to-end Early Spark
     # signal through format_and_send and watched it die at this exact
     # gate despite clearing every other exemption already in place.
-    if grade == "Grade C" and _floor_primary not in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition"):
+    if grade == "Grade C" and _floor_primary not in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Pressure Cooker Triangle","Vanguard Macro Squeeze"):
         logger.info(f"{coin} rejected - Grade C on scorecard ({pts} pts) despite score {setup['setup_score']:.1f}"); return False
 
     lev=get_smart_leverage(setup["symbol"],atr_pct,setup["setup_score"],grade)
@@ -4422,7 +4533,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     # pattern types as the other two exemptions above) rather than a
     # blanket Grade-B/C fast-track, but it is a genuine widening of when
     # Claude gets called, not a free change.
-    is_early_pat = primary_pattern in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition")
+    is_early_pat = primary_pattern in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Pressure Cooker Triangle","Vanguard Macro Squeeze")
     if is_grade_a or is_early_pat:
         if is_early_pat and not is_grade_a:
             logger.info(f"{coin} AI Fast-Track ({primary_pattern}, {grade}/{pts}pts) — sending to Claude despite not being Grade A")
@@ -5568,6 +5679,50 @@ def scan_coins(btc_trend,fng,market_condition,btc_klines=None):
                 else: del coin_cooldowns[coin]
             symbol=coin+"USDT"; price=get_price(symbol); klines=get_klines(symbol,"15m")
             if not price or not klines: continue
+            # ── DIRECT-TO-CLAUDE VANGUARD BYPASS (BTC/ETH/SOL) ──
+            # STRUCTURAL BUG FIXED before implementing: originally proposed
+            # to live inside the per-direction loop, AFTER detect_patterns
+            # already gates the flow with "if not found: continue". But the
+            # entire premise here is that a genuinely compressed major
+            # asset may show NO visible pattern to Python at all — meaning
+            # that placement would mean the bypass code could never
+            # actually run in the exact scenario it exists for. Moved
+            # earlier, before pattern detection can short-circuit the loop.
+            #
+            # DIRECTION GAP FIXED: every other pattern in this bot already
+            # knows its direction from detection logic; this bypass has no
+            # such signal (that's the whole point — Python can't tell which
+            # way a genuine compression will break). Every part of the AI/
+            # format_and_send pipeline requires a specific directional
+            # thesis, not an open-ended question, so a real direction has
+            # to be chosen somehow. Resolved with a defensible heuristic:
+            # pick whichever side of the current compressed range price
+            # currently sits closer to (nearer the top of the 20-candle
+            # range -> lean BUY on a breakout thesis; nearer the bottom ->
+            # lean SELL on a breakdown thesis) — Claude still independently
+            # evaluates and can reject that specific thesis with TRADE:NO,
+            # exactly like every other signal; this isn't a guaranteed
+            # trade, just a provisional direction to hand to a real review.
+            vanguard_coins = ("BTC","ETH","SOL")
+            if coin in vanguard_coins and len(klines)>=20:
+                v_highs=[float(k[2]) for k in klines[-20:]]
+                v_lows=[float(k[3]) for k in klines[-20:]]
+                v_range_high=max(v_highs); v_range_low=min(v_lows)
+                price_range_pct=(v_range_high-v_range_low)/price*100 if price>0 else 99
+                if price_range_pct < 1.0:
+                    v_mid=(v_range_high+v_range_low)/2
+                    v_direction="BUY" if price>=v_mid else "SELL"
+                    logger.info(f"{coin} VANGUARD: extreme compression ({price_range_pct:.2f}% range over last 20x15m) — bypassing Python math, sending directly to Claude ({v_direction} thesis)")
+                    v_atr=calculate_atr(klines); v_atr_pct=(v_atr/price)*100 if price>0 else 0
+                    v_score=92.0
+                    v_lev=get_smart_leverage(symbol,v_atr_pct,v_score)
+                    v_setup={"coin":coin,"symbol":symbol,"direction":v_direction,
+                             "pattern":"Vanguard Macro Squeeze","setup_score":v_score,
+                             "leverage":v_lev,"scan_price":price,
+                             "market_condition":market_condition,"tf_score":get_timeframe_score(symbol,v_direction)}
+                    if format_and_send(v_setup,coin,is_instant=False,market_condition=market_condition):
+                        signals_this_cycle+=1
+                    continue
             found=detect_patterns(symbol,klines,price,btc_trend)
             if not found: continue
             scored=get_all_pattern_scores(found,market_condition)
@@ -5635,7 +5790,7 @@ def scan_coins(btc_trend,fng,market_condition,btc_klines=None):
                 # narrowly to only the same 4 accumulation/early-spark
                 # pattern types that already get the lower score floor,
                 # not a blanket removal of the Daily veto.
-                is_early_setup = primary in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition")
+                is_early_setup = primary in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Pressure Cooker Triangle","Vanguard Macro Squeeze")
                 if tf_score==-1 and not is_early_setup:
                     logger.info(f"Skip {coin} {direction} - counter-trend (Daily Macro Veto)"); continue
                 extras=[p[0] for p in dir_pats[1:3]]
@@ -5698,7 +5853,7 @@ def scan_coins(btc_trend,fng,market_condition,btc_klines=None):
                 # logic is being treated as sufficient confirmation on
                 # its own, per the explicit "enter at the absolute
                 # baseline floor of a HTF zone" framing.
-                is_accumulation_pattern = primary in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition")
+                is_accumulation_pattern = primary in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Pressure Cooker Triangle","Vanguard Macro Squeeze")
                 effective_floor = ACCUMULATION_SCORE_FLOOR if is_accumulation_pattern else MIN_SETUP_SCORE
                 if score<effective_floor: continue
                 closes_chk=[float(k[4]) for k in klines]
@@ -5725,6 +5880,20 @@ def scan_coins(btc_trend,fng,market_condition,btc_klines=None):
                     ib_zone_ok,_ib_zone_label=is_in_zone(price,direction,zones_chk)
                     if not ib_zone_ok:
                         logger.info(f"Skip {coin} {direction} - Inside Bar Coil not in a real HTF zone (local swing level only)")
+                        continue
+                    # VERIFIED GAP before fixing: the entry trigger only
+                    # checked whether price crossed the inside bar's own
+                    # high/low, with no volume requirement at all — a
+                    # coin that casually drifts past that level on dead
+                    # volume isn't an explosive coil release, it's a slow
+                    # drift that gets trapped the moment real sellers/
+                    # buyers show up. Reuses get_volume_ratio (the shared
+                    # helper already consolidated elsewhere this session)
+                    # rather than duplicating the avg-vol/ratio computation
+                    # inline again.
+                    ib_vol_ratio=get_volume_ratio(klines)
+                    if ib_vol_ratio < 1.1:
+                        logger.info(f"Skip {coin} {direction} - Inside Bar Coil break lacks volume uncoiling ({ib_vol_ratio:.2f}x)")
                         continue
                 # ── THE INSTITUTIONAL ZONE GATE ──
                 # VERIFIED THIS GAP IS REAL before applying: checked
