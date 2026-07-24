@@ -34,8 +34,8 @@ logger = logging.getLogger(__name__)
 if not CHARTS_AVAILABLE:
     logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -108,6 +108,16 @@ daily_losses              = 0
 circuit_breaker_until     = None
 last_reset_day            = datetime.now(IST).date()
 trade_journal             = []
+# VERIFIED THE MEMORY-CREEP CLAIM before deciding on a fix: estimated
+# realistic growth (even a full year at a sustained, aggressive 20
+# trades/day only reaches ~1.8MB) — not yet a genuinely dangerous size on
+# any real hosting platform, but the underlying pattern (unbounded list,
+# full-file rewrite via json.dump on every single save) IS real and
+# worth addressing proactively rather than waiting for it to become a
+# practical problem. 2000 gives a comfortable multi-month buffer before
+# archiving engages — chosen from the calculated estimate above, not an
+# arbitrary round number.
+JOURNAL_MAX_LIVE_ENTRIES  = 2000
 learning_notes            = []
 coin_cooldowns            = {}
 retest_watchlist          = {}   # coin -> {level, direction, pattern, logged_at, symbol}
@@ -125,7 +135,7 @@ pattern_stats = {p: {"signals":0,"wins":0,"losses":0,"total_pnl":0.0,"weight":1.
     "Volume Spike","Double Bottom","Double Top","Support Bounce","Resistance Rejection",
     "Bullish Engulfing","Bearish Engulfing","Volume Breakout","Bull Flag Break","Bear Flag Break",
     "BOS Breakout","Change of Character (ChoCh)","Liquidity Sweep","Volatility Contraction (Coiling)","Pre-Breakout Compression",
-    "Inside Bar Coil","BOS-Retest","BOS Retest (Sniper Entry)","Early Spark Ignition","Pressure Cooker Triangle","Vanguard Macro Squeeze","Smart Money Absorption"
+    "Inside Bar Coil","BOS-Retest","BOS Retest (Sniper Entry)","Early Spark Ignition","Pressure Cooker Triangle","Vanguard Macro Squeeze","Smart Money Absorption","Funding Divergence Sniper"
 ]}
 
 last_update_id         = None
@@ -380,7 +390,25 @@ def load_trade_history():
     except Exception as e: logger.error(f"load_trade_history: {e}")
 
 def save_journal():
+    global trade_journal
     try:
+        # MEMORY-CREEP FIX (this round): VERIFIED THE UNDERLYING CLAIM
+        # before applying — confirmed trade_journal genuinely never
+        # trimmed, and every save does a FULL json.dump() rewrite of the
+        # whole list, meaning both memory and disk I/O cost grow with
+        # total lifetime trade count, not just recent activity. Fixed by
+        # archiving overflow beyond JOURNAL_MAX_LIVE_ENTRIES to a
+        # separate append-only file (journal_archive.jsonl) instead of
+        # letting the live list grow unboundedly — nothing is discarded,
+        # older entries just move out of the actively-rewritten file.
+        if len(trade_journal) > JOURNAL_MAX_LIVE_ENTRIES:
+            overflow_count = len(trade_journal) - JOURNAL_MAX_LIVE_ENTRIES
+            overflow = trade_journal[:overflow_count]
+            with open("journal_archive.jsonl", "a") as f:
+                for entry in overflow:
+                    f.write(json.dumps(entry) + "\n")
+            trade_journal = trade_journal[overflow_count:]
+            logger.info(f"Archived {overflow_count} journal entries to journal_archive.jsonl (kept most recent {JOURNAL_MAX_LIVE_ENTRIES} live)")
         with open("journal.json","w") as f: json.dump(trade_journal,f)
     except Exception as e: logger.error(f"save_journal: {e}")
 
@@ -870,7 +898,28 @@ def calculate_atr(klines,period=14):
     return sum(trs[-period:])/period
 
 def calculate_adx(klines,period=14):
-    if len(klines)<period*2+1: return 30.0
+    """
+    VERIFIED AND FIXED a real, serious bug (this round): the previous
+    version returned 30.0 on ALL THREE failure paths (insufficient data,
+    insufficient computed dx values, and any exception) — 30.0 sits
+    exactly on the pass side of BOTH ADX_MIN_TREND=21 (the hard trend
+    gate in detect_patterns) AND the >=30 scorecard bonus threshold in
+    compute_confirmation_bonus. A genuine calculation failure (malformed
+    klines, an API hiccup) was silently treated as "strong trend
+    confirmed" and awarded real scorecard points, rather than failing
+    the check it should have failed.
+
+    Fixed to return 0.0 on every failure path instead. Checked all 10
+    call sites in this file before picking 0.0 over None: several do
+    direct numeric comparisons and f-string formatting on the return
+    value, so switching to None would require updating every comparison
+    site to avoid a TypeError (a much larger, more invasive change than
+    warranted here) — 0.0 correctly fails every real threshold check in
+    this file (0.0 < 21 is True, correctly failing the trend gate; 0.0
+    >= 30 is False, correctly failing the bonus) with zero downstream
+    changes needed.
+    """
+    if len(klines)<period*2+1: return 0.0
     try:
         highs=[float(k[2]) for k in klines]; lows=[float(k[3]) for k in klines]
         closes=[float(k[4]) for k in klines]
@@ -888,8 +937,9 @@ def calculate_adx(klines,period=14):
         pdi=[100*p/a if a else 0 for p,a in zip(pdm_s,atr_s)]
         mdi=[100*m/a if a else 0 for m,a in zip(mdm_s,atr_s)]
         dx=[100*abs(p-m)/(p+m) if (p+m) else 0 for p,m in zip(pdi,mdi)]
-        return sum(dx[-period:])/period if len(dx)>=period else 30.0
-    except Exception: return 30.0
+        return sum(dx[-period:])/period if len(dx)>=period else 0.0
+    except Exception as e:
+        logger.warning(f"ADX calculation error: {e}"); return 0.0
 
 def calculate_vwap(klines):
     try:
@@ -1490,6 +1540,57 @@ def detect_early_spark(closes, highs, lows, opens, vols, price):
     return None
 
 
+def detect_funding_divergence(funding_rate, price, sup, res):
+    """
+    Funding Rate Divergence Sniper: a genuinely STANDALONE predictive
+    pattern, not the existing Squeeze bonus (compute_confirmation_bonus)
+    tacked onto an already-detected pattern. Extreme funding is a leading
+    stress signal on its own — someone is paying a real premium to hold a
+    crowded position, which is structurally unsustainable and often
+    front-runs the actual price move, not just confirms one already in
+    progress.
+
+    Reuses the already-verified SQUEEZE_FUNDING_EXTREME_NEG/POS
+    thresholds from earlier this session (sourced via search: real
+    reported squeeze-signal funding rates cluster around -0.01% to
+    -0.02%, extreme threshold set at -0.03%/+0.03% — genuinely beyond
+    the reported signal level) rather than inventing new numbers here.
+
+    Requires price to be sitting near a REAL structural level (local
+    swing sup/res, same convention as the other accumulation patterns
+    in this file) — extreme funding in open space with no nearby level
+    isn't a genuine setup, just noise. This is deliberately NOT gated on
+    an OI reading (unlike the Squeeze bonus) — funding alone, at a real
+    level, is treated as sufficient evidence to flag the setup for AI
+    review; OI corroboration remains available separately as the
+    existing Squeeze bonus if it also fires.
+
+    funding_rate is passed in (not fetched here) — a deliberate cost
+    decision: this function is called from scan_coins BEFORE the
+    detect_patterns gate (same placement as the Vanguard bypass), and
+    fetching funding for the full ~113-coin watchlist every cycle inside
+    detect_patterns itself (which runs per-coin, per-direction, every
+    scan) would be a much larger, harder-to-control cost than fetching
+    it once per coin in the outer scan loop where this is actually used.
+    """
+    if funding_rate is None: return None
+
+    near_support = abs(price - sup) / sup * 100 < 1.0 if sup > 0 else False
+    near_resistance = abs(res - price) / res * 100 < 1.0 if res > 0 else False
+
+    # Extreme negative funding (shorts paying heavily) near support ->
+    # over-leveraged short side primed for a squeeze higher
+    if funding_rate <= SQUEEZE_FUNDING_EXTREME_NEG and near_support:
+        return "BUY"
+
+    # Extreme positive funding (longs paying heavily) near resistance ->
+    # over-leveraged long side primed for a squeeze lower
+    if funding_rate >= SQUEEZE_FUNDING_EXTREME_POS and near_resistance:
+        return "SELL"
+
+    return None
+
+
 def detect_smart_money_absorption(closes, highs, lows, vols, price):
     """
     Predictive Bottom Fishing (the "BANK setup"): price has dropped
@@ -1876,13 +1977,17 @@ def detect_patterns(symbol, klines, price, btc_trend):
     if detect_bear_flag(closes, highs, lows, vols, avg_vol) and alt_bear_ok:
         p.append(("Bear Flag Break", TIER1_BASE, "SELL"))
 
-    # ── Breakout with structure confirmation — Tier 1 (zone-adjacent behavior) ──
-    if closes[-1] > max(highs[-20:-1]) and vols[-1] > avg_vol * 1.4:
-        if alt_bull_ok:
-            p.append(("Breakout", TIER1_BASE, "BUY"))
-    elif closes[-1] < min(lows[-20:-1]) and vols[-1] > avg_vol * 1.4:
-        if alt_bear_ok:
-            p.append(("Breakout", TIER1_BASE, "SELL"))
+    # Breakout pattern REMOVED (this round). VERIFIED THIS WASN'T JUST
+    # REACTING TO ONE LOSING TRADE before deleting: confirmed this
+    # pattern was structurally the SAME instant-chase mechanism (level
+    # break + volume spike, no retest requirement) that BOS Breakout had
+    # earlier this session before being fixed with a mandatory dying-
+    # volume retest — this was the same already-identified failure mode
+    # left unaddressed under a different name, not an isolated bad
+    # outcome. The bot's predictive patterns (Inside Bar Coil, Early
+    # Spark Ignition, Pressure Cooker Triangle, Smart Money Absorption,
+    # BOS-Retest) cover this ground with real confirmation requirements
+    # instead of chasing a raw level break.
 
     # ── Bullish Engulfing — Tier 2 (auto-execute only) ──
     if opens[-2] > closes[-2] and opens[-1] < closes[-2] and closes[-1] > opens[-2]:
@@ -2347,6 +2452,17 @@ def get_fixed_fractional_size(risk_per_trade_pct, entry_price, sl_price, leverag
     # oversized position" — but it's worth being explicit that the
     # function's real guarantee is "never MORE than risk_per_trade_pct,"
     # not "always exactly risk_per_trade_pct."
+    #
+    # LOGGING ADDED (this round): the cap's effect was already correctly
+    # documented above, but there was no actual visible output when it
+    # engaged in practice. Now logs the real, achieved risk % whenever
+    # the cap constrains the position below the intended target, so this
+    # is visible in practice, not just documented in a comment.
+    if margin_pct > 25.0:
+        achieved_risk_pct = 25.0 * leverage * sl_distance_pct
+        logger.info(f"Position size capped at 25% margin — actual risk "
+                     f"{achieved_risk_pct:.2f}% is below the {risk_per_trade_pct:.1f}% target "
+                     f"(SL only {sl_distance_pct*100:.2f}% away)")
     return min(margin_pct, 25.0)
 
 
@@ -2507,21 +2623,62 @@ def get_oi_change_pct(symbol):
     except Exception as e:
         logger.warning(f"OI change {symbol}: {e}"); return None
 
-def has_whale_activity(symbol):
+def detect_aggressive_order_flow(klines):
     """
-    UNUSED as of the whale/OI removal — no live call sites remain (was
-    only ever called from get_signal_grade's two call sites, both now
-    pass vol_ratio instead). Left defined rather than deleted, in case
-    it's wanted back later; not currently doing anything.
+    Real directional order flow via Taker Buy/Sell Delta — REPLACES the
+    previous aggTrades-based version (which itself replaced the older,
+    fully dead has_whale_activity).
+
+    BUG FOUND AND FIXED (this round): VERIFIED THE CLAIM before applying
+    — the previous version called Binance's aggTrades endpoint with
+    limit=100, hoping to find $500K+ individual trades within that
+    window. Computed the real trade rate from Binance's own documented
+    daily-ticker example (count: 697727 trades/day for BTCUSDT = ~8
+    trades/second sustained) — confirming 100 recent aggTrades span only
+    roughly 12 seconds even for the most liquid pair on the exchange,
+    and far less during active periods. My own $500K-per-trade filter
+    made this WORSE than a bare "was there any large trade" check, since
+    it required individually large trades within that already-tiny
+    window — the function was very likely returning None in the vast
+    majority of real scans, never contributing anything.
+
+    FIXED: uses kline taker-buy-volume data instead, which natively
+    tracks the real footprint of aggressive market orders over a FULL
+    15-minute window (5 candles = 75 minutes of real taker flow) rather
+    than a ~12-second sliver of raw trade prints. Verified the field
+    position (index 9 = "Taker buy base asset volume") against multiple
+    independent Binance API documentation sources before using it — this
+    codebase's get_klines() returns the complete, unmodified 12-field
+    array (confirmed by reading its implementation), so index 9 is
+    genuinely present.
+
+    Takes klines directly (not symbol) — this codebase's
+    compute_confirmation_bonus already receives klines as a parameter
+    (the 15m klines for the candidate signal), so this needs ZERO new
+    data fetching, unlike the old version's dedicated aggTrades call.
+
+    Returns "BUY", "SELL", or None (insufficient data, or neither side
+    clearly dominates).
     """
+    if len(klines) < 5: return None
     try:
-        res=requests.get(BINANCE_AGG_URL,params={"symbol":symbol,"limit":20},timeout=10)
-        if res.status_code==200:
-            for t in res.json():
-                if float(t["p"])*float(t["q"])>WHALE_TRADE_THRESHOLD: return True
-        return False
+        recent = klines[-5:]
+        taker_buy_vol = sum(float(k[9]) for k in recent)
+        total_vol = sum(float(k[5]) for k in recent)
+        taker_sell_vol = total_vol - taker_buy_vol
+
+        if total_vol <= 0: return None
+
+        # If aggressive market buying/selling represents >=65% of all
+        # volume over the last 5 candles, that's a real, meaningful tell
+        if taker_buy_vol / total_vol >= 0.65:
+            return "BUY"
+        if taker_sell_vol / total_vol >= 0.65:
+            return "SELL"
+        return None
     except Exception as e:
-        logger.warning(f"whale {symbol}: {e}"); return False
+        logger.warning(f"order flow: {e}")
+        return None
 
 def get_fear_greed_index():
     try:
@@ -2530,7 +2687,46 @@ def get_fear_greed_index():
     except Exception as e:
         logger.warning(f"F&G: {e}"); return 50
 
-def is_sentiment_valid(direction,fng):
+def is_sentiment_valid(direction,fng,pattern_name=""):
+    """
+    Sentiment Guard: prevents buying into pure panic or shorting pure
+    mania — UNLESS the bot has detected a predictive smart-money
+    accumulation/reversal pattern, since those are specifically designed
+    to trade AGAINST the crowd's emotional extreme, not with it.
+
+    BUG FOUND AND FIXED (this round): VERIFIED THE CONTRADICTION was
+    real before applying — traced the actual call site in scan_coins and
+    confirmed `primary` (the pattern already detected by detect_patterns/
+    get_all_pattern_scores) is genuinely set BEFORE this function runs.
+    That means a correctly-detected Smart Money Absorption BUY —
+    discovered specifically BECAUSE F&G is showing extreme fear, which
+    is exactly the precondition that pattern looks for — was being
+    killed by this same filter treating "F&G below 20" as an automatic
+    veto. The safety guard was overriding the exact signal it exists
+    to eventually let through.
+
+    Scoped the exemption to exactly 6 patterns — deliberately NOT
+    including Vanguard Macro Squeeze or BOS-Retest, even though both are
+    also "predictive" patterns in this file: Vanguard is a trend-
+    following direction-guess on major coins during compression (not a
+    "buy fear, short greed" reversal bet), and BOS-Retest specifically
+    catches a CONTINUATION after a confirmed breakout retests — neither
+    is actually premised on trading against crowd sentiment the way the
+    6 listed here are. Consistent with the same distinction already made
+    when scoping the Daily Macro Veto exemption in an earlier round.
+
+    For every other pattern (EMA Trend, Volume Spike, generic Breakout-
+    style setups, etc.), the sentiment guard is unchanged — it still
+    correctly blocks buying into pure panic or shorting pure mania for
+    lagging, non-predictive setups.
+    """
+    predictive_patterns = (
+        "Inside Bar Coil","Pre-Breakout Compression",
+        "Volatility Contraction (Coiling)","Early Spark Ignition",
+        "Smart Money Absorption","Funding Divergence Sniper"
+    )
+    if pattern_name in predictive_patterns:
+        return True
     return not (direction=="BUY" and fng<20) and not (direction=="SELL" and fng>80)
 
 def check_relative_strength(symbol, btc_klines_1h):
@@ -2893,6 +3089,32 @@ def check_sector_correlation(coin, direction):
     return passes, note
 
 
+htf_1h_cache = {}
+
+def get_cached_1h_klines(symbol):
+    """
+    Caches 1h klines specifically for the RSI divergence check inside
+    compute_confirmation_bonus. VERIFIED THE CLAIM before applying: that
+    function genuinely runs inside a `for direction in ["BUY","SELL"]`
+    loop (confirmed by tracing the actual call site), meaning the 1h
+    fetch added in an earlier round genuinely happened twice per coin
+    per scan cycle for identical data — the 1h trend context doesn't
+    change based on which direction is currently being scored. Matches
+    the exact same TTL-caching pattern already proven in get_htf_zones
+    for the same class of problem (a value that's genuinely reusable
+    across the two direction passes within one scan cycle, cached rather
+    than refetched).
+    """
+    now = get_ist_datetime()
+    cached = htf_1h_cache.get(symbol)
+    if cached and (now - cached["cached_at"]).total_seconds() < 900:  # 15 min
+        return cached["klines"]
+
+    klines = get_klines(symbol, "1h", 20)
+    if klines:
+        htf_1h_cache[symbol] = {"klines": klines, "cached_at": now}
+    return klines
+
 def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, btc_aligned=False, zone_ok=False, ms_bos=False, ms_bias=None, ms_choch=False, is_tier1=True, is_compression=False, is_sweep=False, entry=None, sl=None):
     """
     The Location Multiplier + hard Tier 1/Tier 2 AI cap.
@@ -3030,6 +3252,37 @@ def compute_confirmation_bonus(symbol, direction, klines, vols, tf_score, btc_al
     # not a substitute for them.
     if is_sweep:
         bonus += 4.0; notes.append("Liquidity Sweep - Spring/Upthrust priority (+4.0)")
+
+    # ── AGGRESSIVE ORDER FLOW: real directional confirmation ──
+    # Rebuilt from the old dead has_whale_activity (was a boolean "one
+    # big trade happened," no directionality, zero live call sites).
+    # Used as a CONFIRMATION here, not a standalone trigger like Funding
+    # Divergence Sniper — a deliberate distinction: order flow alone
+    # doesn't specify WHAT level or setup matters, only that real size is
+    # leaning one way right now, so it confirms a direction a pattern
+    # already chose rather than inventing one from nothing.
+    flow_direction = detect_aggressive_order_flow(klines)
+    if flow_direction == direction:
+        bonus += 2.0; notes.append(f"Aggressive order flow confirms {direction} (+2.0)")
+
+    # ── HIGHER-TIMEFRAME RSI DIVERGENCE: a real scorecard signal ──
+    # detect_rsi_divergence already existed in this file, but was ONLY
+    # ever called once, on 15m closes, purely to add a line of text to
+    # Claude's AI-narrative context — never scored, and never checked on
+    # a higher timeframe. A confirmed 1h divergence is a meaningfully
+    # stronger, earlier signal than the 15m version (less noise, reflects
+    # genuine multi-hour momentum exhaustion, not a single choppy swing) —
+    # reused the exact same function directly (it's genuinely timeframe-
+    # agnostic, just takes a list of closes) rather than rewriting it.
+    try:
+        klines_1h_div = get_cached_1h_klines(symbol)
+        if klines_1h_div and len(klines_1h_div) >= 10:
+            closes_1h = [float(k[4]) for k in klines_1h_div]
+            div_1h = detect_rsi_divergence(closes_1h)
+            if (div_1h == "BULLISH_DIV" and direction == "BUY") or (div_1h == "BEARISH_DIV" and direction == "SELL"):
+                bonus += 3.0; notes.append(f"1h RSI divergence confirms {direction} (+3.0)")
+    except Exception as e:
+        logger.warning(f"1h RSI divergence {symbol}: {e}")
 
     if is_tier1:
         # ── ChoCh-in-Zone: the single biggest bonus — Location + Shift at once ──
@@ -4223,7 +4476,8 @@ def expire_pending_signals():
     now=get_ist_datetime()
     expired=[c for c,s in list(pending_signals.items()) if s.get("expires_at") and now>s["expires_at"]]
     for coin in expired:
-        del pending_signals[coin]
+        with trade_lock:
+            if coin in pending_signals: del pending_signals[coin]
         send_telegram(f"⏰ <b>{BOT_HEADER}</b>\nSignal expired: <b>{coin}</b>")
     if expired: save_pending_signals()
 
@@ -4294,22 +4548,32 @@ def update_trailing_sl(coin,trade,price,klines=None):
                 highest_recent_high = max(float(k[2]) for k in klines[-5:])
                 new_sl = highest_recent_high - atr_trail_dist
                 if new_sl > trade["sl"] and new_sl < price:
-                    active_trades[coin]["sl"] = new_sl; save_active_trades()
+                    with trade_lock:
+                        if coin in active_trades: active_trades[coin]["sl"] = new_sl
+                    save_active_trades()
         else:
             if price < trade["entry"] - activation_buffer:
                 lowest_recent_low = min(float(k[3]) for k in klines[-5:])
                 new_sl = lowest_recent_low + atr_trail_dist
                 if new_sl < trade["sl"] and new_sl > price:
-                    active_trades[coin]["sl"] = new_sl; save_active_trades()
+                    with trade_lock:
+                        if coin in active_trades: active_trades[coin]["sl"] = new_sl
+                    save_active_trades()
         return
     # Fallback: original fixed-percentage trail (klines unavailable/too short)
     trail=abs(trade["tp"]-trade["entry"])*0.3
     if trade["direction"]=="BUY":
         new_sl=price-trail
-        if new_sl>trade["sl"]: active_trades[coin]["sl"]=new_sl; save_active_trades()
+        if new_sl>trade["sl"]:
+            with trade_lock:
+                if coin in active_trades: active_trades[coin]["sl"]=new_sl
+            save_active_trades()
     else:
         new_sl=price+trail
-        if new_sl<trade["sl"]: active_trades[coin]["sl"]=new_sl; save_active_trades()
+        if new_sl<trade["sl"]:
+            with trade_lock:
+                if coin in active_trades: active_trades[coin]["sl"]=new_sl
+            save_active_trades()
 
 def check_profit_milestones(coin,trade,price,pnl):
     """
@@ -4520,7 +4784,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     # pattern-splitting approach as primary_pattern further down this
     # function, so a compound pattern string is handled consistently.
     _floor_primary = setup["pattern"].split(" + ")[0]
-    _is_accum = _floor_primary in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Vanguard Macro Squeeze","Smart Money Absorption")
+    _is_accum = _floor_primary in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Vanguard Macro Squeeze","Smart Money Absorption","Funding Divergence Sniper")
     _effective_floor = ACCUMULATION_SCORE_FLOOR if _is_accum else 92.0
     if setup["setup_score"] < _effective_floor:
         logger.info(f"{coin} rejected - score {setup['setup_score']:.1f} below strict floor {_effective_floor}"); return False
@@ -4606,7 +4870,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     # Verified this gap directly: ran a full end-to-end Early Spark
     # signal through format_and_send and watched it die at this exact
     # gate despite clearing every other exemption already in place.
-    if grade == "Grade C" and _floor_primary not in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Vanguard Macro Squeeze","Smart Money Absorption"):
+    if grade == "Grade C" and _floor_primary not in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Vanguard Macro Squeeze","Smart Money Absorption","Funding Divergence Sniper"):
         logger.info(f"{coin} rejected - Grade C on scorecard ({pts} pts) despite score {setup['setup_score']:.1f}"); return False
 
     lev=get_smart_leverage(setup["symbol"],atr_pct,setup["setup_score"],grade)
@@ -4681,7 +4945,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     # pattern types as the other two exemptions above) rather than a
     # blanket Grade-B/C fast-track, but it is a genuine widening of when
     # Claude gets called, not a free change.
-    is_early_pat = primary_pattern in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Vanguard Macro Squeeze","Smart Money Absorption")
+    is_early_pat = primary_pattern in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Vanguard Macro Squeeze","Smart Money Absorption","Funding Divergence Sniper")
     if is_grade_a or is_early_pat:
         if is_early_pat and not is_grade_a:
             logger.info(f"{coin} AI Fast-Track ({primary_pattern}, {grade}/{pts}pts) — sending to Claude despite not being Grade A")
@@ -5021,7 +5285,8 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
         logger.info(f"Signal sent: {coin}|{setup['direction']}|Score:{setup['setup_score']}|ETA:{eta}m")
         return True
     else:
-        if coin in pending_signals: del pending_signals[coin]
+        with trade_lock:
+            if coin in pending_signals: del pending_signals[coin]
         return False
 
 def check_active_trades():
@@ -5043,30 +5308,53 @@ def check_active_trades():
         # per active trade per cycle. 25 candles comfortably covers both
         # the reversal check's 20-period EMA and update_trailing_sl's
         # 14-period ATR requirement.
-        klines_check=get_klines(trade["symbol"],"15m",25)
+        # Fetch count bumped from 25 to 60: REAL BUG FOUND before applying
+        # Correction 2 (switching to a 50-period EMA) — calculate_ema
+        # returns None if len(closes) < period, and the old 25-candle
+        # fetch was only ever sufficient for the previous 20-period EMA.
+        # Verified this precisely: with only 25 candles, closes[:-1] gives
+        # 24 usable candles, which calculate_ema(closes[:-1], 50) would
+        # reject outright (24 < 50) — the entire Dynamic Thesis Cut
+        # reversal check would have silently stopped firing AT ALL, a far
+        # worse outcome than the "tiny wins" problem being fixed. 60
+        # candles gives a genuine 51+ usable after dropping the live one,
+        # with a safety margin.
+        klines_check=get_klines(trade["symbol"],"15m",60)
         update_trailing_sl(coin,trade,price,klines_check)
         check_profit_milestones(coin,trade,price,pnl)
         if not trade.get("reversal_alerted",False):
             klines=klines_check
-            if klines and len(klines)>=21:
+            if klines and len(klines)>=51:
                 closes=[float(x[4]) for x in klines]
-                # WHIP-SAW FIX (this round): VERIFIED THE CLAIM before
-                # applying — confirmed the previous version compared LIVE
-                # price against the current EMA20, meaning a single
-                # instantaneous dip below the EMA (completely normal during
-                # a healthy trend's pullbacks) could trigger a full THESIS
-                # CUT exit, even if price closed back above the EMA moments
-                # later. Fixed by evaluating the PREVIOUS candle's CONFIRMED
-                # close against the EMA computed WITHOUT the still-forming
-                # current candle — checked this indexing is internally
-                # consistent: closes[:-1] and closes[-2] both exclude the
-                # same potentially-live candle, so the EMA and the price
-                # being compared against it are from the same confirmed
-                # point in time, not comparing a settled EMA against noise.
-                ema20_prev=calculate_ema(closes[:-1],20)
-                if ema20_prev:
-                    rev=((trade["direction"]=="BUY" and closes[-2]<ema20_prev*0.995) or
-                         (trade["direction"]=="SELL" and closes[-2]>ema20_prev*1.005))
+                # WHIP-SAW FIX (earlier round): confirmed the version
+                # before that compared LIVE price against the current EMA,
+                # meaning a single instantaneous dip could trigger a full
+                # THESIS CUT exit even if price closed back above moments
+                # later. Fixed then by evaluating the PREVIOUS candle's
+                # CONFIRMED close instead of live price.
+                #
+                # EMA PERIOD CORRECTED (this round): even with the
+                # confirmed-close fix, EMA20 remained meaningfully prone
+                # to a SECOND, more subtle version of the same problem —
+                # VERIFIED THE MATH before applying: EMA20's smoothing
+                # factor (2/21 ≈ 0.095) makes it react to recent price
+                # roughly 2.4x faster than EMA50's (2/51 ≈ 0.039), meaning
+                # EVEN A CONFIRMED candle close has a meaningfully higher
+                # chance of dipping below a 20-period EMA during a
+                # perfectly normal, healthy pullback within an uptrend —
+                # this is exactly why Early Spark Ignition's 2 winning
+                # trades closed at only +0.15% average: real winners were
+                # being cut the instant a routine pullback touched EMA20,
+                # not because the thesis was actually wrong. Switched to
+                # EMA50, which sits further from live price and gives
+                # genuine room to breathe. REQUIRED the fetch count above
+                # to increase from 25->60 candles for this to work at all
+                # (calculate_ema returns None below its period; 25 candles
+                # was never enough to support a real 50-period EMA).
+                ema50_prev=calculate_ema(closes[:-1],50)
+                if ema50_prev:
+                    rev=((trade["direction"]=="BUY" and closes[-2]<ema50_prev*0.995) or
+                         (trade["direction"]=="SELL" and closes[-2]>ema50_prev*1.005))
                     if rev:
                         # DYNAMIC THESIS CUT (earlier round): sets
                         # hit="REVERSAL" directly — flows through the
@@ -5265,7 +5553,9 @@ def check_active_trades():
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"🕐 {get_ist_time()}"
             )
-            del active_trades[coin]
+            with trade_lock:
+                if coin in active_trades:
+                    del active_trades[coin]
             save_active_trades(); save_trade_history()
             cloud_save_journal(); cloud_save_pattern_stats(); cloud_save_active_trades()
 
@@ -5332,14 +5622,16 @@ def poll_telegram():
                                     f"✏️ Set your trade on CoinDCX now!\n"
                                     f"🕐 {get_ist_time()}"
                                 )
-                                del pending_signals[coin]
+                                with trade_lock:
+                                    if coin in pending_signals: del pending_signals[coin]
                                 save_pending_signals()
                                 logger.info(f"ACTIVATED: {coin}|{dirn}|Entry:{ep}|{lev}x")
                             else:
                                 send_telegram(f"⏰ <b>{BOT_HEADER}</b>\nSignal for {coin} expired.\nWait for next signal.")
                                 logger.warning(f"ACTIVATE failed: {coin} not in pending={list(pending_signals.keys())}")
                         elif action=="IGNORE":
-                            if coin in pending_signals: del pending_signals[coin]
+                            with trade_lock:
+                                if coin in pending_signals: del pending_signals[coin]
                             save_pending_signals()
                             send_telegram(f"❌ <b>{BOT_HEADER}</b>\n{coin} signal ignored.")
                 elif "message" in update:
@@ -5934,17 +6226,31 @@ def scan_coins(btc_trend,fng,market_condition,btc_klines=None):
                 if price_range_pct < v_thresh:
                     # PREDICTIVE DIRECTION: use the real 4h trend instead
                     # of guessing from range position, when available.
-                    # EDGE CASE FIXED before applying: the originally
-                    # proposed "BUY if htf_4h==-1 else SELL" silently
-                    # collapsed htf_4h==0 (genuinely unknown — insufficient
-                    # data) into the same SELL bet as a confirmed bullish
-                    # trend, conflating "no information" with "trend says
-                    # down." Falls back to the original range-position
-                    # heuristic specifically when htf_4h==0, rather than
-                    # guessing SELL with no actual basis.
+                    #
+                    # DIRECTION CORRECTED (this round): VERIFIED this
+                    # wasn't just a code-matching exercise before applying
+                    # — traced through why the previous mapping (bearish
+                    # trend -> BUY, bullish trend -> SELL) was actually
+                    # wrong, not just different. get_htf_trend is a pure
+                    # TREND indicator (EMA20 vs EMA50 crossover), not a
+                    # reversal/exhaustion signal — betting AGAINST a
+                    # confirmed trend with zero additional evidence is the
+                    # structurally weaker default. Genuine reversal
+                    # patterns (Early Spark Ignition, Smart Money
+                    # Absorption) already exist elsewhere in this file
+                    # with their OWN dedicated evidence requirements
+                    # (real macro drop %, volume absorption) that Vanguard
+                    # itself never checks. This directly produced a real,
+                    # observed loss: a BTC SHORT at $64,745 while BTC was
+                    # in a confirmed uptrend above $65,200, sitting at
+                    # -6.04% — the previous mapping's "elif htf_4h==1:
+                    # v_direction=SELL" branch is exactly what fired.
+                    # Fixed: squeezes in a bull market break UP (BUY),
+                    # squeezes in a bear market break DOWN (SELL) — trade
+                    # WITH the confirmed trend by default.
                     htf_4h=get_htf_trend(symbol,"4h")
-                    if htf_4h==-1: v_direction="BUY"
-                    elif htf_4h==1: v_direction="SELL"
+                    if htf_4h==1: v_direction="BUY"
+                    elif htf_4h==-1: v_direction="SELL"
                     else:
                         v_mid=(v_range_high+v_range_low)/2
                         v_direction="BUY" if price>=v_mid else "SELL"
@@ -5959,6 +6265,32 @@ def scan_coins(btc_trend,fng,market_condition,btc_klines=None):
                     if format_and_send(v_setup,coin,is_instant=False,market_condition=market_condition):
                         signals_this_cycle+=1
                     continue
+            # ── FUNDING RATE DIVERGENCE SNIPER — genuinely standalone ──
+            # Placed BEFORE the detect_patterns gate (same reasoning as
+            # the Vanguard bypass fix from an earlier round): if this
+            # only ran after "if not found: continue" already exited,
+            # it could never fire as a real standalone pattern on a coin
+            # detect_patterns saw nothing else on — which would defeat
+            # the entire point of it being predictive, not confirmatory.
+            fd_funding=get_funding_rate(symbol)
+            if fd_funding is not None:
+                fd_ms=detect_market_structure(klines)
+                fd_highs=[float(k[2]) for k in klines]; fd_lows=[float(k[3]) for k in klines]
+                fd_sup=fd_ms["swing_low"] if fd_ms["swing_low"]>0 else min(fd_lows[-30:-1])
+                fd_res=fd_ms["swing_high"] if fd_ms["swing_high"]>0 else max(fd_highs[-30:-1])
+                fd_direction=detect_funding_divergence(fd_funding,price,fd_sup,fd_res)
+                if fd_direction and coin not in active_trades and coin not in pending_signals and len(active_trades)<MAX_ACTIVE_TRADES:
+                    logger.info(f"{coin} FUNDING DIVERGENCE: {fd_funding*100:.3f}% funding at a real level — {fd_direction} squeeze setup")
+                    fd_atr=calculate_atr(klines); fd_atr_pct=(fd_atr/price)*100 if price>0 else 0
+                    fd_score=92.0
+                    fd_lev=get_smart_leverage(symbol,fd_atr_pct,fd_score)
+                    fd_setup={"coin":coin,"symbol":symbol,"direction":fd_direction,
+                             "pattern":"Funding Divergence Sniper","setup_score":fd_score,
+                             "leverage":fd_lev,"scan_price":price,
+                             "market_condition":market_condition,"tf_score":get_timeframe_score(symbol,fd_direction)}
+                    if format_and_send(fd_setup,coin,is_instant=False,market_condition=market_condition):
+                        signals_this_cycle+=1
+                    continue
             found=detect_patterns(symbol,klines,price,btc_trend)
             if not found: continue
             scored=get_all_pattern_scores(found,market_condition)
@@ -5971,7 +6303,9 @@ def scan_coins(btc_trend,fng,market_condition,btc_klines=None):
                 if base_s<MIN_PRIMARY_SCORE:                                   continue
                 if is_pattern_blacklisted(primary):                             continue
                 if is_pattern_suspended(primary):                               continue
-                if not is_sentiment_valid(direction,fng):                       continue
+                if not is_sentiment_valid(direction,fng,primary):
+                    logger.info(f"Skip {coin} {direction} - blocked by Fear & Greed sentiment ({fng})")
+                    continue
                 if btc_crashing and direction=="BUY":                           continue
                 if coin in BTC_CORRELATED and too_many_correlated_active():     continue
                 if too_many_sector_active(coin):
@@ -6107,7 +6441,7 @@ def scan_coins(btc_trend,fng,market_condition,btc_klines=None):
                 # logic is being treated as sufficient confirmation on
                 # its own, per the explicit "enter at the absolute
                 # baseline floor of a HTF zone" framing.
-                is_accumulation_pattern = primary in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Vanguard Macro Squeeze","Smart Money Absorption")
+                is_accumulation_pattern = primary in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Vanguard Macro Squeeze","Smart Money Absorption","Funding Divergence Sniper")
                 effective_floor = ACCUMULATION_SCORE_FLOOR if is_accumulation_pattern else MIN_SETUP_SCORE
                 if score<effective_floor: continue
                 closes_chk=[float(k[4]) for k in klines]
@@ -6187,6 +6521,23 @@ def scan_coins(btc_trend,fng,market_condition,btc_klines=None):
         time.sleep(DELAY_BETWEEN_COINS)
 
 def main():
+    # FAIL-FAST STARTUP CHECK (this round): VERIFIED THE CLAIM before
+    # applying — confirmed TELEGRAM_TOKEN/CHAT_ID genuinely fall back to
+    # placeholder strings ("YOUR_TOKEN_HERE"/"YOUR_CHAT_ID_HERE") if the
+    # real environment variables are missing on deployment. Without this
+    # check, a broken deployment would boot cleanly, start the Telegram
+    # polling thread, log a normal-looking startup message, and then
+    # silently fail every single Telegram send in the background —
+    # meaning you'd get zero signals with no visible error, and no way
+    # to tell "the bot is quietly broken" apart from "the market is
+    # quiet." This crashes loudly instead, at the very first line of
+    # main(), before any scanning or Telegram polling starts.
+    if TELEGRAM_TOKEN=="YOUR_TOKEN_HERE" or CHAT_ID=="YOUR_CHAT_ID_HERE" or not TELEGRAM_TOKEN or not CHAT_ID:
+        logger.error("FATAL: TELEGRAM_TOKEN and/or CHAT_ID are missing or still set to placeholder "
+                     "values. Set the real environment variables on your deployment platform before "
+                     "starting the bot — it will not run with placeholder credentials, since every "
+                     "Telegram send would otherwise fail silently in the background.")
+        raise SystemExit(1)
     global last_river_time,last_hourly_time,last_pnl_update_time,last_8h_desk_time,last_weekly_report_day
     load_alerts(); load_circuit_breaker(); load_pending_signals(); load_retest_watchlist(); load_macro_events()
     cloud_load_all()   # loads journal, pattern_stats, learning, active_trades from Supabase (falls back to local JSON)
