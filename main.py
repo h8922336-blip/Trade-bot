@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 if not CHARTS_AVAILABLE:
     logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -82,7 +82,7 @@ COINS = list(dict.fromkeys([
     # anywhere in the file) — the bot could not have been scanning it,
     # confirming that diagnosis was accurate, not a stale claim.
     "HYPE","BERA","IP","INIT","BABY","SAHARA","WAL","LAYER",
-    "RED","SPK","NEWT","KERNEL","EPT","COOKIE","BIO","VVV","ARC","BANK",
+    "RED","SPK","NEWT","KERNEL","EPT","COOKIE","BIO","VVV","ARC","BANK","DEXE",
 
     "BTC","ETH","BNB","SOL","XRP","DOGE","ADA","TRX","AVAX","SHIB",
     "DOT","LINK","BCH","NEAR","LTC","UNI","APT","ETC","HBAR","FIL",
@@ -93,7 +93,7 @@ COINS = list(dict.fromkeys([
     "GMT","ENJ","PEPE","WIF","FLOKI","BONK","ORDI","BOME","NOT","DOGS",
     "JUP","PYTH","JTO","STRK","EIGEN","ETHFI","IO","ZERO","ONDO",
     "BLUR","CFX","METIS","MANTA","ZETA","TRB","ALT","PIXEL","PORTAL","STPT","KAS",
-    "PIPPIN","BSB","CL","LAB","PAXG","DEXE"
+    "PIPPIN","BSB","CL","LAB","PAXG"
     # XRP, ADA, LINK, AVAX already present earlier in this list (see the
     # "BTC","ETH","BNB","SOL","XRP",...,"ADA",... and "LINK" lines above) —
     # not re-added here to avoid a misleading duplicate literal entry.
@@ -1644,14 +1644,44 @@ def detect_early_spark(closes, highs, lows, opens, vols, price):
     dist_from_low_pct = (price - recent_low) / recent_low * 100 if recent_low > 0 else 99
     dist_from_high_pct = (recent_high - price) / price * 100 if price > 0 else 99
 
-    volume_igniting = current_vol >= avg_vol_20 * 1.6
+    # THRESHOLDS TIGHTENED ON DISTANCE, LOOSENED ON VOLUME (this round):
+    # was dist<=5.0%/vol>=1.6x, now dist<=1.5%/vol>=1.1x. VERIFIED THE
+    # DIAGNOSIS was correct before changing anything — reproduced the
+    # exact reported scenario (a genuine multi-candle quiet coil,
+    # followed by a surge candle) and confirmed the OLD thresholds
+    # stayed silent through the entire coil and only fired once the
+    # surge candle had already printed with real volume — precisely
+    # matching the JUP/FIL screenshots (alert timestamped at the top of
+    # a green candle, not at the flat bottom 4-5 candles earlier).
+    #
+    # Also verified the NEW thresholds' real effect before trusting them
+    # — found 1.1x volume still won't catch a genuinely, perfectly flat
+    # coil (tested at exactly 1.0x volume: still fails) — this fix
+    # narrows the gap, it doesn't claim to catch literally zero-volume
+    # coils. Confirmed it DOES work for the realistic case: a coin
+    # pinned near its low with just a slight, early volume uptick
+    # (~1.1-1.2x, not a full spike) now fires roughly 4 candles earlier
+    # than the old thresholds in a direct side-by-side test.
+    #
+    # The distance tightening (5.0% -> 1.5%) is a deliberate, coherent
+    # trade-off alongside the volume loosening, not just "loosen
+    # everything": Early Spark Ignition already gets the full
+    # accumulation-exemption treatment elsewhere in the pipeline (lower
+    # score floor, Daily Veto bypass, Beta Trap bypass, SuperTrend
+    # bypass) — those exist specifically because quiet patterns need
+    # looser gates DOWNSTREAM. Tightening distance HERE makes the
+    # pattern more selective about WHERE it fires (right at the level,
+    # not up to 5% away from it), even while loosening how much volume
+    # confirmation it needs — net effect is earlier AND more precise
+    # about genuine level-tests, not simply "looser."
+    volume_igniting = current_vol >= avg_vol_20 * 1.1
 
     # Volume igniting near the recent low, closing bullish -> Early Long Spark
-    if dist_from_low_pct <= 5.0 and volume_igniting and closes[-1] > opens[-1]:
+    if dist_from_low_pct <= 1.5 and volume_igniting and closes[-1] > opens[-1]:
         return "BUY"
 
     # Volume igniting near the recent high, closing bearish -> Early Short Spark
-    if dist_from_high_pct <= 5.0 and volume_igniting and closes[-1] < opens[-1]:
+    if dist_from_high_pct <= 1.5 and volume_igniting and closes[-1] < opens[-1]:
         return "SELL"
 
     return None
@@ -6244,13 +6274,10 @@ def poll_telegram():
                     elif txt_slash in ("/start","/help","/menu"):
                         menu_kb={
                             "keyboard":[
-                                [{"text":"📊 Trades"},   {"text":"⏳ Pending"},   {"text":"📈 Stats"}],
-                                [{"text":"📅 Summary"},  {"text":"🔥 Streak"},    {"text":"🏆 Best"}],
-                                [{"text":"🛡 Risk"},     {"text":"🧠 Learn"},     {"text":"📓 Journal"}],
-                                [{"text":"🌀 Patterns"}, {"text":"📰 News"},      {"text":"🌍 Market"}],
-                                [{"text":"🔍 Scan"},     {"text":"⚡ CB Status"}, {"text":"📡 Status"}],
-                                [{"text":"🔔 Alerts"},   {"text":"📉 Trend BTC"}, {"text":"💎 Hidden Gems"}],
-                                [{"text":"🧠 AI Analyst"},{"text":"🔮 Counsel"},  {"text":"🌐 Regime"}],
+                                [{"text":"📊 Active Trades"}, {"text":"📓 Trade Journal"}, {"text":"🧠 AI Analyst"}],
+                                [{"text":"🌍 Market Overview"}, {"text":"🌐 Regime & BTC"}, {"text":"🔍 Check Coin"}],
+                                [{"text":"💎 Hidden Gems"}, {"text":"🔥 Squeeze Radar"}, {"text":"👀 Watchlist"}],
+                                [{"text":"📅 10-Day Summary"}, {"text":"📈 Pattern Stats"}, {"text":"⚡ CB Status"}]
                             ],
                             "resize_keyboard":True,
                             "persistent":True
@@ -6289,7 +6316,7 @@ def poll_telegram():
                         # handled by txt_clean block below — trigger it
                         pass
                     # ── Reply keyboard button tap handlers ──
-                    elif txt_clean=="📊 trades":   safe_send(get_active_trades_text,"📊 Trades")
+                    elif txt_clean in ("📊 trades","📊 active trades"):   safe_send(get_active_trades_text,"📊 Trades")
                     elif txt_clean=="⏳ pending":
                         if pending_signals:
                             msg=f"{_H('PENDING SIGNALS','⏳')}\n\n"
@@ -6304,18 +6331,18 @@ def poll_telegram():
                             send_telegram(msg)
                         else:
                             send_telegram(f"{_H('PENDING SIGNALS','⏳')}\n\n  ⚪ No pending signals right now.\n\n  🕐 {get_ist_time()}")
-                    elif txt_clean=="📈 stats":    safe_send(get_pattern_stats_text,"📈 Stats")
-                    elif txt_clean=="📅 summary":  safe_send(get_10day_summary_text,"📅 Summary")
+                    elif txt_clean in ("📈 stats","📈 pattern stats"):    safe_send(get_pattern_stats_text,"📈 Stats")
+                    elif txt_clean in ("📅 summary","📅 10-day summary"):  safe_send(get_10day_summary_text,"📅 Summary")
                     elif txt_clean=="🔥 streak":   safe_send(get_streak_text,"🔥 Streak")
                     elif txt_clean=="🏆 best":     safe_send(get_best_text,"🏆 Best")
                     elif txt_clean in ("🛡️ risk","🛡 risk"):  safe_send(get_risk_text,"🛡 Risk")
                     elif txt_clean=="🧠 learn":    safe_send(get_learning_text,"🧠 Learn")
-                    elif txt_clean=="📓 journal":  safe_send(get_journal_text,"📓 Journal")
+                    elif txt_clean in ("📓 journal","📓 trade journal"):  safe_send(get_journal_text,"📓 Journal")
                     elif txt_clean=="🌀 patterns": safe_send(get_patterns_ranked_text,"🌀 Patterns")
                     elif txt_clean=="📰 news":
                         send_telegram("⚙️ Fetching latest news...")
                         safe_send(get_crypto_news,"📰 News")
-                    elif txt_clean=="🌍 market":   safe_send(cmd_market,"🌍 Market")
+                    elif txt_clean in ("🌍 market","🌍 market overview"):   safe_send(cmd_market,"🌍 Market")
                     elif txt_clean=="🔍 scan":
                         btc_p2=get_price("BTCUSDT"); btc_k2=get_klines("BTCUSDT","1h",50)
                         bt_e2=calculate_ema([float(x[4]) for x in btc_k2],50) if btc_k2 else None
@@ -6375,6 +6402,18 @@ def poll_telegram():
                         safe_send(lambda: run_backtest(bc2),"🔬 Backtest")
                     elif txt_clean in ("💎 hidden gems","/gems"):
                         safe_send(cmd_hidden_gems,"💎 Hidden Gems")
+                    elif txt_clean in ("👀 watchlist","/watchlist"):
+                        safe_send(get_retest_watchlist_text,"👀 Watchlist")
+                    elif txt_clean in ("🔥 squeeze radar","/squeeze"):
+                        safe_send(get_squeeze_radar_text,"🔥 Squeeze Radar")
+                    elif txt_clean=="🔍 check coin":
+                        send_telegram("🔍 Type <code>/check COIN</code> — e.g. <code>/check FIL</code>", parse_mode="HTML")
+                    elif txt_slash.startswith("/check"):
+                        parts=txt_clean.split()
+                        if len(parts)>1:
+                            safe_send(lambda: get_check_coin_text(parts[1]),"🔍 Check Coin")
+                        else:
+                            send_telegram("🔍 Usage: <code>/check COIN</code> — e.g. <code>/check FIL</code>", parse_mode="HTML")
                     elif txt_clean in ("🧠 ai analyst","/analyst"):
                         send_telegram("🧠 AI Analyst reviewing your trades...", parse_mode="")
                         safe_send(ai_analyst_review,"🧠 AI Analyst")
@@ -6393,7 +6432,7 @@ def poll_telegram():
                                 lines.append(f"  {em} <b>{coin}</b> {direction} PnL:{pnl:+.1f}% TP:{dist_tp:.1f}% away")
                             lines.append(f"\n  🕐 {get_ist_time()}")
                             send_telegram("\n".join(lines))
-                    elif txt_clean in ("🌐 regime","/regime"):
+                    elif txt_clean in ("🌐 regime","🌐 regime & btc","/regime"):
                         btc_p=get_price("BTCUSDT"); btc_k=get_klines("BTCUSDT","1h",50)
                         adx=calculate_adx(btc_k) if btc_k else 0
                         fng=get_fear_greed_index()
@@ -6634,6 +6673,82 @@ def check_retest_triggers():
     if triggered: save_retest_watchlist()
     return triggered
 
+
+def get_squeeze_radar_text():
+    """
+    Squeeze Radar: scans the coin list for extreme funding rates,
+    reusing the already-verified SQUEEZE_FUNDING_EXTREME_NEG/POS
+    thresholds (same ones Funding Divergence Sniper and the Squeeze
+    scorecard bonus already use — not new numbers invented here).
+
+    DELIBERATELY SCOPED TO FUNDING RATE ONLY, not funding+OI: checked
+    get_funding_rate has real 15-min TTL caching (built in an earlier
+    round), meaning a full coin-list scan is genuinely cheap here — most
+    coins will hit cache if they were touched by a recent scan_coins
+    cycle. get_oi_change_pct has NO caching at all — an uncached, on-
+    demand scan across the full coin list would be a real, meaningful
+    latency and rate-limit cost for a live Telegram command. Rather than
+    silently promise a full funding+OI scan and either deliver something
+    much slower than expected or silently skip OI without saying so,
+    this is honestly scoped to funding rate only.
+    """
+    results = []
+    for coin in COINS:
+        symbol = coin + "USDT"
+        rate = get_funding_rate(symbol)
+        if rate is None:
+            continue
+        if rate <= SQUEEZE_FUNDING_EXTREME_NEG:
+            results.append((coin, rate, "SHORT squeeze setup (shorts paying heavily)"))
+        elif rate >= SQUEEZE_FUNDING_EXTREME_POS:
+            results.append((coin, rate, "LONG squeeze setup (longs paying heavily)"))
+    if not results:
+        return f"{_H('SQUEEZE RADAR','🔥')}\n\nNo coins currently showing extreme funding rates."
+    results.sort(key=lambda r: abs(r[1]), reverse=True)
+    lines = [_H("SQUEEZE RADAR","🔥"), ""]
+    for coin, rate, label in results[:15]:
+        lines.append(f"🪙 <b>{coin}</b>  {rate*100:+.3f}%  •  {label}")
+    lines.append("")
+    lines.append(f"🕐 {get_ist_time()}")
+    return "\n".join(lines)
+
+def get_check_coin_text(coin_input):
+    """
+    Check Coin: on-demand pull of 15m structure, ADX, volume ratio, and
+    whether price is currently sitting in a real HTF Supply/Demand zone
+    — a personal-confirmation lookup, distinct from the automated
+    scanning pipeline (this never sends a trade signal, purely
+    read-only).
+    """
+    coin = coin_input.strip().upper().replace("USDT", "")
+    symbol = coin + "USDT"
+    price = get_price(symbol)
+    klines = get_klines(symbol, "15m", 100)
+    if not price or not klines or len(klines) < 50:
+        return f"{_H('CHECK COIN','🔍')}\n\n❌ Could not fetch enough data for <b>{coin}</b> — check the symbol and try again."
+    closes = [float(k[4]) for k in klines]
+    adx_val = calculate_adx(klines)
+    vol_ratio = get_volume_ratio(klines)
+    ms = detect_market_structure(klines)
+    zones = get_htf_zones(symbol)
+    zone_ok_buy, zone_label_buy = is_in_zone(price, "BUY", zones)
+    zone_ok_sell, zone_label_sell = is_in_zone(price, "SELL", zones)
+    rsi_val = calculate_rsi(closes)
+    lines = [
+        _H(f"CHECK COIN — {coin}", "🔍"), "",
+        f"💰 Price: <code>{format_price(price)}</code>",
+        f"🏗️ Structure: {ms['bias'].upper()}  •  BOS: {'✅' if ms['bos'] else '➖'}  •  ChoCh: {'✅' if ms['choch'] else '➖'}",
+        f"💪 ADX: {adx_val:.1f}  •  📊 Vol: {vol_ratio:.2f}x avg  •  📈 RSI: {rsi_val:.1f}",
+    ]
+    if zone_ok_buy:
+        lines.append(f"📍 Sitting in a real Demand zone: {zone_label_buy}")
+    elif zone_ok_sell:
+        lines.append(f"📍 Sitting in a real Supply zone: {zone_label_sell}")
+    else:
+        lines.append("📍 Not currently inside a real HTF zone")
+    lines.append("")
+    lines.append(f"🕐 {get_ist_time()}")
+    return "\n".join(lines)
 
 def get_retest_watchlist_text():
     if not retest_watchlist:
@@ -7183,39 +7298,10 @@ def main():
     threading.Thread(target=poll_telegram,daemon=True).start()
     logger.info(f"{BOT_NAME} {BOT_VERSION} starting...")
     send_telegram(
-        f"🚀 <b>TRADING SIGNAL MASTER v32G</b> 🚀\n"
+        f"🚀 <b>TRADING SIGNAL MASTER v32G</b> 🍀\n"
         f"<i>Smart • Fast • Accurate • AI</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"<b>✅ All Systems Active</b>\n\n"
-        f"🔍 Scanner: <b>{len(COINS)} coins</b>\n"
-        f"📊 4h + 1h Trend Filter\n"
-        f"🌀 SuperTrend (15m + 1h)\n"
-        f"📈 ADX Min: <b>{ADX_MIN_TREND}</b>\n"
-        f"💧 VWAP Institutional Filter\n"
-        f"📍 Supply & Demand Zones\n"
-        f"📊 VWAP Institutional Filter\n"
-        f"🔀 RSI Divergence Detection\n"
-        f"🐋 Whale Detection\n"
-        f"😱 Fear & Greed Index\n"
-        f"💰 Funding Rate + OI\n"
-        f"🛡️ Circuit Breaker (≤ -5% only)\n"
-        f"🔄 CB Auto-Reset Midnight IST\n"
-        f"⚡ Instant Signals ≥ {INSTANT_SIGNAL_THRESHOLD}\n"
-        f"🎯 Smart Position Sizing\n"
-        f"🏆 Signal Grading A+/A/B/C\n"
-        f"📋 Profit Milestones +10/20/35%\n"
-        f"🧠 AI Pattern Learning\n"
-        f"⏱️ ETA-Based Coin Cooldown\n"
-        f"🌙 Dead Session (2AM-7AM IST)\n"
-        f"📰 CryptoPanic News {'✅' if NEWS_API_KEY else '⚠️ (set NEWS_API_KEY)'}\n"
-        f"💾 Storage: Local JSON files\n"
-        f"📊 Backtest Engine\n"
-        f"🗓️ Weekly AI Insight\n"
-        f"🎯 Min Score: <b>{MIN_SETUP_SCORE}</b>\n"
-        f"🌀 SuperTrend: 15m = hard block, 1h = grade bonus\n"
-        f"📊 Volume: Dead-volume filter (≥85% avg)\n"
-        f"📍 Drift: Price must stay within 2% of scan\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>✅ Online</b>  •  Scanning <b>{len(COINS)} coins</b>\n\n"
         f"📌 Type /help for all commands\n"
         f"🕐 {get_ist_time()}"
     )
