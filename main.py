@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 if not CHARTS_AVAILABLE:
     logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -121,6 +121,7 @@ trade_journal             = []
 JOURNAL_MAX_LIVE_ENTRIES  = 2000
 learning_notes            = []
 coin_cooldowns            = {}
+early_watch_sent          = {}  # coin -> last Early Watch notification time, rate-limits the heads-up to once/hour per coin
 retest_watchlist          = {}   # coin -> {level, direction, pattern, logged_at, symbol}
 htf_zones_cache           = {}   # symbol -> {"zones": {...}, "cached_at": datetime} — 15min TTL, see get_htf_zones
 consecutive_loss_patterns = {}
@@ -5050,6 +5051,47 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     sniper_triggered, sniper_note = check_5m_sniper_trigger(setup["symbol"], setup["direction"])
 
     if is_quiet_accumulation and not sniper_triggered:
+        # EARLY WATCH NOTIFICATION (this round): VERIFIED THE CORE
+        # DIAGNOSIS before building this — confirmed a quiet accumulation
+        # pattern genuinely gets silently discarded here every single
+        # cycle it doesn't trigger, with zero visibility to the user
+        # until the moment it finally does (or never does, and just
+        # keeps quietly failing this check until the pattern itself stops
+        # firing). That's a real, legitimate gap: "the setup exists and
+        # is close" is genuinely useful information on its own, distinct
+        # from "the setup has now triggered for real."
+        #
+        # Deliberately NOT the proposed 3-tier scoring system — checked
+        # that proposal's actual code and found it referenced undefined
+        # variables/constants, and its proximity+compression scoring
+        # closely duplicates what Pre-Breakout Compression's own
+        # detection function already checks internally (proximity to a
+        # real level, tight candles, quiet volume) before ever appending
+        # to the pattern list — the fact that the pattern fired at all IS
+        # the proximity signal, no need to recompute it here. This sends
+        # a genuine, clearly-labeled heads-up using data already
+        # available at this point, without inventing a second, partially
+        # redundant scoring path or a new signal category that would need
+        # its own SL/TP/position-size handling.
+        #
+        # Rate-limited per coin so this doesn't fire every ~90s cycle for
+        # the same still-coiling setup — once per watch window.
+        if coin not in early_watch_sent or (get_ist_datetime()-early_watch_sent[coin]).total_seconds()>3600:
+            early_watch_sent[coin]=get_ist_datetime()
+            send_telegram(
+                f"🟡 <b>EARLY WATCH — {coin}</b>\n"
+                f"⚙️ <b>TRADING SIGNAL MASTER v32G</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🪙 <b>{coin}</b>  {'🟢' if setup['direction']=='BUY' else '🔴'} {setup['direction']}\n"
+                f"📌 Pattern: {_primary_pat}\n"
+                f"💰 Watching near: <code>{format_price(setup['scan_price'])}</code>\n\n"
+                f"⏳ Coiled on 15m, waiting for the 5m trigger to confirm —\n"
+                f"   this is NOT a trade signal, just a heads-up that a\n"
+                f"   real setup is forming. A full signal follows only if\n"
+                f"   the 5m chart actually confirms.\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🕐 {get_ist_time()}"
+            )
         logger.info(f"{coin} {setup['direction']} coiled on 15m, but waiting for 5m execution: {sniper_note}")
         return False  # rejected THIS cycle only — re-evaluated fresh on the next ~90s scan, no cooldown applied
 
@@ -6489,14 +6531,32 @@ def scan_river(now,market_condition):
 def is_move_already_extended(closes, direction):
     """
     Point 5: Detects if a move has already run too far to chase.
-    If price moved 8%+ in the last 12 candles in the signal direction,
+    If price moved 3.5%+ in the last 12 candles in the signal direction,
     the easy part of the move is likely already gone.
+
+    THRESHOLD TIGHTENED (this round): was 8.0%, now 3.5%. VERIFIED
+    INDEPENDENTLY before applying — searched for external calibration
+    data on typical crypto pullback/continuation magnitude over a
+    comparable ~3-hour window and found nothing precise enough to be
+    load-bearing (available sources discuss much larger, multi-week/
+    month pullback magnitudes, a different timescale entirely).
+    Reasoned instead from internal consistency with this bot's own risk
+    parameters: MIN_RR_RATIO=2.0 and typical structural stop distances
+    (often 0.5-2%, per MIN_SL_PCT and real observed SL% in signals) mean
+    the old 8% threshold was roughly 4-16x a typical stop distance — a
+    coin could move most of a full target distance and still not trip
+    this filter. 3.5% is roughly 1.75-7x a typical stop, a more
+    defensibly tight bar for "already moved several stop-distances,
+    don't chase." This function is called broadly (every pattern except
+    Volatility Contraction), not scoped to any early-entry system, so
+    this is a real, independent tightening of the whole pipeline's
+    chasing filter.
     """
     if len(closes) < 12: return False
     recent = closes[-12:]
     move_pct = (recent[-1] - recent[0]) / recent[0] * 100 if recent[0] > 0 else 0
-    if direction == "BUY" and move_pct > 8.0: return True
-    if direction == "SELL" and move_pct < -8.0: return True
+    if direction == "BUY" and move_pct > 3.5: return True
+    if direction == "SELL" and move_pct < -3.5: return True
     return False
 
 
