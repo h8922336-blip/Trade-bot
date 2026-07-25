@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 if not CHARTS_AVAILABLE:
     logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -144,6 +144,7 @@ last_river_time        = 0
 last_hourly_time       = time.time()
 last_pnl_update_time   = time.time() + 1800
 last_8h_desk_time      = time.time()
+last_pressure_cooker_time = time.time()
 last_weekly_report_day = None
 
 SCAN_INTERVAL            = 90
@@ -1981,7 +1982,23 @@ def detect_patterns(symbol, klines, price, btc_trend):
     adx    = calculate_adx(klines)
     # Minimum activity filter
     if ((max(highs[-20:]) - min(lows[-20:])) / price) * 100 < 1.5: return []
-    if adx < ADX_MIN_TREND: return []
+    # ADX GATE MOVED (this round) — VERIFIED THIS WAS A REAL, SEVERE BUG
+    # before moving it: this used to sit right here, before EVERY pattern
+    # check in this function, including all six accumulation patterns
+    # (Inside Bar Coil, Pre-Breakout Compression, Volatility Contraction,
+    # Early Spark Ignition, Smart Money Absorption, Pressure Cooker
+    # Triangle). Confirmed via two independent tests that a realistic
+    # quiet-coil scenario reads a MUCH higher ADX than the naive "10-18"
+    # assumption would suggest — specifically because ADX computed over a
+    # window spanning a real prior trend into the coil stays artificially
+    # elevated from that recent trend, and Smart Money Absorption's own
+    # detection logic REQUIRES a real prior decline before it even looks
+    # for the coil, meaning its realistic trigger condition was exactly
+    # what this gate was killing. The gate itself is legitimate for
+    # lagging, trend-following patterns (EMA Trend, Bull Flag, etc.) —
+    # moved to apply AFTER the six accumulation patterns run instead of
+    # blocking them from ever being checked at all. See the gate itself
+    # further down, right before the lagging pattern section begins.
     # Market structure
     ms = detect_market_structure(klines)
     ms_bias = ms["bias"]  # "bullish", "bearish", "neutral"
@@ -2097,6 +2114,17 @@ def detect_patterns(symbol, klines, price, btc_trend):
         p.append(("Pressure Cooker Triangle", TIER1_BASE, "BUY"))
     elif triangle_dir == "SELL" and alt_bear_ok:
         p.append(("Pressure Cooker Triangle", TIER1_BASE, "SELL"))
+
+    # ── ADX GATE (relocated here this round) ──
+    # Everything above this line is a genuine accumulation/predictive
+    # pattern (quiet-by-design, low ADX is expected and correct) —
+    # everything below is a lagging, trend-following pattern (EMA Trend,
+    # Bull/Bear Flag, Momentum Surge, etc.) that genuinely SHOULD require
+    # real trend strength to justify firing. This gate is legitimate for
+    # those, just no longer allowed to block the accumulation patterns
+    # above from ever being checked in the first place.
+    if adx < ADX_MIN_TREND:
+        return p
 
     # ── Professional Bull Flag — Tier 1 ──
     if detect_bull_flag(closes, highs, lows, vols, avg_vol) and alt_bull_ok:
@@ -3991,6 +4019,46 @@ def cmd_trend(coin_input):
 
 DESK_REPORT_COINS = ["BTC","ETH","SOL","HYPE","BERA","IP"]
 
+def send_pressure_cooker_report():
+    """
+    The "Pressure Cooker" Report — the scheduled watchlist alert. Chosen
+    over an instant per-coin ping (the alternative design considered):
+    retest_watchlist genuinely can accumulate multiple entries within a
+    single scan cycle (three separate call sites feed it — the AI-
+    flagged-LATE fallback, the already-extended-move check, and the BOS-
+    retest gate, which was extended in an earlier round to also cover
+    Double Top/Bottom) — an instant ping has no natural batching for
+    that, so a genuinely volatile market could produce a real flood of
+    individual messages, exactly what a "clean signal, not noise"
+    design should avoid.
+
+    Interval set to 2 hours (not matched to the existing 8h AI desk
+    report's cadence) — watchlist entries expire after 12 hours
+    (check_retest_triggers), so 2h gives roughly 5-6 chances to see a
+    given entry while it's genuinely still live, versus only 1-2 chances
+    at 8h. The actual goal ("prep your charts") needs the alert to
+    arrive while the setup still has real runway left, not near its
+    expiry.
+
+    Silent (sends nothing) if the watchlist is currently empty — no
+    "nothing to report" message, consistent with the existing "don't
+    spam" design goal.
+    """
+    if not retest_watchlist:
+        return
+    lines = [f"👀 <b>PRESSURE COOKER REPORT</b>", f"⚙️ <b>{len(retest_watchlist)} coin(s) on the radar</b>", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", ""]
+    for coin, w in sorted(retest_watchlist.items(), key=lambda kv: kv[1]["logged_at"], reverse=True):
+        age_hrs = (get_ist_datetime() - w["logged_at"]).total_seconds() / 3600
+        dir_icon = "🟢" if w["direction"] == "BUY" else "🔴"
+        reason = "waiting for pullback to breakout line" if w.get("pattern_type") == "bos_retest" else "move already extended, watching for retest"
+        lines.append(f"{dir_icon} <b>{coin}</b>  {w['direction']}")
+        lines.append(f"   📌 {w['pattern']}")
+        lines.append(f"   📍 Level: <code>{format_price(w['level'])}</code>  •  {reason}")
+        lines.append(f"   ⏱️ On radar {age_hrs:.1f}h (expires at 12h)")
+        lines.append("")
+    lines.append(f"🕐 {get_ist_time()}")
+    send_telegram("\n".join(lines))
+
 def send_8h_ai_desk_report():
     """
     Point 4: The 8-Hour VIP "Prop-Desk" AI Report (retimed from 4h to 8h per user request).
@@ -4769,6 +4837,20 @@ def check_profit_milestones(coin,trade,price,pnl):
         sl_price=_sl_lock_price(m1,0.0)  # breakeven
         active_trades[coin].setdefault("milestones_sent",[]).append("p1")
         active_trades[coin]["sl"]=sl_price
+        # TIME-TO-M1 CAPTURE (this round): VERIFIED THIS WAS A REAL GAP
+        # before fixing — milestones_sent only ever stored string labels
+        # ("p1", "p2"), never a timestamp, and the final trade_journal
+        # entry at close preserved nothing about whether or when M1 was
+        # reached. Once a trade closed, "how quickly did this hit M1"
+        # became unanswerable from historical data — only visible live,
+        # in the moment, via the Telegram message. Records the actual
+        # elapsed minutes here (not a raw timestamp) so it survives
+        # directly into the journal without needing entry-time
+        # arithmetic performed later against a value that might not
+        # even be there.
+        if trade.get("timestamp"):
+            m1_mins = (get_ist_datetime() - trade["timestamp"]).total_seconds() / 60
+            active_trades[coin]["time_to_m1_mins"] = round(m1_mins, 1)
         save_active_trades()
         send_telegram(_ms("✅",f"MILESTONE 1  •  +{m1:.1f}% reached",
                           "SL moved to breakeven — trade is now risk-free!",sl_price))
@@ -4789,31 +4871,38 @@ def check_profit_milestones(coin,trade,price,pnl):
 
 def check_5m_sniper_trigger(symbol, direction):
     """
-    The Law of Two-Stage Execution (The Sniper Trigger). REPLACES the
-    previous get_ltf_confirmation, which was a soft momentum-holding
-    check that only ever applied a scorecard penalty, never blocked a
-    signal (its own docstring said so explicitly: "not a hard block").
+    The Law of Two-Stage Execution (The Sniper Trigger).
 
-    Once the 15m chart detects a coiled setup, this drops to the 5m
-    chart to execute the exact moment volatility genuinely expands —
-    getting entry 1-2 candles earlier than waiting for the 15m candle
-    itself to close, which lets the stop-loss sit much tighter (under
-    the 5m breakout wick, not the wider 15m structure).
+    UPDATED (this round): added a second, earlier trigger path alongside
+    the original breakout-with-volume one, rather than replacing it —
+    VERIFIED THE REAL DIAGNOSIS before making this change: the original
+    version only fired on a genuine breakout candle (current_vol >=
+    1.5x avg AND price breaking recent highs/lows), which by definition
+    only confirms AFTER the initial pump has already happened — the
+    exact "buying candle 8" problem. Added a second path: a wick
+    rejection or micro-reclaim while price is STILL near the level, on
+    much lower volume, catching genuine level-defense before the loud
+    breakout candle forms.
 
-    VERIFIED THE MECHANICS before implementing: the highs5[-4:-1] /
-    lows5[-4:-1] slices correctly compare the current candle's close
-    against the max/min of the 3 PRECEDING candles only — the current
-    candle is excluded from its own baseline, so this genuinely checks
-    "did price just break recent local highs/lows," not a self-
-    referential off-by-one. The len(k5)<10 guard is sufficient for every
-    slice used later (both the 10-candle volume average and the 4-candle
-    high/low window).
+    VERIFIED THE PROPOSED REPLACEMENT CODE before adapting it (not just
+    trusted it as given): found a genuinely dead/confusing line in the
+    version I was handed — a `lows5` list built from an undefined
+    `klines` variable inside a ternary branch that can never execute
+    (`X if False else Y` always evaluates Y in Python, so the broken
+    branch is never actually reached) — confirmed via direct execution
+    this doesn't crash, but it's vestigial copy-paste debris, cleaned up
+    here rather than carried forward. Also verified the -3:-1 slicing
+    used for the micro-reclaim condition has no lookahead bias (excludes
+    the current candle from its own comparison baseline).
 
-    Deliberately fails CLOSED (returns False) when 5m data is
-    unavailable, unlike the old function's fail-open behavior — since
-    this is now used as a hard execution gate for certain patterns (see
-    format_and_send), "we don't actually know" should mean "don't fire,"
-    not "assume it's fine."
+    DELIBERATELY KEPT A VOLUME FLOOR the proposal removed entirely — a
+    wick rejection with literally zero volume behind it is
+    indistinguishable from ordinary noise/spread on a thin coin, and the
+    explicit goal (per the audit this session) was minimizing BOTH late
+    entries AND false positives, not earlier entries at any cost. Set
+    at 0.6x average — well below the old 1.5x spike requirement (so a
+    genuinely quiet wick defense still qualifies), but still requires
+    some real participation, not literally nothing.
 
     Returns (triggered: bool, note: str).
     """
@@ -4830,23 +4919,42 @@ def check_5m_sniper_trigger(symbol, direction):
 
         avg_vol5 = sum(vols5[-10:]) / 10 if len(vols5) >= 10 else 1.0
         current_vol = vols5[-1]
+        vol_ratio = current_vol / avg_vol5 if avg_vol5 > 0 else 0
 
-        # A sudden spike in 5m volume, confirming the coil is genuinely breaking
-        vol_spiking = current_vol >= (avg_vol5 * 1.5)
+        c_open, c_high, c_low, c_close = opens5[-1], highs5[-1], lows5[-1], closes5[-1]
+        candle_range = c_high - c_low
+
+        # A sudden spike in 5m volume, confirming a breakout is genuinely underway
+        vol_spiking = vol_ratio >= 1.5
+        # Real, but much lower, participation floor for the early path —
+        # not "dead," but not requiring the crowd to have arrived yet.
+        vol_not_dead = vol_ratio >= 0.6
 
         if direction == "BUY":
-            bullish_close = closes5[-1] > opens5[-1]
-            breaking_high = closes5[-1] > max(highs5[-4:-1])  # breaking recent 5m highs
+            bullish_close = c_close > c_open
+            breaking_high = c_close > max(highs5[-4:-1])
             if bullish_close and breaking_high and vol_spiking:
-                return True, f"5m Sniper Triggered: Bullish break with {current_vol/avg_vol5:.1f}x volume"
+                return True, f"5m Sniper: Breakout confirmed with {vol_ratio:.1f}x volume"
+
+            lower_wick_pct = (min(c_open, c_close) - c_low) / candle_range * 100 if candle_range > 0 else 0
+            is_wick_rejection = lower_wick_pct >= 35.0 and bullish_close
+            reclaiming_micro = len(highs5) >= 3 and c_close > max(highs5[-3:-1]) and bullish_close
+            if (is_wick_rejection or reclaiming_micro) and vol_not_dead:
+                return True, f"5m Sniper: Early micro-reversal/level defense ({vol_ratio:.1f}x vol)"
 
         elif direction == "SELL":
-            bearish_close = closes5[-1] < opens5[-1]
-            breaking_low = closes5[-1] < min(lows5[-4:-1])  # breaking recent 5m lows
+            bearish_close = c_close < c_open
+            breaking_low = c_close < min(lows5[-4:-1])
             if bearish_close and breaking_low and vol_spiking:
-                return True, f"5m Sniper Triggered: Bearish break with {current_vol/avg_vol5:.1f}x volume"
+                return True, f"5m Sniper: Breakdown confirmed with {vol_ratio:.1f}x volume"
 
-        return False, "Waiting for 5m volume/breakout trigger"
+            upper_wick_pct = (c_high - max(c_open, c_close)) / candle_range * 100 if candle_range > 0 else 0
+            is_wick_rejection = upper_wick_pct >= 35.0 and bearish_close
+            reclaiming_micro = len(lows5) >= 3 and c_close < min(lows5[-3:-1]) and bearish_close
+            if (is_wick_rejection or reclaiming_micro) and vol_not_dead:
+                return True, f"5m Sniper: Early micro-reversal/level defense ({vol_ratio:.1f}x vol)"
+
+        return False, "Waiting for 5m volume/breakout or early micro-reversal trigger"
     except Exception as e:
         return False, f"5m trigger error: {e}"
 
@@ -4916,7 +5024,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     # exempting these two specific patterns from this one penalty (not
     # the whole scoring architecture) since dead volume is their intended
     # signature, not a weakness to punish.
-    is_quiet_accumulation_pattern = any(p in setup["pattern"] for p in ("Inside Bar Coil","Pre-Breakout Compression"))
+    is_quiet_accumulation_pattern = any(p in setup["pattern"] for p in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Smart Money Absorption","Funding Divergence Sniper"))
     if not vol_ok and not is_quiet_accumulation_pattern:
         score_penalty += 6; penalty_notes.append("volume soft (-6)")
     if not rsi_ok:
@@ -5268,18 +5376,18 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
                                    hist_wr=hist_wr,hist_signals=p_signals)
         if ai_result and ai_result["trade"]==False:
             stage = ai_result.get("stage","")
-            if stage == "MID":
-                # User-requested carve-out: STAGE:MID means the AI is
-                # genuinely uncertain (still developing, not clearly bad
-                # like a LATE/exhausted move) — send it anyway rather than
-                # veto outright, with the AI's real verdict/confidence/
-                # reasoning shown in the message so the user can make the
-                # final call themselves. STAGE:LATE keeps its existing
-                # retest-logging behavior below, unchanged — this carve-out
-                # is deliberately scoped to MID only, not a blanket
-                # override of AI rejections.
-                logger.info(f"{coin} AI said TRADE:NO but STAGE:MID — sending anyway per user preference, AI notes will be shown")
-            elif stage == "EARLY" and primary_pattern == "Early Spark Ignition":
+            # STAGE:MID CARVE-OUT REMOVED (this round): this was itself a
+            # user-requested feature from an earlier round ("STAGE:MID
+            # means the AI is genuinely uncertain... send it anyway").
+            # Removed now per a deliberate, informed reversal — not a
+            # contradiction of that earlier decision, a real update to it:
+            # a concrete example (NEAR/USDT) showed this carve-out
+            # correctly flooding Telegram with signals the AI had already
+            # flagged as "late to the party," which is exactly the outcome
+            # the carve-out was meant to avoid in the abstract but didn't
+            # in practice. STAGE:EARLY for Early Spark Ignition specifically
+            # is kept, unchanged — see below.
+            if stage == "EARLY" and primary_pattern == "Early Spark Ignition":
                 # STAGE:EARLY override for Early Spark Ignition specifically.
                 # STAGE and TRADE are genuinely independent fields in the AI's
                 # response (verified by reading the actual prompt instructions
@@ -5843,7 +5951,7 @@ def check_active_trades():
                 trade_journal.append({"date":str(datetime.now(IST).date()),"coin":coin,
                     "direction":trade["direction"],"pattern":primary,
                     "entry":trade["entry"],"exit":exit_price,"pnl":pnl,"port_pnl":port_pnl,"result":pnl_result,
-                    "exit_reason":hit,
+                    "exit_reason":hit,"time_to_m1_mins":trade.get("time_to_m1_mins"),
                     "duration":duration,"tf_score":trade.get("tf_score",0),"market_condition":mc})
                 save_journal(); learn_from_trade(coin,primary,pnl_result,pnl,mc,trade.get("tf_score",0))
             em="✅" if pnl_result=="WIN" else "⏰" if hit=="TIMEOUT" else "🔄" if hit=="REVERSAL" else "🛑"
@@ -6725,32 +6833,54 @@ def scan_coins(btc_trend,fng,market_condition,btc_klines=None):
                 # stop the moment BTC ticks down. Placed with the other
                 # early-continue filters above (fails fast, before the
                 # more expensive zone/structure work below runs).
+                #
+                # ACCUMULATION EXEMPTION (this round): VERIFIED THIS
+                # CONFLICT was real before applying, re-checking my own
+                # original reasoning above first. That reasoning is
+                # genuinely correct for patterns that NEED independent
+                # momentum to justify a tight stop — but Smart Money
+                # Absorption's own detection logic REQUIRES a real prior
+                # decline (macro_drop >= 12%) before it even looks for the
+                # coil, meaning a coin in exactly that state will
+                # structurally show negative 4h performance. This is the
+                # same conflict already found and fixed for the Daily EMA
+                # trend veto and the SuperTrend hard block in earlier
+                # rounds — a genuine bottom, by definition, looks red on
+                # a recent-performance measure right up until the
+                # reversal is already underway. Funding Divergence Sniper
+                # included for consistency with the other exemption
+                # tuples in this file, though it's currently a no-op
+                # here specifically — its own block (a few dozen lines
+                # above) already exits the loop before this point is ever
+                # reached.
+                is_early_setup = primary in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Smart Money Absorption","Funding Divergence Sniper")
                 alt_perf, btc_perf = check_relative_strength(symbol, btc_klines)
-                if direction == "BUY" and alt_perf < btc_perf:
-                    logger.info(f"Skip {coin} LONG - underperforming BTC (Beta Trap Risk)")
-                    continue
-                if direction == "SELL" and alt_perf > btc_perf:
-                    logger.info(f"Skip {coin} SHORT - outperforming BTC (Short Squeeze Risk)")
-                    continue
-                # ── THE ABSOLUTE DIRECTIONAL LOCK ──
-                # VERIFIED THIS GAP WAS REAL before applying: the relative
-                # checks above only compare the alt's performance AGAINST
-                # BTC's — they say nothing about the alt's own absolute
-                # direction. Traced the exact scenario through the actual
-                # code: BTC +4%, alt +1% (still genuinely GREEN, still
-                # rising) — confirmed the SHORT gate above does NOT fire
-                # here (alt_perf=0.01 is not > btc_perf=0.04), so the bot
-                # would happily open a SHORT on a coin that's still going
-                # up, purely because it's rising slower than BTC. Fixed
-                # with a hard absolute rule: never short a coin that's
-                # net positive over the window, never long one that's net
-                # negative — regardless of how it compares to BTC.
-                if direction == "SELL" and alt_perf > 0:
-                    logger.info(f"Skip {coin} SHORT - coin is still green ({alt_perf*100:+.2f}%), absolute directional lock")
-                    continue
-                if direction == "BUY" and alt_perf < 0:
-                    logger.info(f"Skip {coin} LONG - coin is still red ({alt_perf*100:+.2f}%), absolute directional lock")
-                    continue
+                if not is_early_setup:
+                    if direction == "BUY" and alt_perf < btc_perf:
+                        logger.info(f"Skip {coin} LONG - underperforming BTC (Beta Trap Risk)")
+                        continue
+                    if direction == "SELL" and alt_perf > btc_perf:
+                        logger.info(f"Skip {coin} SHORT - outperforming BTC (Short Squeeze Risk)")
+                        continue
+                    # ── THE ABSOLUTE DIRECTIONAL LOCK ──
+                    # VERIFIED THIS GAP WAS REAL before applying: the relative
+                    # checks above only compare the alt's performance AGAINST
+                    # BTC's — they say nothing about the alt's own absolute
+                    # direction. Traced the exact scenario through the actual
+                    # code: BTC +4%, alt +1% (still genuinely GREEN, still
+                    # rising) — confirmed the SHORT gate above does NOT fire
+                    # here (alt_perf=0.01 is not > btc_perf=0.04), so the bot
+                    # would happily open a SHORT on a coin that's still going
+                    # up, purely because it's rising slower than BTC. Fixed
+                    # with a hard absolute rule: never short a coin that's
+                    # net positive over the window, never long one that's net
+                    # negative — regardless of how it compares to BTC.
+                    if direction == "SELL" and alt_perf > 0:
+                        logger.info(f"Skip {coin} SHORT - coin is still green ({alt_perf*100:+.2f}%), absolute directional lock")
+                        continue
+                    if direction == "BUY" and alt_perf < 0:
+                        logger.info(f"Skip {coin} LONG - coin is still red ({alt_perf*100:+.2f}%), absolute directional lock")
+                        continue
                 tf_score=get_timeframe_score(symbol,direction)
                 # Accumulation/Early-Spark exemption from the Daily Macro
                 # Veto. WORTH BEING DIRECT ABOUT THE TENSION HERE: this
@@ -6767,7 +6897,7 @@ def scan_coins(btc_trend,fng,market_condition,btc_klines=None):
                 # narrowly to only the same 4 accumulation/early-spark
                 # pattern types that already get the lower score floor,
                 # not a blanket removal of the Daily veto.
-                # TIGHTENED (this round): VERIFIED THE REASONING before
+                # TIGHTENED (earlier round): VERIFIED THE REASONING before
                 # applying — a genuine reversal/bottom-catching pattern
                 # (Early Spark Ignition, Inside Bar Coil resting on a real
                 # zone) legitimately should bypass the Daily Veto, since a
@@ -6785,7 +6915,20 @@ def scan_coins(btc_trend,fng,market_condition,btc_klines=None):
                 # GUESS on major coins, not a bottom-catching pattern like
                 # Early Spark — it belongs in the same "must respect Daily
                 # trend" category as the continuation patterns.
-                is_early_setup = primary in ("Early Spark Ignition","Inside Bar Coil")
+                #
+                # EXPANDED (this round): Smart Money Absorption added.
+                # VERIFIED THIS WAS A GENUINE MISS before applying, not
+                # just applying what was proposed — re-checked my own
+                # classification above and confirmed Smart Money
+                # Absorption fits squarely in the "genuine reversal/
+                # bottom-catching" category, not the continuation
+                # category: its own detection logic requires a real prior
+                # decline (macro_drop >= 12%) before it even looks for the
+                # coil, structurally identical to Early Spark Ignition's
+                # premise. Pressure Cooker Triangle/Pre-Breakout
+                # Compression/Volatility Contraction/Vanguard remain
+                # excluded — that classification stands, unchanged.
+                is_early_setup = primary in ("Early Spark Ignition","Inside Bar Coil","Smart Money Absorption")
                 if tf_score==-1 and not is_early_setup:
                     logger.info(f"Skip {coin} {direction} - counter-trend (Daily Macro Veto enforced)"); continue
                 extras=[p[0] for p in dir_pats[1:3]]
@@ -6921,10 +7064,24 @@ def scan_coins(btc_trend,fng,market_condition,btc_klines=None):
                     if not zone_ok:
                         logger.info(f"Skip {coin} {direction} - {primary} rejected: formed outside real HTF zone (no man's land)")
                         continue
-                if primary == "BOS Breakout":
-                    # Point 1 (BOS + Retest): don't buy the breakout candle
-                    # itself — log it and wait for a genuine, dying-volume
-                    # pullback to the former resistance/support line instead.
+                if primary in ("BOS Breakout","Double Top","Double Bottom"):
+                    # Point 1 (BOS + Retest) extended this round: VERIFIED
+                    # A REAL GAP before applying — the retest gate only
+                    # ever checked `primary == "BOS Breakout"`, but a real
+                    # trade (NEAR/USDT) had "Double Top" as primary with
+                    # "BOS Breakout" riding along as confluence in the
+                    # compound pattern string — meaning this gate never
+                    # applied to that trade at all. Double Top/Bottom
+                    # already have real internal confirmation (neckline
+                    # break+volume, or sweep-and-reject) and already
+                    # require a real HTF zone above — but neither of those
+                    # addresses RETEST TIMING: a confirmed neckline break
+                    # is, by construction, already a late entry relative
+                    # to where the move started. Routes them through the
+                    # same dying-volume retest mechanism BOS Breakout
+                    # already uses, rather than suppressing them entirely
+                    # (which would discard real, working confirmation
+                    # logic these two patterns already have).
                     log_retest_candidate(coin,symbol,direction,closes_chk,highs_chk,lows_chk,pt,pattern_type="bos_retest")
                     continue
                 atr=atr_chk; atr_pct=(atr/price)*100 if price>0 else 0
@@ -6960,7 +7117,7 @@ def main():
                      "starting the bot — it will not run with placeholder credentials, since every "
                      "Telegram send would otherwise fail silently in the background.")
         raise SystemExit(1)
-    global last_river_time,last_hourly_time,last_pnl_update_time,last_8h_desk_time,last_weekly_report_day
+    global last_river_time,last_hourly_time,last_pnl_update_time,last_8h_desk_time,last_weekly_report_day,last_pressure_cooker_time
     load_alerts(); load_circuit_breaker(); load_pending_signals(); load_retest_watchlist(); load_macro_events()
     cloud_load_all()   # loads journal, pattern_stats, learning, active_trades from Supabase (falls back to local JSON)
     threading.Thread(target=poll_telegram,daemon=True).start()
@@ -7063,6 +7220,7 @@ def main():
             if (now-last_pnl_update_time)>=3600:      send_live_pnl_update(); last_pnl_update_time=now
             if (now-last_river_time)>=RIVER_INTERVAL:  scan_river(now,market_condition); last_river_time=now
             if (now-last_8h_desk_time)>=28800:         send_8h_ai_desk_report(); last_8h_desk_time=now  # 8h = 28800s
+            if (now-last_pressure_cooker_time)>=7200:  send_pressure_cooker_report(); last_pressure_cooker_time=now  # 2h = 7200s
             today=datetime.now(IST).date()
             if today.weekday()==6 and last_weekly_report_day!=today:
                 send_weekly_report(); last_weekly_report_day=today
