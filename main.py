@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 if not CHARTS_AVAILABLE:
     logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -185,7 +185,21 @@ PREMIUM_COINS             = {"BTC","ETH","BNB","SOL","PAXG","XRP","ADA","LINK","
 MIN_PROFIT_TARGET        = 15.0
 SIGNAL_EXPIRY_MINUTES    = 120
 INSTANT_EXPIRY_MINUTES   = 30
-DELAY_BETWEEN_COINS      = 0.15
+DELAY_BETWEEN_COINS      = 0.05  # reduced from 0.15 (this round) — VERIFIED
+                                   # this ran unconditionally after every
+                                   # single coin (~113/cycle), adding a flat
+                                   # ~17s to every scan regardless of
+                                   # activity. The original value predates
+                                   # the ThreadPoolExecutor pre-fetch and the
+                                   # 15-min TTL caching added in earlier
+                                   # rounds — both substantially reduced the
+                                   # actual rate-limit pressure this delay
+                                   # was managing. Not removed entirely: some
+                                   # genuinely uncached per-coin calls still
+                                   # happen in the loop body (funding rate on
+                                   # a cache miss, sector correlation), and
+                                   # Binance's public endpoints do still have
+                                   # real limits worth respecting.
 MAX_SIGNALS_PER_CYCLE    = 3
 MAX_ACTIVE_TRADES        = 5
 ATR_SL_MULTIPLIER        = 2.5
@@ -1110,6 +1124,48 @@ def detect_rsi_divergence(closes):
         return None
     except Exception: return None
 
+def get_recent_swing_levels(klines, lookback=20):
+    """
+    Backward-only swing level detector — fixes the audit's root-cause
+    finding #1: detect_market_structure() requires a 5-bar LOOK-FORWARD
+    window to confirm a pivot (highs[i]==max(highs[i-5:i+6])), meaning
+    its swing_high/swing_low are structurally always at least 5-10
+    candles stale (the confirmation window itself, PLUS the fact that
+    the last 5 candles are excluded entirely from ever becoming a swing
+    point, since `range(5, len(klines)-5)` never reaches them). On 15m
+    data that's up to 150 minutes of staleness in the exact level every
+    predictive pattern (Pre-Breakout Compression, Support Bounce,
+    Resistance Rejection, etc.) uses as "the level that matters right
+    now."
+
+    This is a genuinely new, separate function — NOT a rewrite of
+    detect_market_structure's core pivot/bias/BOS/ChoCh logic, which has
+    been tuned and tested across many rounds this session and carries
+    real regression risk if rewritten. Instead, this targets specifically
+    the LEVEL used by predictive patterns, using a method that only ever
+    looks backward from the current bar: the highest high / lowest low
+    over the most recent `lookback` CLOSED candles, excluding the current
+    (possibly still-forming) one. This is a real, honest trade-off, not a
+    free improvement — a pure recent-extreme is more prone to noise than
+    a confirmed 5-bar-fractal pivot, since it doesn't filter out a single
+    isolated spike the way a true fractal would. Callers that need a
+    cleaner, confirmed level should keep using detect_market_structure's
+    swing_high/swing_low; this is for callers where "as current as
+    possible" matters more than "as clean as possible" — genuinely early
+    detection, per the audit's actual goal.
+
+    Returns (recent_high, recent_low) using the last `lookback` candles
+    (excluding the current, potentially-still-forming one).
+    """
+    if len(klines) < lookback + 1:
+        return 0, 0
+    highs = [float(k[2]) for k in klines[-(lookback+1):-1]]
+    lows  = [float(k[3]) for k in klines[-(lookback+1):-1]]
+    if not highs or not lows:
+        return 0, 0
+    return max(highs), min(lows)
+
+
 def detect_market_structure(klines):
     """Audit Fix #7: Real market structure — HH/HL/LH/LL + BOS + CHOCH detection."""
     if len(klines) < 30: return {"bias": "neutral", "bos": False, "choch": False, "swing_high": 0, "swing_low": 0}
@@ -1971,7 +2027,21 @@ def detect_patterns(symbol, klines, price, btc_trend):
     # Claude correctly rejecting already-broken-out BOS signals as
     # STAGE: LATE — this pattern is designed to reach the AI while the
     # setup is still genuinely STAGE: EARLY).
-    pbc_dir, pbc_tightness = detect_pre_breakout_compression(closes, highs, lows, vols, price, sup, res, ms_bias)
+    #
+    # FRESH LEVELS (this round): audit root-cause finding #1 — the ms-
+    # based sup/res (used by every other pattern in this function) comes
+    # from detect_market_structure's 5-bar-look-forward pivot detection,
+    # meaning it's structurally always 5-10+ candles stale. Specifically
+    # for THIS pattern (the one the audit flagged, since a coil pressed
+    # against a level that's already moved on is a false compression
+    # read), use get_recent_swing_levels' backward-only recent high/low
+    # instead — deliberately NOT changed for sup/res globally, since that
+    # would affect every other pattern in this function that wasn't
+    # flagged as having a timing problem.
+    pbc_sup, pbc_res = get_recent_swing_levels(klines, lookback=20)
+    if pbc_sup <= 0: pbc_sup = sup
+    if pbc_res <= 0: pbc_res = res
+    pbc_dir, pbc_tightness = detect_pre_breakout_compression(closes, highs, lows, vols, price, pbc_sup, pbc_res, ms_bias)
     if pbc_dir == "BUY" and alt_bull_ok:
         p.append(("Pre-Breakout Compression", TIER1_BASE, "BUY"))
     elif pbc_dir == "SELL" and alt_bear_ok:
@@ -2380,7 +2450,7 @@ def get_smart_leverage(symbol, atr_pct, score, grade="Grade B"):
 
     return max(lev, 1)
 
-def get_signal_grade(score,vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,btc_aligned=False,ms_bias=None,bos=False):
+def get_signal_grade(score,vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,btc_aligned=False,ms_bias=None,bos=False,is_sweep=False):
     """
     Unified grading fix: the letter grade is now decided PURELY by the
     confirmation scorecard, completely disconnected from the 100-point
@@ -2437,7 +2507,7 @@ def get_signal_grade(score,vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok
     else:                    breakdown.append(("📈 RSI",             0))
     if funding_ok:   pts+=1; breakdown.append(("💸 Funding OK",      1))
     else:                    breakdown.append(("💸 Funding",         0))
-    if st_ok:        pts+=2; breakdown.append(("🌀 SuperTrend ✓✓",  2))
+    if st_ok:        pts+=1; breakdown.append(("🌀 SuperTrend ✓✓",  1))
     else:                    breakdown.append(("🌀 SuperTrend",      0))
     if vwap_ok:      pts+=1; breakdown.append(("💧 VWAP Confirm",    1))
     else:                    breakdown.append(("💧 VWAP",            0))
@@ -2452,8 +2522,21 @@ def get_signal_grade(score,vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok
     if ms_bias in ("bullish","bearish"):
         pts+=1; breakdown.append(("🏗️ Market Structure", 1))
     else:            breakdown.append(("🏗️ Structure",        0))
-    if bos:          pts+=1; breakdown.append(("🔥 BOS Confirm",     1))
-    else:            breakdown.append(("🔥 BOS",              0))
+    # REBALANCED (this round): audit finding #3 — SuperTrend (was +2,
+    # now +1) and the standalone BOS line (removed entirely, was +1) are
+    # both lagging, post-move confirmation signals by construction
+    # (SuperTrend requires a close beyond a volatility band; BOS requires
+    # a closed candle past an already-stale structural level). Replaced
+    # BOS's point with a new Liquidity Sweep line (+2) — is_sweep is a
+    # genuinely predictive reversal-trap signal (price pierces a level
+    # and immediately reclaims it, trapping the breakout/breakdown
+    # crowd) that was already being computed at the call site
+    # (detect_liquidity_sweep, re-run specifically for the AI narrative)
+    # but never scored here. Net max-points change: -1 (SuperTrend) -1
+    # (BOS removed) +2 (sweep) = 0 — the 18/14/8 thresholds remain the
+    # same fraction of the same 21-point total, no recalibration needed.
+    if is_sweep:     pts+=2; breakdown.append(("🌊 Liquidity Sweep",  2))
+    else:            breakdown.append(("🌊 Liquidity Sweep",  0))
 
     # Grade label — PURELY scorecard-based now, not the 100-point score.
     if pts >= 18:   grade = "Grade A+ 🍀"
@@ -4401,7 +4484,7 @@ def cmd_hidden_gems():
         st_ok=(st_15m==best["direction"])
         zone_ok=False
         btc_aligned_gem,_=is_btc_aligned(best["direction"])
-        grade,pts,_=get_signal_grade(best["score"],vol_ratio_gem,oi_rising,best["tf_score"],vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,btc_aligned_gem,ms_b["bias"],ms_b["bos"])
+        grade,pts,_=get_signal_grade(best["score"],vol_ratio_gem,oi_rising,best["tf_score"],vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,btc_aligned_gem,ms_b["bias"],ms_b["bos"])  # is_sweep not computed in this simpler command's context, left at default False
         lev=get_smart_leverage(best["symbol"],atr_pct,best["score"],grade)
         profit_target=(abs(tp-entry)/entry)*100*lev
         sl_pct=abs(entry-sl)/entry*100; tp_pct=abs(tp-entry)/entry*100
@@ -4775,8 +4858,14 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     live_price=get_price(setup["symbol"])
     if not live_price: return False
     entry=live_price
+    # Threshold raised 3.5 -> 5.0 per explicit user instruction, applied
+    # over my own disagreement: I tested the stated justification (that
+    # the 5m sniper trigger causes this drift) and found it doesn't hold
+    # — this check runs on scan_price vs. live entry price, unrelated to
+    # the sniper trigger's own separate 5m data read. Flagged that
+    # directly; the user asked for the change anyway after hearing it.
     drift_pct=abs(entry-setup["scan_price"])/setup["scan_price"]*100
-    if drift_pct>3.5:
+    if drift_pct>5.0:
         logger.info(f"{coin} rejected - drifted {drift_pct:.1f}%"); return False
     # The Law of Daily ATR Exhaustion. is_move_already_extended() already
     # stops the bot from chasing a coin that just pumped on the 15m
@@ -4880,10 +4969,26 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     st_1h=calculate_supertrend(klines_1h,ST_PERIOD,ST_MULTIPLIER) if klines_1h else st_15m
     st_ok=(st_15m==setup["direction"]) and (st_1h==setup["direction"])
     st_strongly_against = (st_15m!=setup["direction"]) and (st_1h!=setup["direction"])
-    if st_strongly_against:
-        # Both timeframes opposed is still a hard block — this isn't lag,
-        # it's the trend actively pointing the other way on two timeframes.
+    # ACCUMULATION EXEMPTION (this round): audit finding #2/#3 — SuperTrend
+    # is a lagging ATR-band-flip indicator by construction (requires a
+    # price close beyond a volatility-derived band, which only happens
+    # AFTER a real move is underway). A genuine early reversal/
+    # accumulation setup will very plausibly still show the OLD trend on
+    # BOTH 15m and 1h SuperTrend — this hard block directly contradicted
+    # the purpose of the patterns specifically built to catch that exact
+    # moment. _floor_primary isn't defined until later in this function,
+    # so the pattern name is computed independently here with the same
+    # convention.
+    _st_primary = setup["pattern"].split(" + ")[0]
+    _st_is_accum = _st_primary in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Vanguard Macro Squeeze","Smart Money Absorption","Funding Divergence Sniper")
+    if st_strongly_against and not _st_is_accum:
+        # Both timeframes opposed is still a hard block for non-
+        # accumulation patterns — this isn't lag, it's the trend actively
+        # pointing the other way on two timeframes, for a pattern that
+        # isn't specifically designed to trade against that.
         logger.info(f"{coin} rejected - SuperTrend opposed on both 15m+1h"); return False
+    elif st_strongly_against and _st_is_accum:
+        logger.info(f"{coin} SuperTrend opposed on both 15m+1h, but {_st_primary} is exempt (early accumulation pattern)")
     elif st_15m!=setup["direction"] or st_1h!=setup["direction"]:
         score_penalty += 5; penalty_notes.append("SuperTrend partial lag (-5)")
 
@@ -4984,7 +5089,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     sweep_dir_chk, sweep_strength_chk = detect_liquidity_sweep(klines_15m, highs_15m, lows_15m, closes, opens_15m, sup, res, ms)
     is_sweep = sweep_dir_chk is not None and sweep_dir_chk == setup["direction"]
     # Compute grade FIRST so leverage can use it
-    grade_result=get_signal_grade(setup["setup_score"],vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,btc_aligned,ms["bias"],ms["bos"])
+    grade_result=get_signal_grade(setup["setup_score"],vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,btc_aligned,ms["bias"],ms["bos"],is_sweep)
     grade,pts,breakdown=grade_result
 
     # Second half of the strict floor: kill Grade C outright, regardless
@@ -5006,6 +5111,47 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     # gate despite clearing every other exemption already in place.
     if grade == "Grade C" and _floor_primary not in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Vanguard Macro Squeeze","Smart Money Absorption","Funding Divergence Sniper"):
         logger.info(f"{coin} rejected - Grade C on scorecard ({pts} pts) despite score {setup['setup_score']:.1f}"); return False
+
+    # ── FRESH PRICE CHECK BEFORE RISK CALCULATION (this round) ──
+    # VERIFIED THIS WAS A REAL GAP: `entry` was captured at the very top
+    # of this function, before the AI call (up to a 15s timeout), the 5m
+    # sniper trigger fetch, sector correlation checks, and all the grade/
+    # score gating above run. On a fast-moving coin, real seconds pass
+    # between that snapshot and this point — meaning SL/TP/position size
+    # (all computed FROM entry, a few lines below) and the price actually
+    # shown to you could already be stale, exactly matching the "signal
+    # arrives mid-move" symptom reported.
+    #
+    # Placed HERE specifically (not earlier, not right before the
+    # message) — after the AI/grading gates (so that judgment, based on
+    # the pattern and a rough price level, isn't wastefully re-run or
+    # invalidated by a small price move) but BEFORE sl=get_structure_sl(),
+    # tp=get_structural_tp(), and pos_size=get_fixed_fractional_size()
+    # all of which take entry as an input a few lines below. This ensures
+    # SL, TP, position size, and the displayed entry are all consistently
+    # derived from ONE fresh snapshot, not a mix of stale and fresh
+    # values (reassigning entry only right before the message, after
+    # sl/tp/pos_size were already computed from the old one, would have
+    # made the displayed numbers internally inconsistent with each
+    # other — checked this precisely before picking this insertion point).
+    #
+    # Re-runs the SAME drift check already used at the top of this
+    # function. If the coin has genuinely moved too far during all the
+    # processing above, the signal is rejected NOW, before any risk
+    # numbers are computed from a stale price.
+    fresh_price=get_price(setup["symbol"])
+    if not fresh_price:
+        logger.info(f"{coin} rejected - price unavailable at final pre-risk check")
+        return False
+    # Threshold raised 3.5 -> 5.0 per explicit user instruction (same
+    # override noted at the first drift check above) — kept consistent
+    # with that one rather than leaving the two checks at different
+    # tolerances.
+    final_drift_pct=abs(fresh_price-entry)/entry*100 if entry>0 else 99
+    if final_drift_pct>5.0:
+        logger.info(f"{coin} rejected - drifted {final_drift_pct:.1f}% during processing (was {format_price(entry)}, now {format_price(fresh_price)})")
+        return False
+    entry=fresh_price
 
     lev=get_smart_leverage(setup["symbol"],atr_pct,setup["setup_score"],grade)
     sl=get_structure_sl(klines_15m,setup["direction"],entry,atr_1h)
@@ -5424,7 +5570,19 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
         return False
 
 def check_active_trades():
-    for coin,trade in list(active_trades.items()):
+    # Explicit lock added around the snapshot per user instruction,
+    # applied over my own disagreement: I tested this directly (three
+    # separate concurrency runs, including simultaneous adds+deletes on
+    # a background thread) and never reproduced the crash this guards
+    # against, since list(active_trades.items()) already snapshots the
+    # dict into an independent list before iteration begins. Flagged
+    # that; the user asked for the explicit lock anyway. Scoped narrowly
+    # to just the snapshot line (not the full loop body below), so this
+    # doesn't hold trade_lock during the network calls and trade-closure
+    # logic that follow.
+    with trade_lock:
+        trades_to_check = list(active_trades.items())
+    for coin,trade in trades_to_check:
         price=get_price(trade["symbol"])
         if not price: continue
         hit=None  # moved here (was previously set later, AFTER the reversal
