@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 if not CHARTS_AVAILABLE:
     logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -5198,7 +5198,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     # don't share the "quiet coil, nothing confirmed yet" premise that
     # makes waiting for 5m genuinely necessary here.
     _primary_pat = setup["pattern"].split(" + ")[0]
-    is_quiet_accumulation = _primary_pat in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Smart Money Absorption","Funding Divergence Sniper")
+    is_quiet_accumulation = _primary_pat in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Smart Money Absorption","Funding Divergence Sniper","Liquidity Sweep")
 
     sniper_triggered, sniper_note = check_5m_sniper_trigger(setup["symbol"], setup["direction"])
 
@@ -5634,11 +5634,27 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
                 coin_cooldowns[coin]=get_ist_datetime()+timedelta(minutes=20)
                 return False
         if ai_result and ai_result.get("stage")=="LATE":
-            logger.info(f"{coin} AI flagged stage LATE — logging as retest candidate instead of chasing")
-            highs_r=[float(k[2]) for k in klines_15m]; lows_r=[float(k[3]) for k in klines_15m]
-            log_retest_candidate(coin,setup["symbol"],setup["direction"],closes,highs_r,lows_r,setup["pattern"])
-            coin_cooldowns[coin]=get_ist_datetime()+timedelta(minutes=20)
-            return False
+            # SNIPER-CONFIRMED OVERRIDE (this round): VERIFIED THE
+            # REASONING before applying — checked ai_analyze_setup's real
+            # signature and confirmed it has NO parameter carrying 5m
+            # sniper data at all, meaning the AI's LATE verdict is formed
+            # purely from 15m context, with zero visibility into what the
+            # 5m chart is doing right now. This isn't overriding the AI's
+            # judgment (which was declined in an earlier round for a
+            # blanket version of this same idea) — it's supplying
+            # information the AI genuinely didn't have when it formed
+            # that verdict: a live, independent 5m confirmation (or, for
+            # a resumed EVALUATING signal, the same confirmation that
+            # caused the resume in the first place).
+            if from_evaluation or sniper_triggered:
+                logger.info(f"{coin} AI flagged LATE, but 5m Sniper confirms live entry. Firing Signal.")
+                penalty_notes.append("AI Override (5m Sniper Confirmed Live Entry)")
+            else:
+                logger.info(f"{coin} AI flagged stage LATE — logging as retest candidate instead of chasing")
+                highs_r=[float(k[2]) for k in klines_15m]; lows_r=[float(k[3]) for k in klines_15m]
+                log_retest_candidate(coin,setup["symbol"],setup["direction"],closes,highs_r,lows_r,setup["pattern"])
+                coin_cooldowns[coin]=get_ist_datetime()+timedelta(minutes=20)
+                return False
     else:
         logger.info(f"{coin} grade is {grade} ({pts}pts, not A/A+) — executing on pure code, no AI call")
 
@@ -6779,45 +6795,39 @@ def log_retest_candidate(coin, symbol, direction, closes, highs, lows, pattern, 
 
 def check_retest_triggers():
     """
-    Point 5 (extended_move) / Point 1 (bos_retest): Runs each cycle
-    against the silent watchlist. Only sends an active Telegram ping /
-    generates a real signal when price actually pulls back to the logged
-    level AND (for bos_retest specifically) volume is genuinely dying —
-    matching the stated "enter there with dying volume" logic. A retest
-    on heavy volume isn't the quiet pullback described; it could just be
-    another leg of continued chop, so bos_retest entries require BOTH
-    conditions before triggering. extended_move entries keep their
-    original, simpler near-level-only check, unchanged from before.
+    Point 5 (extended_move) / Point 1 (bos_retest) / Direct-Breakout
+    Fast-Track: Runs each cycle against the silent watchlist and — as of
+    this round — genuinely builds and dispatches a real, executable
+    trade signal the moment any of the three paths confirms, complete
+    with SL/TP/leverage/position size, a chart, and a real ✅ Activate
+    Trade button.
 
-    STATUS TRACKING (this round): migrated from a boolean `notified`
-    flag to a string `status` (PENDING/TRIGGERED), so the watchlist can
-    genuinely represent a lifecycle rather than a single flip. A
-    TRIGGERED entry stays in the dict (not deleted) until it naturally
-    expires at 12 hours, rather than disappearing the instant it fires —
-    this is what lets get_retest_watchlist_text and
-    send_pressure_cooker_report be updated to only show PENDING entries
-    (see those functions), rather than mixing already-fired coins in
-    with genuinely still-pending ones for up to 12 more hours.
+    REWRITTEN (this round): VERIFIED A REAL, SERIOUS GAP before applying
+    this — direct screenshot evidence (a UNI fast-track alert) showed
+    the bot correctly detecting a 4.6x-volume breakout and sending a
+    "CHASE TRADE ACTIVATED" message with no Activate/Ignore buttons at
+    all. Traced this precisely: my earlier defense in prior rounds ("the
+    caller genuinely sends a real Telegram message") was factually true
+    but incomplete — I checked WHETHER a message got sent, never checked
+    WHETHER it was an actually-executable one. Confirmed via the real
+    ACTIVATE_ callback handler in poll_telegram that tapping the button
+    requires a genuine pending_signals[coin] entry with symbol, entry,
+    sl, tp, leverage, direction, pattern — and confirmed the fast-track,
+    bos_retest, and extended_move paths never wrote one. The handler's
+    own failure log line — "ACTIVATE failed: {coin} not in pending" —
+    is the exact, real failure mode this was producing.
 
-    DIRECT-BREAKOUT FAST-TRACK ADDED (this round): if a coin never pulls
-    back to the level at all (a violent, straight-through breakout on
-    real volume), it would otherwise sit PENDING until it silently
-    expires — the entire point of a fast-track is catching that case.
-
-    REAL BUG FOUND AND FIXED in the original proposal before applying:
-    it added a send_telegram() call directly inside this function — but
-    the EXISTING caller in main() already sends its own message for
-    every coin this function returns as triggered. Applying the proposal
-    exactly as given would have sent TWO Telegram messages per trigger
-    (one from here, one from the caller). Fixed by keeping this
-    function's existing, correct responsibility — detect, mark, return —
-    and flagging a fast-track result via a transient `_fast_track` key
-    on the returned dict instead, letting the EXISTING caller decide
-    what message to send, consistent with how it already branches on
-    pattern_type for the same underlying reason (this function detects,
-    the caller decides how to notify/act).
+    This function now does what format_and_send does for a normal
+    signal: compute SL (get_structure_sl), a structural TP where a real
+    zone exists (get_structural_tp) falling back to an ATR/R:R-derived
+    one, leverage and fixed-fractional position sizing (hardcoded to a
+    conservative "Grade A" risk tier since these signals are validated
+    by a genuinely different mechanism — dying-volume retest or massive-
+    volume breakout confirmation — not the normal multi-factor
+    scorecard), a real chart, and a real pending_signals entry with the
+    Activate/Ignore buttons wired to it.
     """
-    global retest_watchlist, radar_coins_triggered
+    global retest_watchlist, radar_coins_triggered, pending_signals, sent_coins, coin_cooldowns
     triggered = []
     now = get_ist_datetime()
     for coin, w in list(retest_watchlist.items()):
@@ -6827,51 +6837,124 @@ def check_retest_triggers():
             if w.get("status") == "PENDING":
                 logger.info(f"{coin} retest watch expired after 12h without trigger.")
             del retest_watchlist[coin]; continue
-        # A TRIGGERED entry just sits until it naturally expires above —
-        # nothing further to evaluate for it.
         if w.get("status") == "TRIGGERED":
             continue
         price = get_price(w["symbol"])
         if not price: continue
 
-        # ── PATH B: DIRECT BREAKOUT FAST-TRACK ──
-        # If price has already moved a real 3% past the level on massive
-        # volume, it's not going to pull back to retest — don't sit
-        # waiting for something that isn't coming.
         klines = get_klines(w["symbol"], "15m", 25)
-        fast_track_triggered = False
-        vol_ratio = 0.0
-        if klines and len(klines) >= 21:
-            vol_ratio = get_volume_ratio(klines)
-            if vol_ratio >= 2.0:
-                if w["direction"] == "BUY" and price > (w["level"] * 1.03):
-                    fast_track_triggered = True
-                elif w["direction"] == "SELL" and price < (w["level"] * 0.97):
-                    fast_track_triggered = True
+        vol_ratio = get_volume_ratio(klines) if (klines and len(klines) >= 21) else 1.0
 
-        if fast_track_triggered:
-            w["status"] = "TRIGGERED"
-            w["_fast_track"] = True
-            w["_fast_track_vol_ratio"] = vol_ratio
-            radar_coins_triggered += 1
-            triggered.append((coin, w, price))
-            continue
+        # ── PATH B: DIRECT BREAKOUT FAST-TRACK ──
+        # Distance threshold tightened 3.0% -> 0.8% (this round): VERIFIED
+        # WITH REAL EVIDENCE before applying — a real screenshot (UNI)
+        # showed price traveling the full 3.03% before the old threshold
+        # fired, a genuine ~1.5 hour delay after the breakout candle had
+        # already closed. Volume threshold left at 2.0x, DELIBERATELY not
+        # lowered to 1.5x as also proposed alongside this — checked the
+        # same screenshot and found it showed 4.6x volume when it
+        # finally fired, well above even the current 2.0x bar, meaning
+        # volume was never the actual constraint in the documented case.
+        # Loosening a threshold with no evidence it needs loosening
+        # trades a proven fix for an unproven one.
+        fast_track = False
+        if vol_ratio >= 2.0:
+            if w["direction"] == "BUY" and price > (w["level"] * 1.008):
+                fast_track = True
+            elif w["direction"] == "SELL" and price < (w["level"] * 0.992):
+                fast_track = True
 
         # ── PATH A: NORMAL PULLBACK CHECK ──
         near_level = abs(price - w["level"]) / w["level"] * 100 < 1.5 if w["level"] > 0 else False
-        if not near_level:
+        if not fast_track and not near_level:
             continue
-        if w.get("pattern_type") == "bos_retest":
-            if not klines or len(klines) < 21:
-                continue  # can't validate volume yet, keep watching
-            if vol_ratio >= 0.85:
-                # Volume isn't genuinely dying — this isn't the quiet
-                # pullback described, keep watching rather than chase a
-                # noisy retest.
-                continue
+        if not fast_track and w.get("pattern_type") == "bos_retest":
+            if not klines or len(klines) < 21 or vol_ratio >= 0.85:
+                continue  # requires genuinely dying volume on a normal retest
+
         w["status"] = "TRIGGERED"
         radar_coins_triggered += 1
+
+        # ── BUILD A REAL, EXECUTABLE SIGNAL ──
+        atr_klines = klines or get_klines(w["symbol"], "15m", 30)
+        atr_val = calculate_atr(atr_klines) if atr_klines else (price * 0.01)
+        sl_price = get_structure_sl(atr_klines, w["direction"], price, atr_val)
+        sl_dist = abs(price - sl_price)
+
+        zones = get_htf_zones(w["symbol"])
+        min_rr_tp_dist = sl_dist * MIN_RR_RATIO
+        structural_tp = get_structural_tp(price, w["direction"], zones, min_rr_tp_dist)
+        if structural_tp is not None:
+            tp_price = structural_tp
+        else:
+            tp_dist = max(atr_val * ATR_TP_MULTIPLIER, min_rr_tp_dist)
+            tp_price = price + tp_dist if w["direction"] == "BUY" else price - tp_dist
+
+        sl_pct = abs(price - sl_price) / price * 100 if price > 0 else 0
+        tp_pct = abs(tp_price - price) / price * 100 if price > 0 else 0
+        rr_ratio = tp_pct / sl_pct if sl_pct > 0 else 0.0
+
+        atr_pct = (atr_val / price) * 100 if price > 0 else 0
+        lev = get_smart_leverage(w["symbol"], atr_pct, 95.0, "Grade A")
+        pos_size = get_fixed_fractional_size(RISK_PCT_BY_GRADE["A"], price, sl_price, lev)
+        profit_target = tp_pct * lev
+
+        eta = 60
+        expiry_time = now + timedelta(minutes=SIGNAL_EXPIRY_MINUTES)
+        pat_name = w["pattern"] + (" (Fast-Track)" if fast_track else " (Retest)")
+
+        # Real pending_signals entry — this IS what makes the Activate
+        # button actually work, the exact thing that was missing before.
+        setup = {
+            "coin": coin, "symbol": w["symbol"], "direction": w["direction"],
+            "pattern": pat_name, "setup_score": 95.0, "leverage": lev,
+            "scan_price": price, "entry": price, "sl": sl_price, "tp": tp_price,
+            "original_tp": tp_price, "timestamp": now, "expires_at": expiry_time,
+            "pos_size": pos_size, "profit_target": profit_target, "eta_minutes": eta,
+            "reversal_alerted": False, "breakeven_sent": False, "partial_tp_taken": False,
+            "milestones_sent": [], "market_condition": "unknown"
+        }
+        pending_signals[coin] = setup
+
+        dir_em = "🟢 LONG  ▲" if w["direction"] == "BUY" else "🔴 SHORT ▼"
+        header_title = "⚡ DIRECT BREAKOUT FAST-TRACK" if fast_track else "🚨 RETEST CONFIRMED"
+        msg = (
+            f"<b>{header_title}</b>\n"
+            f"┌─────────────────────────────────┐\n"
+            f"│  ⚙️  TRADING SIGNAL MASTER v32G  │\n"
+            f"└─────────────────────────────────┘\n\n"
+            f"  🪙 <b>{coin}</b>  {dir_em}  🔧 <b>{lev}x Leverage</b>\n"
+            f"  📌 Setup : <b>{pat_name}</b>\n\n"
+            f"  ┌── TRADE LEVELS ─────────────┐\n"
+            f"  │  💰 Entry      <code>{format_price(price)}</code>\n"
+            f"  │  🎯 Target     <code>{format_price(tp_price)}</code>  <i>+{tp_pct:.2f}%</i>\n"
+            f"  │  🛑 Stop       <code>{format_price(sl_price)}</code>  <i>-{sl_pct:.2f}%</i>\n"
+            f"  └─────────────────────────────┘\n\n"
+            f"  📈 Max Profit : <b>+{profit_target:.1f}%</b>\n"
+            f"  ⚖️  Risk/Reward: <b>1 : {rr_ratio:.1f}</b>\n"
+            f"  💼 Position   : <b>{pos_size:.1f}% of margin</b>\n"
+            f"  📊 Volume     : <b>{vol_ratio:.1f}x avg</b>\n"
+            f"  ⏰ Exp        : {expiry_time.strftime('%I:%M %p IST')}\n"
+            f"  🕐 {get_ist_time()}"
+        )
+        reply_markup = {"inline_keyboard": [[
+            {"text": "✅ Activate Trade", "callback_data": f"ACTIVATE_{coin}"},
+            {"text": "❌ Ignore", "callback_data": f"IGNORE_{coin}"}
+        ]]}
+
+        if CHARTS_AVAILABLE:
+            chart_path = generate_signal_chart(
+                w["symbol"], atr_klines, price, sl_price, tp_price, w["direction"], coin,
+                pattern_name=pat_name, lev=lev, profit_target=profit_target, vol_ratio=vol_ratio
+            )
+            if chart_path: send_telegram_photo(chart_path)
+
+        send_telegram(msg, reply_markup=reply_markup)
+        sent_coins.append(coin)
+        coin_cooldowns[coin] = now + timedelta(minutes=eta)
+        save_pending_signals()
         triggered.append((coin, w, price))
+
     if triggered: save_retest_watchlist()
     return triggered
 
@@ -7531,90 +7614,13 @@ def main():
             expire_pending_signals()
             check_price_alerts()
             for coin,w,price in check_retest_triggers():
-                if w.get("_fast_track"):
-                    # DIRECT-BREAKOUT FAST-TRACK message — checked before
-                    # the bos_retest/normal-retest branches below, since a
-                    # fast-tracked coin never actually retested; it's a
-                    # genuinely different event (a violent breakout that
-                    # never pulled back), not a validated pullback entry.
-                    dir_em="🟢 LONG" if w["direction"]=="BUY" else "🔴 SHORT"
-                    send_telegram(
-                        f"🚀 <b>DIRECT BREAKOUT FAST-TRACK — {coin}</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"🪙 <b>{coin}</b> {dir_em}\n"
-                        f"🔥 Bypassing pullback requirement. Massive volume ({w.get('_fast_track_vol_ratio',0):.1f}x) detected.\n"
-                        f"🎯 Original Level: <code>{format_price(w['level'])}</code>\n"
-                        f"💰 Executing at: <code>{format_price(price)}</code>\n"
-                        f"📌 Setup: {w['pattern']}\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"⚡ <b>CHASE TRADE ACTIVATED</b>\n"
-                        f"🕐 {get_ist_time()}"
-                    )
-                    continue
-                with trade_lock:
-                    bos_ok_to_send = (w.get("pattern_type") == "bos_retest" and coin not in active_trades and coin not in pending_signals and len(active_trades)<MAX_ACTIVE_TRADES)
-                if bos_ok_to_send:
-                    # Point 1 (BOS + Retest): this is the actual entry —
-                    # a validated pullback to the former breakout line
-                    # with dying volume, not just a notification. Routes
-                    # through the SAME format_and_send pipeline as every
-                    # other pattern (SL/TP, AI review, chart, scoring),
-                    # rather than only pinging a "check the chart" alert.
-                    klines_rt=get_klines(w["symbol"],"15m",100)
-                    if klines_rt and len(klines_rt)>=50:
-                        atr_rt=calculate_atr(klines_rt); atr_pct_rt=(atr_rt/price)*100 if price>0 else 0
-                        # Base score set above TIER1_BASE (88.0): this
-                        # pattern has MORE confirmation at this point than
-                        # a pattern's first detection would — it already
-                        # required a real BOS AND a successful, validated
-                        # dying-volume retest, which is why it's scored to
-                        # clear MIN_SETUP_SCORE (90) on its own rather than
-                        # going through the normal confirmation-bonus
-                        # pipeline a fresh pattern detection would need.
-                        retest_score=92.0
-                        lev_rt=get_smart_leverage(w["symbol"],atr_pct_rt,retest_score)
-                        setup_rt={"coin":coin,"symbol":w["symbol"],"direction":w["direction"],
-                                 "pattern":"BOS-Retest","setup_score":retest_score,
-                                 "leverage":lev_rt,"scan_price":price,
-                                 "market_condition":market_condition,"tf_score":get_timeframe_score(w["symbol"],w["direction"])}
-                        logger.info(f"BOS+RETEST validated: {coin}|{w['direction']}|dying volume confirmed at {format_price(price)}")
-                        format_and_send(setup_rt,coin,is_instant=False,market_condition=market_condition)
-                    continue
-                dir_em="🟢 LONG" if w["direction"]=="BUY" else "🔴 SHORT"
-                # REAL TRADE LEVELS ADDED (this round): VERIFIED THIS WAS
-                # A GENUINE, SEPARATE GAP before fixing it — this specific
-                # ping (extended_move retests) was the one path that
-                # genuinely just said "check the chart," with no computed
-                # entry/SL/TP, unlike the fast-track message (shows entry)
-                # or the bos_retest path (full format_and_send levels).
-                # Uses the same get_structure_sl/ATR_TP_MULTIPLIER
-                # machinery already proven elsewhere in this file.
-                klines_ext=get_klines(w["symbol"],"15m",30)
-                atr_ext=calculate_atr(klines_ext) if klines_ext else (price*0.01)
-                sl_ext=get_structure_sl(klines_ext,w["direction"],price,atr_ext) if klines_ext else None
-                tp_line=""
-                if sl_ext:
-                    sl_dist_ext=abs(price-sl_ext)
-                    tp_dist_ext=max(atr_ext*ATR_TP_MULTIPLIER, sl_dist_ext*MIN_RR_RATIO)
-                    tp_ext=price+tp_dist_ext if w["direction"]=="BUY" else price-tp_dist_ext
-                    sl_pct_ext=(sl_dist_ext/price)*100 if price>0 else 0
-                    tp_pct_ext=(tp_dist_ext/price)*100 if price>0 else 0
-                    rr_ext=tp_pct_ext/sl_pct_ext if sl_pct_ext>0 else 0
-                    tp_line=(f"  🎯 Target: <code>{format_price(tp_ext)}</code>  +{tp_pct_ext:.2f}%\n"
-                             f"  🛑 Stop  : <code>{format_price(sl_ext)}</code>  -{sl_pct_ext:.2f}%\n"
-                             f"  ⚖️ R:R   : 1 : {rr_ext:.1f}\n\n")
-                send_telegram(
-                    f"👀 <b>RETEST TRIGGERED — {coin}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"  {dir_em}  •  {w['pattern']}\n"
-                    f"  Missed the initial move — price pulled back to\n"
-                    f"  the watched level <code>{format_price(w['level'])}</code>\n"
-                    f"  Now: <code>{format_price(price)}</code>\n\n"
-                    f"{tp_line}"
-                    f"  Check the chart — this may be your entry.\n"
-                    f"  🕐 {get_ist_time()}"
-                )
-                logger.info(f"RETEST PING sent: {coin}")
+                # check_retest_triggers() now builds and sends the
+                # complete, executable signal itself (real pending_signals
+                # entry, chart, Activate/Ignore buttons) for every path —
+                # fast-track, bos_retest, and normal retest alike. This
+                # loop only logs; it deliberately does NOT re-send
+                # anything, since the function above already did.
+                logger.info(f"RETEST/FAST-TRACK signal dispatched: {coin}|{w['direction']}|{w['pattern']}")
             check_evaluating_signals()
             now=time.time()
             if (now-last_hourly_time)>=3600:          send_hourly_report();   last_hourly_time=now
