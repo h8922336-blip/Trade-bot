@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 if not CHARTS_AVAILABLE:
     logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -106,6 +106,9 @@ pending_signals           = {}
 hourly_queue              = {}
 sent_coins                = []
 daily_losses              = 0
+total_scan_cycles         = 0
+radar_coins_added         = 0
+radar_coins_triggered     = 0
 circuit_breaker_until     = None
 last_reset_day            = datetime.now(IST).date()
 trade_journal             = []
@@ -122,6 +125,7 @@ JOURNAL_MAX_LIVE_ENTRIES  = 2000
 learning_notes            = []
 coin_cooldowns            = {}
 early_watch_sent          = {}  # coin -> last Early Watch notification time, rate-limits the heads-up to once/hour per coin
+evaluating_signals        = {}  # coin -> {"setup": setup, "market_condition": mc, "logged_at": timestamp} — the EVALUATING state holding pen
 retest_watchlist          = {}   # coin -> {level, direction, pattern, logged_at, symbol}
 htf_zones_cache           = {}   # symbol -> {"zones": {...}, "cached_at": datetime} — 15min TTL, see get_htf_zones
 consecutive_loss_patterns = {}
@@ -145,6 +149,7 @@ last_river_time        = 0
 last_hourly_time       = time.time()
 last_pnl_update_time   = time.time() + 1800
 last_8h_desk_time      = time.time()
+_bot_start_time        = time.time()  # set once at process start, for /summary's uptime display
 last_pressure_cooker_time = time.time()
 last_weekly_report_day = None
 
@@ -506,6 +511,30 @@ def save_pending_signals():
             s[coin]=d
         atomic_json_write("pending_signals.json", s)
     except Exception as e: logger.error(f"save_pending: {e}")
+
+def save_evaluating_signals():
+    try:
+        s = {}
+        for coin, data in list(evaluating_signals.items()):
+            d = dict(data)
+            if isinstance(d.get("logged_at"), datetime):
+                d["logged_at"] = d["logged_at"].isoformat()
+            s[coin] = d
+        atomic_json_write("evaluating_signals.json", s)
+    except Exception as e: logger.error(f"save_evaluating_signals: {e}")
+
+def load_evaluating_signals():
+    global evaluating_signals
+    try:
+        if not os.path.exists("evaluating_signals.json"): return
+        with open("evaluating_signals.json") as f: data = json.load(f)
+        for coin, d in data.items():
+            if d.get("logged_at"):
+                try: d["logged_at"] = datetime.fromisoformat(d["logged_at"])
+                except Exception: d["logged_at"] = get_ist_datetime()
+            evaluating_signals[coin] = d
+        logger.info(f"Loaded {len(evaluating_signals)} evaluating signals.")
+    except Exception as e: logger.error(f"load_evaluating_signals: {e}")
 
 def save_retest_watchlist():
     try:
@@ -3825,6 +3854,50 @@ def get_pattern_stats_text():
     text+=f"  🕐 {get_ist_time()}"
     return text
 
+def get_detailed_summary_text():
+    """
+    System Telemetry & Summary — the /summary command's new content.
+    Prepends cycle-count and radar-conversion telemetry ahead of the
+    existing 10-day performance breakdown (copied here directly from
+    get_10day_summary_text's real logic, not left as a placeholder —
+    that function is left in place, unchanged, for any other caller
+    still using it directly).
+    """
+    today=datetime.now(IST).date()
+    conversion_rate = (radar_coins_triggered / radar_coins_added * 100) if radar_coins_added > 0 else 0
+    uptime_secs = time.time() - _bot_start_time
+    uptime_h = int(uptime_secs // 3600); uptime_m = int((uptime_secs % 3600) // 60)
+
+    text = f"{_H('SYSTEM TELEMETRY & SUMMARY','⚙️')}\n\n"
+    text += f"  🔄 Scan Cycles: <b>{total_scan_cycles}</b>  •  ⏱️ Uptime: <b>{uptime_h}h {uptime_m}m</b>\n"
+    text += f"  📡 Radar Conversions: {radar_coins_triggered}/{radar_coins_added} (<b>{conversion_rate:.1f}%</b>)\n"
+    text += f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    ow=ol=0; op=0.0; best_pnl=worst_pnl=None; best_ds=worst_ds=""
+    for days_ago in range(9,-1,-1):
+        day=today-timedelta(days=days_ago)
+        dt=[j for j in trade_journal if j.get("date")==str(day)]
+        w=sum(1 for t in dt if t["result"]=="WIN"); l=sum(1 for t in dt if t["result"]=="LOSS")
+        total=w+l; pnl=sum(t.get("port_pnl", t["pnl"]) for t in dt)
+        ow+=w; ol+=l; op+=pnl; ds=day.strftime("%d %b")
+        if total==0:
+            text+=f"  ⚪ <b>{ds}</b>  ──────────  No trades\n"
+        else:
+            em="✅" if w>l else "❌" if l>w else "➖"
+            bar="█"*w+"░"*l
+            text+=f"  {em} <b>{ds}</b>  [{bar[:8]}]  {w}W/{l}L  {fmt_pnl(pnl)}\n"
+            if best_pnl is None or pnl>best_pnl: best_pnl=pnl; best_ds=ds
+            if worst_pnl is None or pnl<worst_pnl: worst_pnl=pnl; worst_ds=ds
+    ot=ow+ol; owr=(ow/ot*100) if ot>0 else 0
+    text+=(f"\n  ══════════════════════════════\n"
+           f"  ✅ Wins     : {ow}   ❌ Losses  : {ol}\n"
+           f"  🎯 Win Rate : <b>{owr:.1f}%</b>\n"
+           f"  💰 PnL      : {fmt_pnl(op)}   📊 Avg/Day: {fmt_pnl(op/10)}\n")
+    if best_ds:  text+=f"  🏆 Best Day : {best_ds}  ({fmt_pnl(best_pnl)})\n"
+    if worst_ds: text+=f"  📉 Worst    : {worst_ds}  ({fmt_pnl(worst_pnl)})\n"
+    text+=f"  🕐 {get_ist_time()}"
+    return text
+
 def get_10day_summary_text():
     today=datetime.now(IST).date()
     text=f"{_H('10-DAY PERFORMANCE','📅')}\n\n"
@@ -4075,10 +4148,15 @@ def send_pressure_cooker_report():
     "nothing to report" message, consistent with the existing "don't
     spam" design goal.
     """
-    if not retest_watchlist:
+    # PENDING-only filter (this round) — same reasoning as
+    # get_retest_watchlist_text: TRIGGERED entries now persist until
+    # their 12h expiry rather than disappearing immediately, and this
+    # report's whole premise is "here's what's currently on the radar."
+    pending = {c: w for c, w in retest_watchlist.items() if w.get("status", "PENDING") == "PENDING"}
+    if not pending:
         return
-    lines = [f"👀 <b>PRESSURE COOKER REPORT</b>", f"⚙️ <b>{len(retest_watchlist)} coin(s) on the radar</b>", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", ""]
-    for coin, w in sorted(retest_watchlist.items(), key=lambda kv: kv[1]["logged_at"], reverse=True):
+    lines = [f"👀 <b>PRESSURE COOKER REPORT</b>", f"⚙️ <b>{len(pending)} coin(s) on the radar</b>", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", ""]
+    for coin, w in sorted(pending.items(), key=lambda kv: kv[1]["logged_at"], reverse=True):
         age_hrs = (get_ist_datetime() - w["logged_at"]).total_seconds() / 3600
         dir_icon = "🟢" if w["direction"] == "BUY" else "🔴"
         reason = "waiting for pullback to breakout line" if w.get("pattern_type") == "bos_retest" else "move already extended, watching for retest"
@@ -4904,93 +4982,137 @@ def check_5m_sniper_trigger(symbol, direction):
     """
     The Law of Two-Stage Execution (The Sniper Trigger).
 
-    UPDATED (this round): added a second, earlier trigger path alongside
-    the original breakout-with-volume one, rather than replacing it —
-    VERIFIED THE REAL DIAGNOSIS before making this change: the original
-    version only fired on a genuine breakout candle (current_vol >=
-    1.5x avg AND price breaking recent highs/lows), which by definition
-    only confirms AFTER the initial pump has already happened — the
-    exact "buying candle 8" problem. Added a second path: a wick
-    rejection or micro-reclaim while price is STILL near the level, on
-    much lower volume, catching genuine level-defense before the loud
-    breakout candle forms.
+    "BLIND TO THE PAST" BUG FIXED (this round): VERIFIED THIS WAS REAL
+    AND SEVERE before applying, cross-checked against actual production
+    screenshots — confirmed the previous version only ever checked index
+    [-1] (the single most recent 5m candle). The scan cycle runs every
+    ~90s, but a 5m candle only closes every 5 minutes — meaning most
+    scan cycles re-check the exact same still-forming candle multiple
+    times, and a genuine wick rejection or micro-reclaim that happened
+    1-2 candles (5-10 minutes) in the past was structurally invisible to
+    this check. This is mathematically consistent with real observed
+    behavior: dozens of coins sitting in "EARLY WATCH — waiting for the
+    5m trigger to confirm" for hours, since the exact moment their real
+    reversal candle formed, this check likely wasn't looking at it.
 
-    VERIFIED THE PROPOSED REPLACEMENT CODE before adapting it (not just
-    trusted it as given): found a genuinely dead/confusing line in the
-    version I was handed — a `lows5` list built from an undefined
-    `klines` variable inside a ternary branch that can never execute
-    (`X if False else Y` always evaluates Y in Python, so the broken
-    branch is never actually reached) — confirmed via direct execution
-    this doesn't crash, but it's vestigial copy-paste debris, cleaned up
-    here rather than carried forward. Also verified the -3:-1 slicing
-    used for the micro-reclaim condition has no lookahead bias (excludes
-    the current candle from its own comparison baseline).
+    Fixed by checking the last 3 candles (not just the current one).
+    VERIFIED THE REPLACEMENT LOGIC directly before adopting it (not
+    trusted blindly, per this session's standard) — confirmed the
+    k5[i-4:i] comparison windows across all three loop iterations have
+    no lookahead bias (each window correctly excludes the candle being
+    evaluated), and confirmed the volume baseline (a fixed 10-candle
+    window at k5[-13:-3]) deliberately excludes the 3 candles being
+    checked from their own average — a genuine improvement over the
+    prior rolling vols5[-10:] baseline, which would have let a candle's
+    own volume inflate the average it's being compared against.
 
-    DELIBERATELY KEPT A VOLUME FLOOR the proposal removed entirely — a
-    wick rejection with literally zero volume behind it is
-    indistinguishable from ordinary noise/spread on a thin coin, and the
-    explicit goal (per the audit this session) was minimizing BOTH late
-    entries AND false positives, not earlier entries at any cost. Set
-    at 0.6x average — well below the old 1.5x spike requirement (so a
-    genuinely quiet wick defense still qualifies), but still requires
-    some real participation, not literally nothing.
+    Still keeps a real, non-zero volume floor (vol_not_dead >= 0.6x) —
+    a wick rejection with literally zero participation behind it is
+    still indistinguishable from noise on a thin coin; this session's
+    explicit goal has consistently been minimizing BOTH late entries
+    AND false positives, not earlier entries at any cost.
 
     Returns (triggered: bool, note: str).
     """
     try:
         k5 = get_klines(symbol, "5m", 15)
-        if not k5 or len(k5) < 10:
+        if not k5 or len(k5) < 13:
             return False, "5m data unavailable"
 
-        closes5 = [float(k[4]) for k in k5]
-        opens5  = [float(k[1]) for k in k5]
-        highs5  = [float(k[2]) for k in k5]
-        lows5   = [float(k[3]) for k in k5]
-        vols5   = [float(k[5]) for k in k5]
+        # Check the last 3 candles so a recent wick/reclaim that already
+        # happened isn't invisible just because a newer, quieter candle
+        # has since formed on top of it.
+        for i in range(-3, 0):
+            c_open, c_high, c_low, c_close = float(k5[i][1]), float(k5[i][2]), float(k5[i][3]), float(k5[i][4])
+            candle_range = c_high - c_low
 
-        avg_vol5 = sum(vols5[-10:]) / 10 if len(vols5) >= 10 else 1.0
-        current_vol = vols5[-1]
-        vol_ratio = current_vol / avg_vol5 if avg_vol5 > 0 else 0
+            avg_v = sum(float(x[5]) for x in k5[-13:-3]) / 10 if len(k5) >= 13 else 1.0
+            vol_ratio = float(k5[i][5]) / avg_v if avg_v > 0 else 0
+            vol_spiking = vol_ratio >= 1.5
+            vol_not_dead = vol_ratio >= 0.6
 
-        c_open, c_high, c_low, c_close = opens5[-1], highs5[-1], lows5[-1], closes5[-1]
-        candle_range = c_high - c_low
+            if direction == "BUY":
+                bullish_close = c_close > c_open
+                breaking_high = c_close > max(float(x[2]) for x in k5[i-4:i]) if len(k5[:i]) >= 4 else False
+                if bullish_close and breaking_high and vol_spiking:
+                    return True, f"5m Sniper: Breakout confirmed ({vol_ratio:.1f}x volume)"
+                lower_wick_pct = (min(c_open, c_close) - c_low) / candle_range * 100 if candle_range > 0 else 0
+                if (lower_wick_pct >= 35.0 or breaking_high) and bullish_close and vol_not_dead:
+                    return True, f"5m Sniper: Early micro-reversal/level defense ({vol_ratio:.1f}x vol)"
 
-        # A sudden spike in 5m volume, confirming a breakout is genuinely underway
-        vol_spiking = vol_ratio >= 1.5
-        # Real, but much lower, participation floor for the early path —
-        # not "dead," but not requiring the crowd to have arrived yet.
-        vol_not_dead = vol_ratio >= 0.6
-
-        if direction == "BUY":
-            bullish_close = c_close > c_open
-            breaking_high = c_close > max(highs5[-4:-1])
-            if bullish_close and breaking_high and vol_spiking:
-                return True, f"5m Sniper: Breakout confirmed with {vol_ratio:.1f}x volume"
-
-            lower_wick_pct = (min(c_open, c_close) - c_low) / candle_range * 100 if candle_range > 0 else 0
-            is_wick_rejection = lower_wick_pct >= 35.0 and bullish_close
-            reclaiming_micro = len(highs5) >= 3 and c_close > max(highs5[-3:-1]) and bullish_close
-            if (is_wick_rejection or reclaiming_micro) and vol_not_dead:
-                return True, f"5m Sniper: Early micro-reversal/level defense ({vol_ratio:.1f}x vol)"
-
-        elif direction == "SELL":
-            bearish_close = c_close < c_open
-            breaking_low = c_close < min(lows5[-4:-1])
-            if bearish_close and breaking_low and vol_spiking:
-                return True, f"5m Sniper: Breakdown confirmed with {vol_ratio:.1f}x volume"
-
-            upper_wick_pct = (c_high - max(c_open, c_close)) / candle_range * 100 if candle_range > 0 else 0
-            is_wick_rejection = upper_wick_pct >= 35.0 and bearish_close
-            reclaiming_micro = len(lows5) >= 3 and c_close < min(lows5[-3:-1]) and bearish_close
-            if (is_wick_rejection or reclaiming_micro) and vol_not_dead:
-                return True, f"5m Sniper: Early micro-reversal/level defense ({vol_ratio:.1f}x vol)"
+            elif direction == "SELL":
+                bearish_close = c_close < c_open
+                breaking_low = c_close < min(float(x[3]) for x in k5[i-4:i]) if len(k5[:i]) >= 4 else False
+                if bearish_close and breaking_low and vol_spiking:
+                    return True, f"5m Sniper: Breakdown confirmed ({vol_ratio:.1f}x volume)"
+                upper_wick_pct = (c_high - max(c_open, c_close)) / candle_range * 100 if candle_range > 0 else 0
+                if (upper_wick_pct >= 35.0 or breaking_low) and bearish_close and vol_not_dead:
+                    return True, f"5m Sniper: Early micro-reversal/level defense ({vol_ratio:.1f}x vol)"
 
         return False, "Waiting for 5m volume/breakout or early micro-reversal trigger"
     except Exception as e:
         return False, f"5m trigger error: {e}"
 
 
-def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition="bull"):
+def check_evaluating_signals():
+    """
+    The Poll & Resume half of the two-stage EVALUATING pipeline. Runs
+    every scan cycle against coins currently held in evaluating_signals
+    — checks the 5m sniper for each one, and if it fires within the 45-
+    minute window, resumes format_and_send with the held setup.
+
+    VERIFIED A REAL GAP before applying this, that the original
+    blueprint didn't address: the held `setup` dict's `scan_price` is
+    anchored to the moment of INITIAL 15m detection. If left unchanged
+    across a resume that can happen up to 45 minutes later,
+    format_and_send's first drift check (which compares a freshly
+    fetched live price against `setup["scan_price"]`) would silently
+    have its meaning repurposed — instead of measuring the same-cycle
+    detection-to-execution latency it was built to catch, it would be
+    comparing a fresh price against an up-to-45-minute-old anchor,
+    which is a fundamentally different (and much noisier) question.
+    Fixed by refreshing `scan_price` to the current price right before
+    resuming, so that check's semantics stay consistent whether a
+    signal flowed through in one pass or was held and resumed — this
+    doesn't remove the drift check, it keeps it measuring what it's
+    actually meant to measure at the moment of the real decision.
+    """
+    global evaluating_signals
+    triggered_any = False
+    now = get_ist_datetime()
+
+    for coin, data in list(evaluating_signals.items()):
+        # Give it 45 minutes (9 x 5m candles) to fire before giving up
+        minutes_active = (now - data["logged_at"]).total_seconds() / 60
+        if minutes_active > 45:
+            logger.info(f"{coin} evaluation expired — no 5m trigger within 45 mins.")
+            del evaluating_signals[coin]
+            triggered_any = True
+            continue
+
+        setup = data["setup"]
+        market_condition = data["market_condition"]
+
+        sniper_triggered, sniper_note = check_5m_sniper_trigger(setup["symbol"], setup["direction"])
+
+        if sniper_triggered:
+            logger.info(f"{coin} EVALUATING signal triggered: {sniper_note} — Resuming pipeline.")
+            del evaluating_signals[coin]
+            triggered_any = True
+
+            # Refresh scan_price to now (see docstring) before resuming,
+            # so format_and_send's own drift check measures fresh
+            # latency, not staleness accumulated across the hold.
+            fresh_scan_price = get_price(setup["symbol"])
+            if fresh_scan_price:
+                setup["scan_price"] = fresh_scan_price
+
+            format_and_send(setup, coin, market_condition=market_condition, from_evaluation=True)
+
+    if triggered_any:
+        save_evaluating_signals()
+
+def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition="bull",from_evaluation=False):
     global sent_coins,coin_cooldowns
     if check_circuit_breaker(): return False
     if not is_good_trading_session(coin): return False
@@ -5080,52 +5202,71 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
 
     sniper_triggered, sniper_note = check_5m_sniper_trigger(setup["symbol"], setup["direction"])
 
-    if is_quiet_accumulation and not sniper_triggered:
-        # EARLY WATCH NOTIFICATION (this round): VERIFIED THE CORE
-        # DIAGNOSIS before building this — confirmed a quiet accumulation
-        # pattern genuinely gets silently discarded here every single
-        # cycle it doesn't trigger, with zero visibility to the user
-        # until the moment it finally does (or never does, and just
-        # keeps quietly failing this check until the pattern itself stops
-        # firing). That's a real, legitimate gap: "the setup exists and
-        # is close" is genuinely useful information on its own, distinct
-        # from "the setup has now triggered for real."
-        #
-        # Deliberately NOT the proposed 3-tier scoring system — checked
-        # that proposal's actual code and found it referenced undefined
-        # variables/constants, and its proximity+compression scoring
-        # closely duplicates what Pre-Breakout Compression's own
-        # detection function already checks internally (proximity to a
-        # real level, tight candles, quiet volume) before ever appending
-        # to the pattern list — the fact that the pattern fired at all IS
-        # the proximity signal, no need to recompute it here. This sends
-        # a genuine, clearly-labeled heads-up using data already
-        # available at this point, without inventing a second, partially
-        # redundant scoring path or a new signal category that would need
-        # its own SL/TP/position-size handling.
-        #
-        # Rate-limited per coin so this doesn't fire every ~90s cycle for
-        # the same still-coiling setup — once per watch window.
-        if coin not in early_watch_sent or (get_ist_datetime()-early_watch_sent[coin]).total_seconds()>3600:
-            early_watch_sent[coin]=get_ist_datetime()
-            send_telegram(
-                f"🟡 <b>EARLY WATCH — {coin}</b>\n"
-                f"⚙️ <b>TRADING SIGNAL MASTER v32G</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"🪙 <b>{coin}</b>  {'🟢' if setup['direction']=='BUY' else '🔴'} {setup['direction']}\n"
-                f"📌 Pattern: {_primary_pat}\n"
-                f"💰 Watching near: <code>{format_price(setup['scan_price'])}</code>\n\n"
-                f"⏳ Coiled on 15m, waiting for the 5m trigger to confirm —\n"
-                f"   this is NOT a trade signal, just a heads-up that a\n"
-                f"   real setup is forming. A full signal follows only if\n"
-                f"   the 5m chart actually confirms.\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🕐 {get_ist_time()}"
-            )
-        logger.info(f"{coin} {setup['direction']} coiled on 15m, but waiting for 5m execution: {sniper_note}")
-        return False  # rejected THIS cycle only — re-evaluated fresh on the next ~90s scan, no cooldown applied
+    if is_quiet_accumulation and not sniper_triggered and not from_evaluation:
+        # DEEP COIL BYPASS (earlier round): if the setup already scores A+
+        # (>=92.0) AND is genuinely sitting inside a confirmed HTF zone,
+        # skip the 5m wait entirely and send now — a setup this strong,
+        # already resting on a real institutional level, doesn't need
+        # the extra confirmation layer the sniper exists to provide for
+        # weaker setups. FOUND A REAL BUG IN THE PROPOSED CODE before
+        # applying it (that round): it referenced `zone_ok` directly, but
+        # that variable isn't computed until much later in this same
+        # function — using it here as given would raise a NameError and
+        # crash every single accumulation-pattern signal, not just
+        # selectively bypass some of them. Fixed by computing a local,
+        # narrowly-scoped zone check specifically for this bypass — a
+        # small, accepted extra fetch only for accumulation patterns
+        # actually being evaluated here, not added to every signal's cost.
+        _deep_coil_zones = get_htf_zones(setup["symbol"])
+        _deep_coil_zone_ok, _deep_coil_zone_label = is_in_zone(entry, setup["direction"], _deep_coil_zones)
+        if _deep_coil_zone_ok and setup["setup_score"] >= 92.0:
+            logger.info(f"{coin} Deep Coil Bypass — A+ score ({setup['setup_score']:.1f}) already sitting in {_deep_coil_zone_label}, skipping 5m wait")
+            penalty_notes.append("Deep Coil Bypass (Instant Entry)")
+        else:
+            # SUSPEND AND HOLD (this round): moved from "discard and
+            # re-detect next cycle" to a genuine EVALUATING state — the
+            # setup (with all its already-computed math: SL/TP inputs,
+            # score, leverage) is saved to evaluating_signals rather than
+            # thrown away, and check_evaluating_signals() polls the 5m
+            # sniper for it every scan cycle without needing to
+            # re-detect the 15m pattern from scratch.
+            if coin not in evaluating_signals:
+                evaluating_signals[coin] = {
+                    "setup": setup,
+                    "market_condition": market_condition,
+                    "logged_at": get_ist_datetime()
+                }
+                save_evaluating_signals()
 
-    if sniper_triggered:
+                # Rate-limit the Telegram heads-up (same early_watch_sent
+                # mechanism already proven from an earlier round).
+                if coin not in early_watch_sent or (get_ist_datetime()-early_watch_sent[coin]).total_seconds()>3600:
+                    early_watch_sent[coin]=get_ist_datetime()
+                    send_telegram(
+                        f"🟡 <b>EARLY ENTRY CHECKPOINT — {coin}</b>\n"
+                        f"⚙️ <b>TRADING SIGNAL MASTER v32G</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"🪙 <b>{coin}</b>  {'🟢' if setup['direction']=='BUY' else '🔴'} {setup['direction']}\n"
+                        f"📌 Pattern: {_primary_pat}\n"
+                        f"💰 Price coiling at: <code>{format_price(setup['scan_price'])}</code>\n\n"
+                        f"⏳ <b>STATUS: EVALUATING (45m Window)</b>\n"
+                        f"   The 15m/1h trend is compressing early. We are now\n"
+                        f"   waiting for the exact 5-minute wick rejection to\n"
+                        f"   fire the executable trade signal.\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🕐 {get_ist_time()}"
+                    )
+            logger.info(f"{coin} {setup['direction']} coiled on 15m, moved to EVALUATING state.")
+            return False  # halts cleanly — check_evaluating_signals() resumes this via the held setup, not a fresh re-detection
+
+    # Sniper-note attribution: an instantly-confirmed trigger, a resumed
+    # EVALUATING trigger, and a soft-penalty non-accumulation pattern are
+    # three genuinely distinct cases worth distinguishing in the log/
+    # scorecard, not collapsed into one "5m Sniper Executed" note.
+    if from_evaluation:
+        logger.info(f"{coin} 5m Sniper confirmed from EVALUATING state.")
+        penalty_notes.append("5m Sniper Executed (Post-Evaluation)")
+    elif sniper_triggered:
         logger.info(f"{coin} {sniper_note} — EXECUTING EARLY ENTRY")
         penalty_notes.append("5m Sniper Executed")
     else:
@@ -6161,7 +6302,7 @@ def poll_telegram():
                         else: send_telegram(f"{_H('PENDING SIGNALS','⏳')}\n\n  ⚪ No pending signals.\n\n  🕐 {get_ist_time()}")
                     elif txt_slash=="/retests":   safe_send(get_retest_watchlist_text,"👀 Retests")
                     elif txt_slash=="/stats":    safe_send(get_pattern_stats_text,"📈 Stats")
-                    elif txt_slash=="/summary":  safe_send(get_10day_summary_text,"📅 Summary")
+                    elif txt_slash=="/summary":  safe_send(get_detailed_summary_text,"📅 Summary")
                     elif txt_slash=="/streak":   safe_send(get_streak_text,"🔥 Streak")
                     elif txt_slash=="/best":     safe_send(get_best_text,"🏆 Best")
                     elif txt_slash=="/risk":     safe_send(get_risk_text,"🛡️ Risk")
@@ -6332,7 +6473,7 @@ def poll_telegram():
                         else:
                             send_telegram(f"{_H('PENDING SIGNALS','⏳')}\n\n  ⚪ No pending signals right now.\n\n  🕐 {get_ist_time()}")
                     elif txt_clean in ("📈 stats","📈 pattern stats"):    safe_send(get_pattern_stats_text,"📈 Stats")
-                    elif txt_clean in ("📅 summary","📅 10-day summary"):  safe_send(get_10day_summary_text,"📅 Summary")
+                    elif txt_clean in ("📅 summary","📅 10-day summary"):  safe_send(get_detailed_summary_text,"📅 Summary")
                     elif txt_clean=="🔥 streak":   safe_send(get_streak_text,"🔥 Streak")
                     elif txt_clean=="🏆 best":     safe_send(get_best_text,"🏆 Best")
                     elif txt_clean in ("🛡️ risk","🛡 risk"):  safe_send(get_risk_text,"🛡 Risk")
@@ -6617,7 +6758,7 @@ def log_retest_candidate(coin, symbol, direction, closes, highs, lows, pattern, 
     "extended_move" (the original/default case) doesn't have that
     requirement — kept exactly as it worked before this change.
     """
-    global retest_watchlist
+    global retest_watchlist, radar_coins_added
     # Use the recent swing as the level to watch for a retest back to
     level = min(lows[-12:]) if direction == "BUY" else max(highs[-12:])
     retest_watchlist[coin] = {
@@ -6628,8 +6769,9 @@ def log_retest_candidate(coin, symbol, direction, closes, highs, lows, pattern, 
         "pattern_type": pattern_type,
         "logged_at": get_ist_datetime(),
         "current_price": closes[-1],
-        "notified": False
+        "status": "PENDING"  # PENDING -> TRIGGERED (or deleted on 12h expiry)
     }
+    radar_coins_added += 1
     save_retest_watchlist()
     reason = "BOS — waiting for pullback to the breakout line" if pattern_type=="bos_retest" else "move already extended"
     logger.info(f"{coin} {reason} — logged retest watch at {format_price(level)} (silent, no push)")
@@ -6646,29 +6788,89 @@ def check_retest_triggers():
     another leg of continued chop, so bos_retest entries require BOTH
     conditions before triggering. extended_move entries keep their
     original, simpler near-level-only check, unchanged from before.
+
+    STATUS TRACKING (this round): migrated from a boolean `notified`
+    flag to a string `status` (PENDING/TRIGGERED), so the watchlist can
+    genuinely represent a lifecycle rather than a single flip. A
+    TRIGGERED entry stays in the dict (not deleted) until it naturally
+    expires at 12 hours, rather than disappearing the instant it fires —
+    this is what lets get_retest_watchlist_text and
+    send_pressure_cooker_report be updated to only show PENDING entries
+    (see those functions), rather than mixing already-fired coins in
+    with genuinely still-pending ones for up to 12 more hours.
+
+    DIRECT-BREAKOUT FAST-TRACK ADDED (this round): if a coin never pulls
+    back to the level at all (a violent, straight-through breakout on
+    real volume), it would otherwise sit PENDING until it silently
+    expires — the entire point of a fast-track is catching that case.
+
+    REAL BUG FOUND AND FIXED in the original proposal before applying:
+    it added a send_telegram() call directly inside this function — but
+    the EXISTING caller in main() already sends its own message for
+    every coin this function returns as triggered. Applying the proposal
+    exactly as given would have sent TWO Telegram messages per trigger
+    (one from here, one from the caller). Fixed by keeping this
+    function's existing, correct responsibility — detect, mark, return —
+    and flagging a fast-track result via a transient `_fast_track` key
+    on the returned dict instead, letting the EXISTING caller decide
+    what message to send, consistent with how it already branches on
+    pattern_type for the same underlying reason (this function detects,
+    the caller decides how to notify/act).
     """
-    global retest_watchlist
+    global retest_watchlist, radar_coins_triggered
     triggered = []
+    now = get_ist_datetime()
     for coin, w in list(retest_watchlist.items()):
         # Expire stale watches after 12 hours — the setup is no longer relevant
-        if (get_ist_datetime() - w["logged_at"]).total_seconds() > 12*3600:
+        minutes_active = (now - w["logged_at"]).total_seconds() / 60
+        if minutes_active > 720:
+            if w.get("status") == "PENDING":
+                logger.info(f"{coin} retest watch expired after 12h without trigger.")
             del retest_watchlist[coin]; continue
+        # A TRIGGERED entry just sits until it naturally expires above —
+        # nothing further to evaluate for it.
+        if w.get("status") == "TRIGGERED":
+            continue
         price = get_price(w["symbol"])
         if not price: continue
-        near_level = abs(price - w["level"]) / w["level"] * 100 < 1.0 if w["level"] > 0 else False
-        if not near_level or w["notified"]:
+
+        # ── PATH B: DIRECT BREAKOUT FAST-TRACK ──
+        # If price has already moved a real 3% past the level on massive
+        # volume, it's not going to pull back to retest — don't sit
+        # waiting for something that isn't coming.
+        klines = get_klines(w["symbol"], "15m", 25)
+        fast_track_triggered = False
+        vol_ratio = 0.0
+        if klines and len(klines) >= 21:
+            vol_ratio = get_volume_ratio(klines)
+            if vol_ratio >= 2.0:
+                if w["direction"] == "BUY" and price > (w["level"] * 1.03):
+                    fast_track_triggered = True
+                elif w["direction"] == "SELL" and price < (w["level"] * 0.97):
+                    fast_track_triggered = True
+
+        if fast_track_triggered:
+            w["status"] = "TRIGGERED"
+            w["_fast_track"] = True
+            w["_fast_track_vol_ratio"] = vol_ratio
+            radar_coins_triggered += 1
+            triggered.append((coin, w, price))
+            continue
+
+        # ── PATH A: NORMAL PULLBACK CHECK ──
+        near_level = abs(price - w["level"]) / w["level"] * 100 < 1.5 if w["level"] > 0 else False
+        if not near_level:
             continue
         if w.get("pattern_type") == "bos_retest":
-            klines = get_klines(w["symbol"], "15m", 25)
             if not klines or len(klines) < 21:
                 continue  # can't validate volume yet, keep watching
-            vol_ratio = get_volume_ratio(klines)
             if vol_ratio >= 0.85:
                 # Volume isn't genuinely dying — this isn't the quiet
                 # pullback described, keep watching rather than chase a
                 # noisy retest.
                 continue
-        w["notified"] = True
+        w["status"] = "TRIGGERED"
+        radar_coins_triggered += 1
         triggered.append((coin, w, price))
     if triggered: save_retest_watchlist()
     return triggered
@@ -6751,10 +6953,18 @@ def get_check_coin_text(coin_input):
     return "\n".join(lines)
 
 def get_retest_watchlist_text():
-    if not retest_watchlist:
+    # PENDING-only filter (this round): FOUND A REAL, NEW ISSUE the
+    # status-tracking migration would have caused if left unfixed —
+    # since TRIGGERED entries now stay in retest_watchlist until their
+    # 12h expiry (not deleted immediately), this would otherwise show
+    # already-fired coins mixed in with genuinely still-pending ones,
+    # confusing for a command whose entire point is "what's currently
+    # being watched."
+    pending = {c: w for c, w in retest_watchlist.items() if w.get("status", "PENDING") == "PENDING"}
+    if not pending:
         return f"{_H('RETEST WATCHLIST','👀')}\n\n  🌙 No coins currently being watched for retest.\n\n  🕐 {get_ist_time()}"
     lines = [f"{_H('RETEST WATCHLIST','👀')}\n"]
-    for coin, w in retest_watchlist.items():
+    for coin, w in pending.items():
         price = get_price(w["symbol"]) or w["current_price"]
         dist = abs(price - w["level"]) / w["level"] * 100 if w["level"] > 0 else 0
         dir_em = "🟢" if w["direction"] == "BUY" else "🔴"
@@ -7292,8 +7502,8 @@ def main():
                      "starting the bot — it will not run with placeholder credentials, since every "
                      "Telegram send would otherwise fail silently in the background.")
         raise SystemExit(1)
-    global last_river_time,last_hourly_time,last_pnl_update_time,last_8h_desk_time,last_weekly_report_day,last_pressure_cooker_time
-    load_alerts(); load_circuit_breaker(); load_pending_signals(); load_retest_watchlist(); load_macro_events()
+    global last_river_time,last_hourly_time,last_pnl_update_time,last_8h_desk_time,last_weekly_report_day,last_pressure_cooker_time,total_scan_cycles
+    load_alerts(); load_circuit_breaker(); load_pending_signals(); load_retest_watchlist(); load_macro_events(); load_evaluating_signals()
     cloud_load_all()   # loads journal, pattern_stats, learning, active_trades from Supabase (falls back to local JSON)
     threading.Thread(target=poll_telegram,daemon=True).start()
     logger.info(f"{BOT_NAME} {BOT_VERSION} starting...")
@@ -7316,10 +7526,31 @@ def main():
             market_condition=detect_market_condition(btc_price,btc_klines)
             logger.info(f"BTC:{'BULL' if btc_trend==1 else 'BEAR'}|Market:{market_condition}|F&G:{fng}|Losses:{daily_losses}/{MAX_DAILY_LOSSES}|CB:{'ACTIVE' if check_circuit_breaker() else 'OK'}")
             scan_coins(btc_trend,fng,market_condition,btc_klines)
+            total_scan_cycles += 1
             check_active_trades()
             expire_pending_signals()
             check_price_alerts()
             for coin,w,price in check_retest_triggers():
+                if w.get("_fast_track"):
+                    # DIRECT-BREAKOUT FAST-TRACK message — checked before
+                    # the bos_retest/normal-retest branches below, since a
+                    # fast-tracked coin never actually retested; it's a
+                    # genuinely different event (a violent breakout that
+                    # never pulled back), not a validated pullback entry.
+                    dir_em="🟢 LONG" if w["direction"]=="BUY" else "🔴 SHORT"
+                    send_telegram(
+                        f"🚀 <b>DIRECT BREAKOUT FAST-TRACK — {coin}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🪙 <b>{coin}</b> {dir_em}\n"
+                        f"🔥 Bypassing pullback requirement. Massive volume ({w.get('_fast_track_vol_ratio',0):.1f}x) detected.\n"
+                        f"🎯 Original Level: <code>{format_price(w['level'])}</code>\n"
+                        f"💰 Executing at: <code>{format_price(price)}</code>\n"
+                        f"📌 Setup: {w['pattern']}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"⚡ <b>CHASE TRADE ACTIVATED</b>\n"
+                        f"🕐 {get_ist_time()}"
+                    )
+                    continue
                 with trade_lock:
                     bos_ok_to_send = (w.get("pattern_type") == "bos_retest" and coin not in active_trades and coin not in pending_signals and len(active_trades)<MAX_ACTIVE_TRADES)
                 if bos_ok_to_send:
@@ -7350,6 +7581,28 @@ def main():
                         format_and_send(setup_rt,coin,is_instant=False,market_condition=market_condition)
                     continue
                 dir_em="🟢 LONG" if w["direction"]=="BUY" else "🔴 SHORT"
+                # REAL TRADE LEVELS ADDED (this round): VERIFIED THIS WAS
+                # A GENUINE, SEPARATE GAP before fixing it — this specific
+                # ping (extended_move retests) was the one path that
+                # genuinely just said "check the chart," with no computed
+                # entry/SL/TP, unlike the fast-track message (shows entry)
+                # or the bos_retest path (full format_and_send levels).
+                # Uses the same get_structure_sl/ATR_TP_MULTIPLIER
+                # machinery already proven elsewhere in this file.
+                klines_ext=get_klines(w["symbol"],"15m",30)
+                atr_ext=calculate_atr(klines_ext) if klines_ext else (price*0.01)
+                sl_ext=get_structure_sl(klines_ext,w["direction"],price,atr_ext) if klines_ext else None
+                tp_line=""
+                if sl_ext:
+                    sl_dist_ext=abs(price-sl_ext)
+                    tp_dist_ext=max(atr_ext*ATR_TP_MULTIPLIER, sl_dist_ext*MIN_RR_RATIO)
+                    tp_ext=price+tp_dist_ext if w["direction"]=="BUY" else price-tp_dist_ext
+                    sl_pct_ext=(sl_dist_ext/price)*100 if price>0 else 0
+                    tp_pct_ext=(tp_dist_ext/price)*100 if price>0 else 0
+                    rr_ext=tp_pct_ext/sl_pct_ext if sl_pct_ext>0 else 0
+                    tp_line=(f"  🎯 Target: <code>{format_price(tp_ext)}</code>  +{tp_pct_ext:.2f}%\n"
+                             f"  🛑 Stop  : <code>{format_price(sl_ext)}</code>  -{sl_pct_ext:.2f}%\n"
+                             f"  ⚖️ R:R   : 1 : {rr_ext:.1f}\n\n")
                 send_telegram(
                     f"👀 <b>RETEST TRIGGERED — {coin}</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -7357,10 +7610,12 @@ def main():
                     f"  Missed the initial move — price pulled back to\n"
                     f"  the watched level <code>{format_price(w['level'])}</code>\n"
                     f"  Now: <code>{format_price(price)}</code>\n\n"
+                    f"{tp_line}"
                     f"  Check the chart — this may be your entry.\n"
                     f"  🕐 {get_ist_time()}"
                 )
                 logger.info(f"RETEST PING sent: {coin}")
+            check_evaluating_signals()
             now=time.time()
             if (now-last_hourly_time)>=3600:          send_hourly_report();   last_hourly_time=now
             if (now-last_pnl_update_time)>=3600:      send_live_pnl_update(); last_pnl_update_time=now
