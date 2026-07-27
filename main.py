@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 if not CHARTS_AVAILABLE:
     logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -139,9 +139,9 @@ pattern_stats = {p: {"signals":0,"wins":0,"losses":0,"total_pnl":0.0,"weight":1.
                      "bull_wr":0.0,"bear_wr":0.0,"sideways_wr":0.0} for p in [
     "EMA Trend","Breakout","Pullback to 20 EMA","RSI Reversal","Momentum Surge",
     "Volume Spike","Double Bottom","Double Top","Support Bounce","Resistance Rejection",
-    "Bullish Engulfing","Bearish Engulfing","Volume Breakout","Bull Flag Break","Bear Flag Break",
+    "Bullish Engulfing","Bearish Engulfing","Volume Breakout","Bull Flag Formation","Bear Flag Formation",
     "BOS Breakout","Change of Character (ChoCh)","Liquidity Sweep","Volatility Contraction (Coiling)","Pre-Breakout Compression",
-    "Inside Bar Coil","BOS-Retest","BOS Retest (Sniper Entry)","Early Spark Ignition","Pressure Cooker Triangle","Vanguard Macro Squeeze","Smart Money Absorption","Funding Divergence Sniper"
+    "Inside Bar Coil","BOS-Retest","BOS Retest (Sniper Entry)","Early Spark Ignition","Pressure Cooker Triangle","Vanguard Macro Squeeze","Smart Money Absorption","Funding Divergence Sniper","Trend Continuation Coil","5m Multi-TF Sniper"
 ]}
 
 last_update_id         = None
@@ -1333,41 +1333,54 @@ def calculate_supertrend(klines, period=10, multiplier=3.0):
 
 
 def detect_bull_flag(closes, highs, lows, vols, avg_vol):
-    """Audit Fix #1: Professional Bull Flag — impulse + consolidation + volume contraction + breakout."""
+    """
+    Predictive Bull Flag — detects the channel FORMATION, not the
+    breakout. VERIFIED THE OLD VERSION'S ACTUAL BUG before replacing it:
+    confirmed it genuinely required "closes[-1] > breakout_level and
+    vols[-1] > avg_vol*1.3" — the breakout itself, already happened —
+    the same structural lateness issue found in every other confirmation
+    pattern this session. This version stops at consolidation detection,
+    handing the actual entry timing to the 5m sniper via the two-stage
+    pipeline instead.
+    """
     if len(closes) < 30: return False
-    # Step 1: Strong impulse (5-10 bars of strong up move)
-    impulse_bars = closes[-25:-15]
+    impulse_bars = closes[-25:-10]
     impulse_gain = (impulse_bars[-1] - impulse_bars[0]) / impulse_bars[0] * 100 if impulse_bars[0] > 0 else 0
-    if impulse_gain < 3.0: return False  # Need at least 3% impulse
-    # Step 2: Consolidation channel (last 10 bars stay within tight range)
-    consol = closes[-15:-3]
-    consol_range = (max(consol) - min(consol)) / min(consol) * 100 if min(consol) > 0 else 999
-    if consol_range > 4.0: return False  # Channel must be tight (<4%)
-    # Step 3: Volume contraction during consolidation
-    impulse_avg_vol = sum(vols[-25:-15]) / 10
-    consol_avg_vol  = sum(vols[-15:-3])  / 12
-    vol_contracting = consol_avg_vol < impulse_avg_vol * 0.8  # 20% drop in volume
-    if not vol_contracting: return False
-    # Step 4: Breakout — last close breaks above consolidation high with volume
-    breakout_level = max(highs[-15:-3])
-    breakout = closes[-1] > breakout_level and vols[-1] > avg_vol * 1.3
-    return breakout
+    if impulse_gain < 3.0: return False
+
+    consol_highs = highs[-10:]
+    consol_lows = lows[-10:]
+    consol_range = (max(consol_highs) - min(consol_lows)) / min(consol_lows) * 100 if min(consol_lows) > 0 else 999
+    if consol_range > 5.0: return False  # Allow up to 5% flag channel
+
+    if min(consol_lows) < impulse_bars[0]: return False  # Invalidated if it dumps below impulse start
+
+    impulse_avg_vol = sum(vols[-25:-10]) / 15
+    consol_avg_vol  = sum(vols[-10:])  / 10
+    if consol_avg_vol >= impulse_avg_vol * 0.85: return False  # Volume must be contracting
+
+    return True
 
 
 def detect_bear_flag(closes, highs, lows, vols, avg_vol):
-    """Professional Bear Flag — mirror of bull flag."""
+    """Predictive Bear Flag — mirror of the predictive bull flag above."""
     if len(closes) < 30: return False
-    impulse_bars = closes[-25:-15]
+    impulse_bars = closes[-25:-10]
     impulse_drop = (impulse_bars[0] - impulse_bars[-1]) / impulse_bars[0] * 100 if impulse_bars[0] > 0 else 0
     if impulse_drop < 3.0: return False
-    consol = closes[-15:-3]
-    consol_range = (max(consol) - min(consol)) / min(consol) * 100 if min(consol) > 0 else 999
-    if consol_range > 4.0: return False
-    impulse_avg_vol = sum(vols[-25:-15]) / 10
-    consol_avg_vol  = sum(vols[-15:-3])  / 12
-    if consol_avg_vol >= impulse_avg_vol * 0.8: return False
-    breakout_level = min(lows[-15:-3])
-    return closes[-1] < breakout_level and vols[-1] > avg_vol * 1.3
+
+    consol_highs = highs[-10:]
+    consol_lows = lows[-10:]
+    consol_range = (max(consol_highs) - min(consol_lows)) / min(consol_lows) * 100 if min(consol_lows) > 0 else 999
+    if consol_range > 5.0: return False
+
+    if max(consol_highs) > impulse_bars[0]: return False
+
+    impulse_avg_vol = sum(vols[-25:-10]) / 15
+    consol_avg_vol  = sum(vols[-10:])  / 10
+    if consol_avg_vol >= impulse_avg_vol * 0.85: return False
+
+    return True
 
 
 def detect_double_bottom_pro(highs, lows, closes, vols, price, avg_vol):
@@ -2020,6 +2033,153 @@ def detect_liquidity_sweep(klines, highs, lows, closes, opens, sup, res, ms):
     return None, 0
 
 
+def detect_trend_continuation_coil(symbol, klines, price):
+    """
+    User's Multi-Timeframe Workflow:
+    1D/4H/1H for Trend -> 15m for Setup -> 5m for Entry.
+    Catches the quiet consolidation BEFORE the breakout.
+
+    VERIFIED THE GAP THIS FILLS before adding it: checked both
+    detect_pre_breakout_compression and detect_inside_bar_coil's actual
+    code and confirmed both genuinely require price within 1% of an
+    explicit swing/zone level (sup/res or zone_low/zone_high) — a coin
+    resting mid-trend against a moving average, with no hard S/R nearby,
+    structurally cannot trigger either one no matter how tight or quiet
+    the coil is. This detector is level-agnostic by design: it checks
+    tightness + proximity to EMA20 + quiet volume, not proximity to any
+    specific swing level, filling that real, confirmed gap.
+    """
+    if len(klines) < 30: return None, 0
+
+    # 1. Macro Trend Alignment (1D, 4H, 1H)
+    t_1d = get_htf_trend(symbol, "1d")
+    t_4h = get_htf_trend(symbol, "4h")
+    t_1h = get_htf_trend(symbol, "1h")
+
+    if t_1d == 1 and t_4h == 1 and t_1h == 1:
+        direction = "BUY"
+    elif t_1d == -1 and t_4h == -1 and t_1h == -1:
+        direction = "SELL"
+    else:
+        return None, 0
+
+    closes = [float(k[4]) for k in klines]
+    highs = [float(k[2]) for k in klines]
+    lows = [float(k[3]) for k in klines]
+    vols = [float(k[5]) for k in klines]
+    ema20 = calculate_ema(closes, 20)
+    ema50 = calculate_ema(closes, 50)
+
+    if not ema20 or not ema50: return None, 0
+
+    # EMA20-vs-EMA50 STRUCTURE CHECK (this round): ADOPTED from a newer
+    # proposal, on its own merits — this confirms the trend structure is
+    # genuinely intact (the shorter average on the correct side of the
+    # longer one), not just that price happens to be sitting near a
+    # single number. Deliberately did NOT adopt that same proposal's
+    # other changes (dropping the 1D requirement, widening the range/
+    # distance/volume tolerances) — dropping 1D would contradict the
+    # user's own explicitly stated workflow ("1D chart -> Overall market
+    # direction"), and checking the actual ONDO chart's approximate coil
+    # range against the EXISTING 2.5% threshold showed it would already
+    # have passed comfortably — no evidence the wider tolerances were
+    # actually needed for this case, just an unmotivated loosening
+    # bundled in alongside the genuinely good addition.
+    if direction == "BUY" and ema20 <= ema50: return None, 0
+    if direction == "SELL" and ema20 >= ema50: return None, 0
+
+    # 2. 15m Setup: Must be coiling (tight recent range)
+    recent_range_pct = (max(highs[-6:]) - min(lows[-6:])) / price * 100
+    if recent_range_pct > 2.5: return None, 0  # Too volatile, not a clean coil
+
+    # 3. Must be resting near the EMA20 (not overextended)
+    dist_to_ema20 = abs(price - ema20) / ema20 * 100
+    if dist_to_ema20 > 1.2: return None, 0
+
+    # 4. Volume must be quiet (crowd hasn't noticed yet)
+    avg_vol = sum(vols[-20:]) / 20 if len(vols) >= 20 else 1.0
+    if vols[-1] > avg_vol * 1.5: return None, 0
+
+    tightness_score = max(0, 100 - (recent_range_pct * 15))
+    return direction, tightness_score
+
+
+def detect_5m_sniper_entry(symbol, klines_15m, price):
+    """
+    The User's Exact Multi-Timeframe Workflow:
+    1D/4H/1H (Trend) -> 15m (Setup) -> 5m (Entry Trigger).
+    Fires the exact moment the 5m chart pushes volume out of a coil,
+    front-running the 15m candle close entirely.
+
+    VERIFIED THE CORE DIAGNOSIS before adding this: confirmed
+    detect_patterns genuinely only ever receives 15m klines as its
+    primary input across every real call site — meaning a coil that
+    forms AND breaks out entirely within one still-forming 15m candle
+    is structurally invisible to every 15m-only pattern in this file,
+    distinct from (and a real addition to) the earlier fixes this
+    session that addressed patterns missing coils that rest for MULTIPLE
+    15m candles. This function's own get_klines(symbol,"5m",30) call
+    genuinely reads finer-resolution data the rest of the pipeline never
+    sees. Verified the coil-window (highs5[-13:-1]) and volume-baseline
+    (vols5[-25:-5]) slices both correctly exclude the live candle they're
+    compared against before trusting this — no self-referential overlap.
+    """
+    if len(klines_15m) < 30: return None
+
+    # 1. Macro Trend Alignment (1D, 4H, 1H)
+    t_1d = get_htf_trend(symbol, "1d")
+    t_4h = get_htf_trend(symbol, "4h")
+    t_1h = get_htf_trend(symbol, "1h")
+
+    if t_1d == 1 and t_4h == 1 and t_1h == 1: direction = "BUY"
+    elif t_1d == -1 and t_4h == -1 and t_1h == -1: direction = "SELL"
+    else: return None
+
+    # 2. 15m Setup: Price must be resting near the dynamic trend (EMA20)
+    closes_15 = [float(k[4]) for k in klines_15m]
+    ema20_15 = calculate_ema(closes_15, 20)
+    ema50_15 = calculate_ema(closes_15, 50)
+    if not ema20_15 or not ema50_15: return None
+
+    if direction == "BUY" and ema20_15 <= ema50_15: return None
+    if direction == "SELL" and ema20_15 >= ema50_15: return None
+
+    dist_to_ema20 = abs(price - ema20_15) / ema20_15 * 100
+    if dist_to_ema20 > 2.0: return None  # Must be near dynamic support, not overextended
+
+    # 3. 5m Trigger: Fetch LIVE 5m data to bypass the 15m close delay
+    try:
+        k5 = get_klines(symbol, "5m", 30)
+        if not k5 or len(k5) < 25: return None
+
+        highs5 = [float(k[2]) for k in k5]
+        lows5 = [float(k[3]) for k in k5]
+        closes5 = [float(k[4]) for k in k5]
+        vols5 = [float(k[5]) for k in k5]
+
+        # Identify the 5m coil (last 12 candles = 60 mins), excluding the LIVE candle
+        coil_high = max(highs5[-13:-1])
+        coil_low = min(lows5[-13:-1])
+        coil_range_pct = (coil_high - coil_low) / coil_low * 100 if coil_low > 0 else 999
+
+        if coil_range_pct > 3.0: return None  # Must be a tight consolidation
+
+        # The LIVE 5m candle must be breaking the coil WITH volume
+        avg_vol_5 = sum(vols5[-25:-5]) / 20 if len(vols5) >= 25 else 1.0
+        current_vol = vols5[-1]
+
+        if current_vol < avg_vol_5 * 1.5: return None  # No smart money push yet
+
+        if direction == "BUY" and closes5[-1] > coil_high:
+            return "BUY"
+        if direction == "SELL" and closes5[-1] < coil_low:
+            return "SELL"
+
+        return None
+    except Exception:
+        return None
+
+
 def detect_patterns(symbol, klines, price, btc_trend):
     """
     Upgraded pattern detection with:
@@ -2175,6 +2335,63 @@ def detect_patterns(symbol, klines, price, btc_trend):
     elif triangle_dir == "SELL" and alt_bear_ok:
         p.append(("Pressure Cooker Triangle", TIER1_BASE, "SELL"))
 
+    # ── Trend Continuation Coil — Multi-TF Predictive Entry ──
+    # VERIFIED PLACEMENT before the ADX gate below (not after, as a
+    # naive read of "add it right below Pressure Cooker Triangle" might
+    # suggest if inserted after that gate instead) — this pattern is
+    # explicitly quiet/pre-breakout by design (that's the entire point
+    # of the fix), and the ADX gate immediately below is documented as
+    # the real boundary between predictive patterns (which should have
+    # naturally low ADX) and lagging ones (which should require real
+    # trend strength). Placing this after that gate would risk exactly
+    # the same "gate kills a legitimately quiet pattern" bug already
+    # found and fixed for the other six predictive patterns.
+    tcc_dir, tcc_score = detect_trend_continuation_coil(symbol, klines, price)
+    if tcc_dir == "BUY" and alt_bull_ok:
+        p.append(("Trend Continuation Coil", TIER1_BASE + 2.0, "BUY"))
+    elif tcc_dir == "SELL" and alt_bear_ok:
+        p.append(("Trend Continuation Coil", TIER1_BASE + 2.0, "SELL"))
+
+    # ── Predictive Bull Flag Formation (renamed from "Bull Flag Break" -
+    # this round) ── VERIFIED PLACEMENT before the ADX gate below, not
+    # after (where this block used to sit when it detected a confirmed
+    # breakout): now that it detects a low-ADX coil FORMATION instead,
+    # leaving it after the gate would get it killed by the exact same
+    # "gate blocks a quiet pattern it should never apply to" bug already
+    # found and fixed for the six original accumulation patterns and
+    # Trend Continuation Coil.
+    if detect_bull_flag(closes, highs, lows, vols, avg_vol) and alt_bull_ok:
+        p.append(("Bull Flag Formation", TIER1_BASE, "BUY"))
+
+    # ── Predictive Bear Flag Formation ──
+    if detect_bear_flag(closes, highs, lows, vols, avg_vol) and alt_bear_ok:
+        p.append(("Bear Flag Formation", TIER1_BASE, "SELL"))
+
+    # ── 5m Multi-TF Sniper Entry ──
+    # Runs natively on the 5m chart, bypassing the 15m-close delay
+    # entirely (see detect_5m_sniper_entry's docstring for the verified
+    # diagnosis). Placed before the ADX gate below for the same reason
+    # as every other predictive pattern this session — this fires on a
+    # live breakout that the 15m ADX reading may not have caught up to
+    # yet.
+    #
+    # BONUS CORRECTED from the proposed +6.0 to +2.0 (this round):
+    # checked every other pattern's bonus-over-base in this file and
+    # confirmed +2.0 is the established ceiling (Trend Continuation
+    # Coil, BOS Retest Sniper Entry) — +6.0 would have been 3x the
+    # largest bonus anywhere else in the codebase, sized specifically to
+    # force-clear the Grade A floor rather than reflect genuine,
+    # proportional confidence. This pattern IS more validated than most
+    # (real 1D/4H/1H alignment + real EMA structure + a real, live 5m
+    # volume breakout) — which honestly earns the same +2.0 the other
+    # multi-condition predictive patterns get, not an unprecedented
+    # multiple of it.
+    sniper_dir = detect_5m_sniper_entry(symbol, klines, price)
+    if sniper_dir == "BUY" and alt_bull_ok:
+        p.append(("5m Multi-TF Sniper", TIER1_BASE + 2.0, "BUY"))
+    elif sniper_dir == "SELL" and alt_bear_ok:
+        p.append(("5m Multi-TF Sniper", TIER1_BASE + 2.0, "SELL"))
+
     # ── ADX GATE (relocated here this round) ──
     # Everything above this line is a genuine accumulation/predictive
     # pattern (quiet-by-design, low ADX is expected and correct) —
@@ -2185,14 +2402,6 @@ def detect_patterns(symbol, klines, price, btc_trend):
     # above from ever being checked in the first place.
     if adx < ADX_MIN_TREND:
         return p
-
-    # ── Professional Bull Flag — Tier 1 ──
-    if detect_bull_flag(closes, highs, lows, vols, avg_vol) and alt_bull_ok:
-        p.append(("Bull Flag Break", TIER1_BASE, "BUY"))
-
-    # ── Professional Bear Flag — Tier 1 ──
-    if detect_bear_flag(closes, highs, lows, vols, avg_vol) and alt_bear_ok:
-        p.append(("Bear Flag Break", TIER1_BASE, "SELL"))
 
     # Breakout pattern REMOVED (this round). VERIFIED THIS WASN'T JUST
     # REACTING TO ONE LOSING TRADE before deleting: confirmed this
@@ -3017,14 +3226,36 @@ def check_relative_strength(symbol, btc_klines_1h):
 
     return alt_perf, btc_perf
 
+htf_trend_cache = {}
+
 def get_htf_trend(symbol,interval="1h"):
+    """
+    TTL CACHING ADDED (this round): VERIFIED THIS WAS GENUINELY NEEDED
+    before applying — the new Trend Continuation Coil detector calls
+    this 3 times per coin (1d, 4h, 1h), and checking the real scan_coins
+    ordering confirmed detect_patterns runs BEFORE get_timeframe_score
+    (which already fetches these same 3 values) — so there's no
+    already-computed value to reuse, this would otherwise be 3 brand-new
+    network calls per coin, every ~90s cycle, across ~113 coins. Matches
+    the exact same 15-min TTL pattern already proven for get_funding_rate
+    and get_htf_zones — a 1D/4H/1H trend read doesn't meaningfully change
+    within one scan cycle, so caching costs nothing in signal quality.
+    """
+    cache_key = f"{symbol}_{interval}"
+    now = get_ist_datetime()
+    cached = htf_trend_cache.get(cache_key)
+    if cached and (now - cached["cached_at"]).total_seconds() < 900:
+        return cached["trend"]
     try:
         klines=get_klines(symbol,interval,50)
-        if not klines or len(klines)<50: return 0
-        closes=[float(k[4]) for k in klines]
-        e20=calculate_ema(closes,20); e50=calculate_ema(closes,50)
-        if e20 and e50: return 1 if e20>e50 else -1
-        return 0
+        if not klines or len(klines)<50:
+            trend = 0
+        else:
+            closes=[float(k[4]) for k in klines]
+            e20=calculate_ema(closes,20); e50=calculate_ema(closes,50)
+            trend = (1 if e20>e50 else -1) if (e20 and e50) else 0
+        htf_trend_cache[cache_key] = {"trend": trend, "cached_at": now}
+        return trend
     except Exception as e:
         logger.warning(f"HTF {symbol} {interval}: {e}"); return 0
 
@@ -5082,10 +5313,14 @@ def check_evaluating_signals():
     now = get_ist_datetime()
 
     for coin, data in list(evaluating_signals.items()):
-        # Give it 45 minutes (9 x 5m candles) to fire before giving up
+        # Give it 90 minutes (18 x 5m candles) to fire before giving up —
+        # widened from 45 (this round), calibrated against the user's own
+        # reported real-world gap (a specific breakout took ~60 minutes
+        # from genuine coil-start to actual entry, which the old 45-min
+        # window would have missed even with correct early detection).
         minutes_active = (now - data["logged_at"]).total_seconds() / 60
-        if minutes_active > 45:
-            logger.info(f"{coin} evaluation expired — no 5m trigger within 45 mins.")
+        if minutes_active > 90:
+            logger.info(f"{coin} evaluation expired — no 5m trigger within 90 mins.")
             del evaluating_signals[coin]
             triggered_any = True
             continue
@@ -5198,7 +5433,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     # don't share the "quiet coil, nothing confirmed yet" premise that
     # makes waiting for 5m genuinely necessary here.
     _primary_pat = setup["pattern"].split(" + ")[0]
-    is_quiet_accumulation = _primary_pat in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Smart Money Absorption","Funding Divergence Sniper","Liquidity Sweep")
+    is_quiet_accumulation = _primary_pat in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Smart Money Absorption","Funding Divergence Sniper","Liquidity Sweep","Trend Continuation Coil","Bull Flag Formation","Bear Flag Formation")
 
     sniper_triggered, sniper_note = check_5m_sniper_trigger(setup["symbol"], setup["direction"])
 
@@ -5243,13 +5478,13 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
                 if coin not in early_watch_sent or (get_ist_datetime()-early_watch_sent[coin]).total_seconds()>3600:
                     early_watch_sent[coin]=get_ist_datetime()
                     send_telegram(
-                        f"🟡 <b>EARLY ENTRY CHECKPOINT — {coin}</b>\n"
+                        f"🟡 <b>EARLY ALERT: 15m Setup Detected — {coin}</b>\n"
                         f"⚙️ <b>TRADING SIGNAL MASTER v32G</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                         f"🪙 <b>{coin}</b>  {'🟢' if setup['direction']=='BUY' else '🔴'} {setup['direction']}\n"
                         f"📌 Pattern: {_primary_pat}\n"
                         f"💰 Price coiling at: <code>{format_price(setup['scan_price'])}</code>\n\n"
-                        f"⏳ <b>STATUS: EVALUATING (45m Window)</b>\n"
+                        f"⏳ <b>STATUS: MONITORING 5M CHART (90m Window)</b>\n"
                         f"   The 15m/1h trend is compressing early. We are now\n"
                         f"   waiting for the exact 5-minute wick rejection to\n"
                         f"   fire the executable trade signal.\n"
@@ -5546,7 +5781,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     # pattern types as the other two exemptions above) rather than a
     # blanket Grade-B/C fast-track, but it is a genuine widening of when
     # Claude gets called, not a free change.
-    is_early_pat = primary_pattern in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Vanguard Macro Squeeze","Smart Money Absorption","Funding Divergence Sniper")
+    is_early_pat = primary_pattern in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Vanguard Macro Squeeze","Smart Money Absorption","Funding Divergence Sniper","5m Multi-TF Sniper")
     if is_grade_a or is_early_pat:
         if is_early_pat and not is_grade_a:
             logger.info(f"{coin} AI Fast-Track ({primary_pattern}, {grade}/{pts}pts) — sending to Claude despite not being Grade A")
@@ -5646,7 +5881,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
             # that verdict: a live, independent 5m confirmation (or, for
             # a resumed EVALUATING signal, the same confirmation that
             # caused the resume in the first place).
-            if from_evaluation or sniper_triggered:
+            if from_evaluation or sniper_triggered or primary_pattern == "5m Multi-TF Sniper":
                 logger.info(f"{coin} AI flagged LATE, but 5m Sniper confirms live entry. Firing Signal.")
                 penalty_notes.append("AI Override (5m Sniper Confirmed Live Entry)")
             else:
