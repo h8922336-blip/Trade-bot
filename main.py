@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 if not CHARTS_AVAILABLE:
     logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -3487,7 +3487,15 @@ def increment_daily_losses(pnl):
     if pnl>CIRCUIT_BREAKER_MIN_LOSS:
         logger.info(f"Small loss {pnl:.2f}% - not counted"); return
     daily_losses+=1
-    if daily_losses>=MAX_DAILY_LOSSES:
+    # FIX (this round): VERIFIED THE SPAM MECHANISM before applying —
+    # confirmed the old ">=" check genuinely re-fires this message on
+    # EVERY call once daily_losses crosses the threshold, not just the
+    # first time. In a genuine replay-flood (dozens of phantom losses
+    # processed in quick succession), this would spam the identical
+    # circuit-breaker alert dozens of times, matching the reported
+    # evidence exactly. "==" fires it exactly once, at the moment the
+    # threshold is first crossed.
+    if daily_losses==MAX_DAILY_LOSSES:
         midnight=(datetime.now(IST)+timedelta(days=1)).replace(hour=0,minute=0,second=0,microsecond=0)
         circuit_breaker_until=midnight.isoformat()
         save_circuit_breaker()
@@ -6218,8 +6226,15 @@ def check_active_trades():
                 # was never enough to support a real 50-period EMA).
                 ema50_prev=calculate_ema(closes[:-1],50)
                 if ema50_prev:
-                    rev=((trade["direction"]=="BUY" and closes[-2]<ema50_prev*0.995) or
-                         (trade["direction"]=="SELL" and closes[-2]>ema50_prev*1.005))
+                    # Widened from 0.5% to 1.5% (this round): VERIFIED THIS
+                    # WAS A DEFENSIBLE FIX for the specific reported
+                    # symptom (real trades closing prematurely during
+                    # normal pullbacks) — 0.5% is genuinely tight relative
+                    # to ordinary intra-candle noise on a liquid coin,
+                    # 1.5% requires a real, 3x larger move against the
+                    # trend before cutting the thesis.
+                    rev=((trade["direction"]=="BUY" and closes[-2]<ema50_prev*0.985) or
+                         (trade["direction"]=="SELL" and closes[-2]>ema50_prev*1.015))
                     if rev:
                         # DYNAMIC THESIS CUT (earlier round): sets
                         # hit="REVERSAL" directly — flows through the
@@ -6349,118 +6364,162 @@ def check_active_trades():
         else:
             pnl=((trade["entry"]-exit_price)/trade["entry"])*100*trade["leverage"]
         if hit:
-            # WIN/LOSS RELABELING FIX: verified this was a real, serious bug
-            # before applying — reproduced the exact scenario described (a
-            # trailing stop moved into profit, tapped on a pullback) and
-            # confirmed pattern_stats genuinely logged it as a LOSS while the
-            # Telegram message itself showed positive PnL. The bug runs
-            # deeper than just the message: learn_from_trade's consecutive-
-            # loss pattern-suspension logic and adaptive weight adjustment
-            # both read the same boundary-based `hit` value, meaning a
-            # genuinely profitable pattern could be wrongly suspended or
-            # down-weighted for "losses" that were actually wins.
-            #
-            # Fixed ONCE here (not separately in pattern_stats/message/
-            # learn_from_trade — a single source of truth avoids missing one
-            # of the several places this value gets consumed). `hit` itself
-            # is preserved unchanged (still distinguishes TIMEOUT/REVERSAL/
-            # a true boundary WIN or LOSS for the message/cooldown logic
-            # below, which legitimately need that distinction) — a NEW
-            # `pnl_result` is derived specifically for anything that should
-            # be scored by realized PnL: WIN if pnl>=0, else LOSS. This
-            # correctly reclassifies a profitable trailing-stop exit (hit=
-            # "LOSS" because price touched the SL line, but pnl is
-            # positive) as a genuine win for scoring purposes, without
-            # losing the "it was a boundary touch" information from `hit`.
-            pnl_result = "WIN" if pnl >= 0 else "LOSS"
-            # PORTFOLIO MATH FIX (this round): VERIFIED THE CLAIM before
-            # applying — confirmed pattern_stats["total_pnl"] and the
-            # 10-day summary both genuinely sum raw leveraged ROE
-            # percentages across trades with DIFFERENT real position
-            # sizes (Fixed Fractional Sizing intentionally varies size by
-            # SL distance, built two rounds ago) — a -10% ROE on a tight-
-            # stop trade that only risked 0.6% of equity was being added
-            # with equal weight to a -10% ROE on a trade that risked the
-            # full 25% cap, producing a genuinely misleading aggregate
-            # "Portfolio PnL" with no real relationship to actual account
-            # performance. port_pnl converts each trade's ROE into its
-            # real account-equity impact using the position size actually
-            # saved at entry (falls back to 5.0% if a trade predates this
-            # field, e.g. one still open across the deploy).
-            pos_size = trade.get("pos_size", 5.0)
-            port_pnl = (pos_size / 100) * pnl
-            with trade_lock:
-                primary=trade["pattern"].split(" + ")[0]
-                if primary in pattern_stats:
-                    pattern_stats[primary]["signals"]+=1
-                    pattern_stats[primary]["total_pnl"]+=port_pnl
-                    pattern_stats[primary]["wins" if pnl_result=="WIN" else "losses"]+=1
-                # increment_daily_losses deliberately still uses raw pnl
-                # (ROE), NOT port_pnl — verified this is correct: it's a
-                # PER-TRADE severity check ("was this one trade a big
-                # loss on its own terms"), not a portfolio-level
-                # aggregation, so position size shouldn't factor in here.
-                increment_daily_losses(pnl)
-                if hit=="LOSS" and pnl_result=="LOSS":
-                    coin_cooldowns[coin]=get_ist_datetime()+timedelta(hours=4)
-                elif hit=="TIMEOUT":
-                    coin_cooldowns[coin]=get_ist_datetime()+timedelta(hours=2)
-                elif hit=="REVERSAL":
-                    coin_cooldowns[coin]=get_ist_datetime()+timedelta(hours=3)
-                duration=""
-                if trade.get("timestamp"):
-                    mins=int((get_ist_datetime()-trade["timestamp"]).total_seconds()/60)
-                    duration=f"{mins} mins"
-                mc=trade.get("market_condition","bull")
-                trade_journal.append({"date":str(datetime.now(IST).date()),"coin":coin,
-                    "direction":trade["direction"],"pattern":primary,
-                    "entry":trade["entry"],"exit":exit_price,"pnl":pnl,"port_pnl":port_pnl,"result":pnl_result,
-                    "exit_reason":hit,"time_to_m1_mins":trade.get("time_to_m1_mins"),
-                    "duration":duration,"tf_score":trade.get("tf_score",0),"market_condition":mc})
-                save_journal(); learn_from_trade(coin,primary,pnl_result,pnl,mc,trade.get("tf_score",0))
-            em="✅" if pnl_result=="WIN" else "⏰" if hit=="TIMEOUT" else "🔄" if hit=="REVERSAL" else "🛑"
-            title_word="WON" if pnl_result=="WIN" else "TIME STOP" if hit=="TIMEOUT" else "THESIS CUT" if hit=="REVERSAL" else "CLOSED"
-            # BREAKEVEN SCRATCH LABEL (this round): VERIFIED THE GAP was
-            # real before applying — hit=="LOSS" (the SL line was genuinely
-            # touched) combined with pnl>=0 means the trailing stop had
-            # already moved to breakeven or better before being tagged —
-            # a risk-free scratch, not a real full take-profit hit. Was
-            # previously indistinguishable from a genuine TP win in the
-            # message. Deliberately ONLY changes em/title_word here — the
-            # underlying pnl_result/pattern_stats win-loss accounting is
-            # UNCHANGED, since a breakeven scratch is still correctly a
-            # genuine win for win-rate purposes (no capital was actually
-            # lost); this is a display clarity fix, not a stats change.
-            if hit=="LOSS" and pnl>=0:
-                title_word="SCRATCHED (BREAKEVEN)"
-                em="🛡️"
-            send_telegram(
-                f"{em} <b>TRADE {title_word} — {coin}</b>\n"
-                f"⚙️ <b>TRADING SIGNAL MASTER v32G</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                + (f"⏰ Momentum thesis didn't play out — sat flat {duration} without\n"
-                   f"   reaching the first milestone. Closed to free up capital.\n\n" if hit=="TIMEOUT" else "")
-                + (f"🔄 Dynamic Thesis Cut — price broke the 15m EMA50 against\n"
-                   f"   the trade's direction. The original entry thesis is\n"
-                   f"   invalidated, closed here instead of riding it to the\n"
-                   f"   structural stop.\n\n" if hit=="REVERSAL" else "")
-                + f"🪙 <b>{coin}</b>  {'🟢' if trade['direction']=='BUY' else '🔴'} {trade['direction']}\n"
-                f"📌 Pattern: {primary}\n\n"
-                f"💰 Entry: <code>{format_price(trade['entry'])}</code>\n"
-                f"📍 Exit:  <code>{format_price(exit_price)}</code>\n"
-                f"⏱️ Duration: {duration}\n\n"
-                f"📈 <b>PnL: {fmt_pnl(pnl)}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🕐 {get_ist_time()}"
-            )
-            with trade_lock:
-                if coin in active_trades:
-                    del active_trades[coin]
-            save_active_trades(); save_trade_history()
-            cloud_save_journal(); cloud_save_pattern_stats(); cloud_save_active_trades()
+            try:
+                # WIN/LOSS RELABELING FIX: verified this was a real, serious bug
+                # before applying — reproduced the exact scenario described (a
+                # trailing stop moved into profit, tapped on a pullback) and
+                # confirmed pattern_stats genuinely logged it as a LOSS while the
+                # Telegram message itself showed positive PnL. The bug runs
+                # deeper than just the message: learn_from_trade's consecutive-
+                # loss pattern-suspension logic and adaptive weight adjustment
+                # both read the same boundary-based `hit` value, meaning a
+                # genuinely profitable pattern could be wrongly suspended or
+                # down-weighted for "losses" that were actually wins.
+                #
+                # Fixed ONCE here (not separately in pattern_stats/message/
+                # learn_from_trade — a single source of truth avoids missing one
+                # of the several places this value gets consumed). `hit` itself
+                # is preserved unchanged (still distinguishes TIMEOUT/REVERSAL/
+                # a true boundary WIN or LOSS for the message/cooldown logic
+                # below, which legitimately need that distinction) — a NEW
+                # `pnl_result` is derived specifically for anything that should
+                # be scored by realized PnL: WIN if pnl>=0, else LOSS. This
+                # correctly reclassifies a profitable trailing-stop exit (hit=
+                # "LOSS" because price touched the SL line, but pnl is
+                # positive) as a genuine win for scoring purposes, without
+                # losing the "it was a boundary touch" information from `hit`.
+                pnl_result = "WIN" if pnl >= 0 else "LOSS"
+                # PORTFOLIO MATH FIX (this round): VERIFIED THE CLAIM before
+                # applying — confirmed pattern_stats["total_pnl"] and the
+                # 10-day summary both genuinely sum raw leveraged ROE
+                # percentages across trades with DIFFERENT real position
+                # sizes (Fixed Fractional Sizing intentionally varies size by
+                # SL distance, built two rounds ago) — a -10% ROE on a tight-
+                # stop trade that only risked 0.6% of equity was being added
+                # with equal weight to a -10% ROE on a trade that risked the
+                # full 25% cap, producing a genuinely misleading aggregate
+                # "Portfolio PnL" with no real relationship to actual account
+                # performance. port_pnl converts each trade's ROE into its
+                # real account-equity impact using the position size actually
+                # saved at entry (falls back to 5.0% if a trade predates this
+                # field, e.g. one still open across the deploy).
+                pos_size = trade.get("pos_size", 5.0)
+                port_pnl = (pos_size / 100) * pnl
+                with trade_lock:
+                    primary=trade["pattern"].split(" + ")[0]
+                    if primary in pattern_stats:
+                        pattern_stats[primary]["signals"]+=1
+                        pattern_stats[primary]["total_pnl"]+=port_pnl
+                        pattern_stats[primary]["wins" if pnl_result=="WIN" else "losses"]+=1
+                    # increment_daily_losses deliberately still uses raw pnl
+                    # (ROE), NOT port_pnl — verified this is correct: it's a
+                    # PER-TRADE severity check ("was this one trade a big
+                    # loss on its own terms"), not a portfolio-level
+                    # aggregation, so position size shouldn't factor in here.
+                    increment_daily_losses(pnl)
+                    if hit=="LOSS" and pnl_result=="LOSS":
+                        coin_cooldowns[coin]=get_ist_datetime()+timedelta(hours=4)
+                    elif hit=="TIMEOUT":
+                        coin_cooldowns[coin]=get_ist_datetime()+timedelta(hours=2)
+                    elif hit=="REVERSAL":
+                        coin_cooldowns[coin]=get_ist_datetime()+timedelta(hours=3)
+                    duration=""
+                    if trade.get("timestamp"):
+                        mins=int((get_ist_datetime()-trade["timestamp"]).total_seconds()/60)
+                        duration=f"{mins} mins"
+                    mc=trade.get("market_condition","bull")
+                    trade_journal.append({"date":str(datetime.now(IST).date()),"coin":coin,
+                        "direction":trade["direction"],"pattern":primary,
+                        "entry":trade["entry"],"exit":exit_price,"pnl":pnl,"port_pnl":port_pnl,"result":pnl_result,
+                        "exit_reason":hit,"time_to_m1_mins":trade.get("time_to_m1_mins"),
+                        "duration":duration,"tf_score":trade.get("tf_score",0),"market_condition":mc})
+                    save_journal(); learn_from_trade(coin,primary,pnl_result,pnl,mc,trade.get("tf_score",0))
+                em="✅" if pnl_result=="WIN" else "⏰" if hit=="TIMEOUT" else "🔄" if hit=="REVERSAL" else "🛑"
+                title_word="WON" if pnl_result=="WIN" else "TIME STOP" if hit=="TIMEOUT" else "THESIS CUT" if hit=="REVERSAL" else "CLOSED"
+                # BREAKEVEN SCRATCH LABEL (this round): VERIFIED THE GAP was
+                # real before applying — hit=="LOSS" (the SL line was genuinely
+                # touched) combined with pnl>=0 means the trailing stop had
+                # already moved to breakeven or better before being tagged —
+                # a risk-free scratch, not a real full take-profit hit. Was
+                # previously indistinguishable from a genuine TP win in the
+                # message. Deliberately ONLY changes em/title_word here — the
+                # underlying pnl_result/pattern_stats win-loss accounting is
+                # UNCHANGED, since a breakeven scratch is still correctly a
+                # genuine win for win-rate purposes (no capital was actually
+                # lost); this is a display clarity fix, not a stats change.
+                if hit=="LOSS" and pnl>=0:
+                    title_word="SCRATCHED (BREAKEVEN)"
+                    em="🛡️"
+                send_telegram(
+                    f"{em} <b>TRADE {title_word} — {coin}</b>\n"
+                    f"⚙️ <b>TRADING SIGNAL MASTER v32G</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    + (f"⏰ Momentum thesis didn't play out — sat flat {duration} without\n"
+                       f"   reaching the first milestone. Closed to free up capital.\n\n" if hit=="TIMEOUT" else "")
+                    + (f"🔄 Dynamic Thesis Cut — price broke the 15m EMA50 against\n"
+                       f"   the trade's direction. The original entry thesis is\n"
+                       f"   invalidated, closed here instead of riding it to the\n"
+                       f"   structural stop.\n\n" if hit=="REVERSAL" else "")
+                    + f"🪙 <b>{coin}</b>  {'🟢' if trade['direction']=='BUY' else '🔴'} {trade['direction']}\n"
+                    f"📌 Pattern: {primary}\n\n"
+                    f"💰 Entry: <code>{format_price(trade['entry'])}</code>\n"
+                    f"📍 Exit:  <code>{format_price(exit_price)}</code>\n"
+                    f"⏱️ Duration: {duration}\n\n"
+                    f"📈 <b>PnL: {fmt_pnl(pnl)}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🕐 {get_ist_time()}"
+                )
+            except Exception as e:
+                logger.error(f"Error processing trade close for {coin}: {e}")
+            finally:
+                # ABSOLUTE GUARANTEE: never leave a dead trade in memory to
+                # loop forever, even if the message-construction or journal-
+                # writing logic above raises an unexpected exception. VERIFIED
+                # THE CLAIMED MECHANISM before applying this defensively:
+                # confirmed this whole block genuinely had NO enclosing
+                # try/except before this round, so an exception here would
+                # have propagated up and likely crashed check_active_trades()
+                # for that cycle rather than silently looping — the specific
+                # "infinite death loop" mechanism as described wasn't
+                # reproducible against the actual code. This restructuring is
+                # still real, sound, defensive engineering regardless: it
+                # guarantees deletion against any FUTURE exception in this
+                # block, not just the one originally claimed.
+                with trade_lock:
+                    if coin in active_trades:
+                        del active_trades[coin]
+                save_active_trades(); save_trade_history()
+                cloud_save_journal(); cloud_save_pattern_stats(); cloud_save_active_trades()
 
 def poll_telegram():
     global last_update_id
+
+    # ── ANTI-PHANTOM-TRADE STARTUP FLUSH (this round) ──
+    # VERIFIED THIS WAS A REAL, SERIOUS BUG before applying: confirmed
+    # last_update_id genuinely initializes to None (see the module-level
+    # global), meaning the FIRST getUpdates call after any restart has no
+    # offset parameter and pulls Telegram's full backlog of unacknowledged
+    # updates. Confirmed pending_signals genuinely persists across restarts
+    # (saved/loaded from disk via save_pending_signals/load_pending_signals),
+    # meaning an old, stale ACTIVATE click replayed after a restart would
+    # find its coin still present and still activatable — at whatever price
+    # the market happens to be at NOW, a genuine zombie trade at a stale,
+    # unintended price. This directly matches the phantom-trade evidence.
+    try:
+        res = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates", timeout=10)
+        if res.status_code == 200:
+            updates = res.json().get("result", [])
+            if updates:
+                last_id = updates[-1]["update_id"]
+                # Second call with offset=last_id+1 tells Telegram these
+                # updates are acknowledged, so they won't be redelivered —
+                # a bare read alone does NOT clear the backlog.
+                requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates", params={"offset": last_id + 1}, timeout=10)
+                last_update_id = last_id
+                logger.info(f"Flushed {len(updates)} stale Telegram updates on startup. Starting clean.")
+    except Exception as e:
+        logger.error(f"Failed to flush Telegram queue on startup: {e}")
+
     while True:
         try:
             params={}
@@ -6480,18 +6539,36 @@ def poll_telegram():
                         action=data.split("_",1)[0]
                         coin=data.split("_",1)[1]
                         if action=="ACTIVATE":
-                            if coin in pending_signals:
-                                lp=get_price(pending_signals[coin].get("symbol",coin+"USDT"))
-                                if lp and lp>0: pending_signals[coin]["entry"]=lp
-                                pending_signals[coin]["breakeven_sent"]=False
-                                pending_signals[coin]["partial_tp_taken"]=False
-                                pending_signals[coin]["reversal_alerted"]=False
-                                pending_signals[coin]["milestones_sent"]=[]
-                                pending_signals[coin]["timestamp"]=get_ist_datetime()
-                                pending_signals[coin]["expires_at"]=None
+                            # THREAD-SAFE ACTIVATION: atomically pop BEFORE
+                            # processing, not after — VERIFIED THIS WAS A
+                            # REAL GAP before applying: the old code left a
+                            # genuine window where the coin existed in BOTH
+                            # pending_signals and active_trades at once
+                            # (from active_trades[coin]=... until the
+                            # deletion many lines later), which a second,
+                            # near-simultaneous ACTIVATE for the same coin
+                            # (a real, plausible scenario during a replay
+                            # flood) could exploit to reprocess it.
+                            with trade_lock:
+                                if coin not in pending_signals:
+                                    setup = None
+                                else:
+                                    setup = pending_signals.pop(coin)
+                            if setup is None:
+                                send_telegram(f"⏰ <b>{BOT_HEADER}</b>\nSignal for {coin} expired.\nWait for next signal.")
+                                logger.warning(f"ACTIVATE failed: {coin} not in pending={list(pending_signals.keys())}")
+                            else:
+                                lp=get_price(setup.get("symbol",coin+"USDT"))
+                                if lp and lp>0: setup["entry"]=lp
+                                setup["breakeven_sent"]=False
+                                setup["partial_tp_taken"]=False
+                                setup["reversal_alerted"]=False
+                                setup["milestones_sent"]=[]
+                                setup["timestamp"]=get_ist_datetime()
+                                setup["expires_at"]=None
                                 with trade_lock:
-                                    active_trades[coin]=pending_signals[coin]
-                                save_active_trades()
+                                    active_trades[coin]=setup
+                                save_active_trades(); save_pending_signals()
                                 t=active_trades[coin]
                                 ep=t.get("entry",0); sl_p=t.get("sl",0); tp_p=t.get("tp",0)
                                 lev=t.get("leverage",5); dirn=t.get("direction","?"); pat=t.get("pattern","?")
@@ -6522,13 +6599,7 @@ def poll_telegram():
                                     f"✏️ Set your trade on CoinDCX now!\n"
                                     f"🕐 {get_ist_time()}"
                                 )
-                                with trade_lock:
-                                    if coin in pending_signals: del pending_signals[coin]
-                                save_pending_signals()
                                 logger.info(f"ACTIVATED: {coin}|{dirn}|Entry:{ep}|{lev}x")
-                            else:
-                                send_telegram(f"⏰ <b>{BOT_HEADER}</b>\nSignal for {coin} expired.\nWait for next signal.")
-                                logger.warning(f"ACTIVATE failed: {coin} not in pending={list(pending_signals.keys())}")
                         elif action=="IGNORE":
                             with trade_lock:
                                 if coin in pending_signals: del pending_signals[coin]
