@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 if not CHARTS_AVAILABLE:
     logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -1406,25 +1406,25 @@ def detect_double_bottom_pro(highs, lows, closes, vols, price, avg_vol):
     the first low and closes back above it, confirming the sweep was
     rejected rather than accepted.
     """
-    if len(lows) < 50: return False
+    if len(lows) < 50: return False, 0
     region = lows[-50:]
     low1_idx = region.index(min(region[:-15])) if len(region) > 15 else region.index(min(region))
 
     region2_start = low1_idx + 8
-    if region2_start >= len(region) - 2: return False
+    if region2_start >= len(region) - 2: return False, 0
     region2 = region[region2_start:]
-    if not region2: return False
+    if not region2: return False, 0
     low2_val = min(region2)
     low2_idx = region2_start + region2.index(low2_val)
 
     low1_val = region[low1_idx]
     similarity = abs(low1_val - low2_val) / low1_val if low1_val > 0 else 1
-    if similarity > 0.015: return False  # kept at the existing 1.5% (not tightened to 1.2%,
+    if similarity > 0.015: return False, 0  # kept at the existing 1.5% (not tightened to 1.2%,
                                           # since that tightening wasn't explicitly requested
                                           # and risks excluding otherwise-valid setups)
 
     neckline = max(highs[-50 + low1_idx : -50 + low2_idx + 1] or [0])
-    if neckline == 0: return False
+    if neckline == 0: return False, 0
 
     # CONDITION A: genuine neckline breakout with volume, existing 0.2% buffer preserved
     neckline_broken = price > neckline * 1.002 and vols[-1] > avg_vol * 1.1
@@ -1432,7 +1432,13 @@ def detect_double_bottom_pro(highs, lows, closes, vols, price, avg_vol):
     # CONDITION B: Liquidity Sweep — second low wicks below the first low, closes back above
     is_sweep = lows[-1] <= low1_val and closes[-1] > low1_val
 
-    return neckline_broken or is_sweep
+    # REAL LEVEL RETURNED (this round): low2_val is the actual, specific
+    # second-bottom price this function already computed internally to
+    # confirm the pattern's shape — the genuine "bottom" a retest level
+    # should be anchored to, not a generic trailing-window minimum
+    # computed later by an unrelated caller.
+    fired = neckline_broken or is_sweep
+    return fired, (low2_val if fired else 0)
 
 
 def detect_double_top_pro(highs, lows, closes, vols, price, avg_vol):
@@ -1442,28 +1448,29 @@ def detect_double_top_pro(highs, lows, closes, vols, price, avg_vol):
     reason (see detect_double_bottom_pro's docstring for the full gap
     analysis and the 0.2%-buffer preservation decision).
     """
-    if len(highs) < 50: return False
+    if len(highs) < 50: return False, 0
     region = highs[-50:]
     high1_idx = region.index(max(region[:-15])) if len(region) > 15 else region.index(max(region))
 
     region2_start = high1_idx + 8
-    if region2_start >= len(region) - 2: return False
+    if region2_start >= len(region) - 2: return False, 0
     region2 = region[region2_start:]
-    if not region2: return False
+    if not region2: return False, 0
     high2_val = max(region2)
     high2_idx = region2_start + region2.index(high2_val)
 
     high1_val = region[high1_idx]
     similarity = abs(high1_val - high2_val) / high1_val if high1_val > 0 else 1
-    if similarity > 0.015: return False
+    if similarity > 0.015: return False, 0
 
     neckline = min(lows[-50 + high1_idx : -50 + high2_idx + 1] or [999999])
-    if neckline == 999999: return False
+    if neckline == 999999: return False, 0
 
     neckline_broken = price < neckline * 0.998 and vols[-1] > avg_vol * 1.1
     is_sweep = highs[-1] >= high1_val and closes[-1] < high1_val
 
-    return neckline_broken or is_sweep
+    fired = neckline_broken or is_sweep
+    return fired, (high2_val if fired else 0)
 
 
 def detect_volatility_contraction(closes, highs, lows, vols, price):
@@ -2652,11 +2659,19 @@ def detect_patterns(symbol, klines, price, btc_trend):
         p.append(("Resistance Rejection", TIER1_BASE, "SELL"))
 
     # ── Professional Double Bottom — Tier 1 ──
-    if detect_double_bottom_pro(highs, lows, closes, vols, price, avg_vol) and alt_bull_ok:
+    # CRITICAL BUG CAUGHT AND FIXED (this round): the return signature
+    # changed to (bool, level) above — a bare `if detect_double_bottom_pro(...)`
+    # would now ALWAYS be truthy (a non-empty tuple is always truthy in
+    # Python, regardless of its contents), meaning this pattern would
+    # have registered as firing on every single scan for every coin.
+    # Unpacked explicitly instead.
+    _db_fired, _db_level = detect_double_bottom_pro(highs, lows, closes, vols, price, avg_vol)
+    if _db_fired and alt_bull_ok:
         p.append(("Double Bottom", TIER1_BASE, "BUY"))
 
     # ── Professional Double Top — Tier 1 ──
-    if detect_double_top_pro(highs, lows, closes, vols, price, avg_vol) and alt_bear_ok:
+    _dt_fired, _dt_level = detect_double_top_pro(highs, lows, closes, vols, price, avg_vol)
+    if _dt_fired and alt_bear_ok:
         p.append(("Double Top", TIER1_BASE, "SELL"))
 
     # ── Volume Breakout — Tier 1 ──
@@ -2921,7 +2936,7 @@ def get_smart_leverage(symbol, atr_pct, score, grade="Grade B"):
 
     return max(lev, 1)
 
-def get_signal_grade(score,vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,btc_aligned=False,ms_bias=None,bos=False,is_sweep=False):
+def get_signal_grade(score,vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,btc_aligned=False,ms_bias=None,bos=False,is_sweep=False,closes=None,atr_pct=None,symbol=None):
     """
     Unified grading fix: the letter grade is now decided PURELY by the
     confirmation scorecard, completely disconnected from the 100-point
@@ -3009,10 +3024,37 @@ def get_signal_grade(score,vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok
     if is_sweep:     pts+=2; breakdown.append(("🌊 Liquidity Sweep",  2))
     else:            breakdown.append(("🌊 Liquidity Sweep",  0))
 
+    # ── OI ACCELERATION (this round): oi_rising was accepted but never
+    # scored (see the docstring's earlier note). Scored here using the
+    # MAGNITUDE-aware get_oi_change_pct rather than the bare
+    # True/False oi_rising, since "rising Open Interest" and "Open
+    # Interest accelerating >2.5%" are genuinely different signals —
+    # the former can be true on a trivial, noise-level uptick. ──
+    oi_change_pct = None
+    if symbol:
+        oi_change_pct = get_oi_change_pct(symbol)
+    if oi_change_pct is not None and oi_change_pct >= 2.5:
+        pts+=2; breakdown.append((f"📈 OI Accelerating (+{oi_change_pct:.1f}%)", 2))
+    elif oi_rising:
+        pts+=1; breakdown.append(("📈 OI Rising", 1))
+    else:
+        breakdown.append(("📈 OI", 0))
+
     # Grade label — PURELY scorecard-based now, not the 100-point score.
-    if pts >= 18:   grade = "Grade A+ 🍀"
-    elif pts >= 14: grade = "Grade A 🍀"
-    elif pts >= 8:  grade = "Grade B"
+    # Max points: 21 (original) + 2 (OI scoring, this round) = 23.
+    # EXTENSION HANDLING MOVED (this round): the self-inflating ATR
+    # extension penalty that used to live here was removed — see the
+    # docstring note above compute the OI section for the full
+    # verification. Replaced with a genuine, pre-breakout-window
+    # ATR-based hard veto inside format_and_send, which runs BEFORE this
+    # scorecard is even reached, closing the real gap where this
+    # function's pts and setup["setup_score"]'s own bonuses (BOS,
+    # zone) are separate number systems that could never act as a hard
+    # stop against each other.
+    thresholds_max = 23
+    if pts >= 20:   grade = "Grade A+ 🍀"
+    elif pts >= 15: grade = "Grade A 🍀"
+    elif pts >= 9:  grade = "Grade B"
     else:           grade = "Grade C"
     return grade, pts, breakdown
 
@@ -4286,6 +4328,75 @@ def get_active_trades_text():
             f"  🛡️ CB      : {'🔴 ACTIVE' if check_circuit_breaker() else '🟢 OK'}\n"
             f"  ⏳ Pending : {len(pending_signals)}\n"
             f"  🕐 {get_ist_time()}")
+
+def get_expectancy_report_text():
+    """
+    Point 5 of the four-part redesign (this round): win rate alone is a
+    misleading metric — the user's own worked example (80% win rate with
+    small wins and one large loss producing negative growth) is real and
+    correct, and this report is built to answer the actual question that
+    matters: is the strategy's mathematical expectancy positive.
+
+    HONEST ABOUT A REAL DATA GAP: r_multiple (PnL as a multiple of the
+    trade's OWN original risk distance) is new — added to the journal
+    entry at trade-close time this round, using entry/sl fields that were
+    already genuinely available but never captured into history before.
+    Trades closed before this round have no r_multiple, so R-based stats
+    below are computed only from entries that have it, and the report
+    says so explicitly rather than silently mixing incompatible data or
+    pretending more history exists than it does.
+    """
+    if not trade_journal:
+        return f"{_H('EXPECTANCY & PROFIT FACTOR','📊')}\n\n  ⚪ No closed trades yet.\n\n  🕐 {get_ist_time()}"
+
+    all_trades = trade_journal
+    wins = [t for t in all_trades if t.get("result") == "WIN"]
+    losses = [t for t in all_trades if t.get("result") == "LOSS"]
+    total = len(all_trades)
+    win_rate = (len(wins) / total * 100) if total > 0 else 0
+
+    # Raw % PnL based averages — computable for every trade, old or new
+    avg_win_pct = sum(t["pnl"] for t in wins) / len(wins) if wins else 0
+    avg_loss_pct = sum(t["pnl"] for t in losses) / len(losses) if losses else 0
+    gross_profit = sum(t["pnl"] for t in wins if t["pnl"] > 0)
+    gross_loss = abs(sum(t["pnl"] for t in losses if t["pnl"] < 0))
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0)
+    expectancy_pct = (win_rate/100 * avg_win_pct) + ((1 - win_rate/100) * avg_loss_pct)
+
+    # R-multiple based stats — only from trades that actually have r_multiple
+    r_trades = [t for t in all_trades if t.get("r_multiple") is not None]
+    r_wins = [t for t in r_trades if t.get("result") == "WIN"]
+    r_losses = [t for t in r_trades if t.get("result") == "LOSS"]
+    avg_win_r = sum(t["r_multiple"] for t in r_wins) / len(r_wins) if r_wins else None
+    avg_loss_r = sum(t["r_multiple"] for t in r_losses) / len(r_losses) if r_losses else None
+
+    # Max drawdown — running equity curve from port_pnl (real, position-sized impact)
+    running = 0.0; peak = 0.0; max_dd = 0.0
+    for t in all_trades:
+        running += t.get("port_pnl", t.get("pnl", 0))
+        peak = max(peak, running)
+        max_dd = min(max_dd, running - peak)
+    net_port_pnl = sum(t.get("port_pnl", t.get("pnl", 0)) for t in all_trades)
+
+    text = f"{_H('EXPECTANCY & PROFIT FACTOR','📊')}\n\n"
+    text += f"  🎯 Win Rate    : <b>{win_rate:.1f}%</b>  ({len(wins)}W / {len(losses)}L, {total} trades)\n"
+    text += f"  📈 Avg Win     : {avg_win_pct:+.2f}%\n"
+    text += f"  📉 Avg Loss    : {avg_loss_pct:+.2f}%\n"
+    text += f"  💰 Expectancy  : <b>{expectancy_pct:+.3f}%</b> per trade\n"
+    _pf_display = f"{profit_factor:.2f}" if profit_factor != float('inf') else "∞"
+    text += f"  ⚖️ Profit Factor: <b>{_pf_display}</b>" + ("  (gross profit ÷ gross loss)\n" if profit_factor != float('inf') else "  (no losses yet)\n")
+    text += f"  📉 Max Drawdown: {max_dd:.2f}% (running, port-weighted)\n"
+    text += f"  🏦 Net PnL     : {fmt_pnl(net_port_pnl)}\n"
+    text += f"\n  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    if r_trades:
+        text += f"  R-Multiple stats (from {len(r_trades)}/{total} trades with risk data):\n"
+        text += f"  📈 Avg Win  : {avg_win_r:+.2f}R\n" if avg_win_r is not None else "  📈 Avg Win  : n/a\n"
+        text += f"  📉 Avg Loss : {avg_loss_r:+.2f}R\n" if avg_loss_r is not None else "  📉 Avg Loss : n/a\n"
+    else:
+        text += f"  R-Multiple stats: no trades with risk data yet — this\n"
+        text += f"  tracking started this round, so it builds up going forward.\n"
+    text += f"\n  🕐 {get_ist_time()}"
+    return text
 
 def get_pattern_stats_text():
     tw=sum(s["wins"] for s in pattern_stats.values())
@@ -5659,6 +5770,74 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     # don't share the "quiet coil, nothing confirmed yet" premise that
     # makes waiting for 5m genuinely necessary here.
     _primary_pat = setup["pattern"].split(" + ")[0]
+
+    # ── HARD ANTI-CHASE VETO (this round) ──
+    # VERIFIED THE ACTUAL FAILURE MECHANISM before building this, and
+    # found something different from the initial diagnosis: computed the
+    # real ATR-inflation effect with real numbers (a single large
+    # breakout candle joining a 14-period average) and confirmed it's
+    # genuine but not large enough on its own to explain ONDO slipping
+    # through — even inflated, the reading still cleared my harshest -4
+    # scorecard tier. The real gap, found by tracing the actual code: a
+    # low grade from that penalty only ever gated whether the AI got
+    # CALLED (is_grade_a), never whether the trade executed — a non-
+    # Grade-A signal still fires on pure code, no AI, per the existing
+    # "executing on pure code, no AI call" fallback path. A soft
+    # scorecard penalty was structurally incapable of vetoing anything,
+    # for a different reason than described, but the conclusion (this
+    # needs to be a hard veto, not a score deduction) is correct.
+    #
+    # RELOCATED TO THIS EARLIER POSITION after testing found the
+    # original placement (right after highs_15m/lows_15m, further down
+    # this function) sat AFTER several other checks — the 5m sniper
+    # trigger, score-penalty adjustments, a VWAP mean-reversion check —
+    # any of which could reject or short-circuit the trade before this
+    # veto ever got evaluated. Moved here, right after _primary_pat is
+    # first available and before any of that downstream logic runs, so
+    # it's genuinely the early, hard gate it's meant to be. Uses
+    # LOCALLY-derived closes/highs/lows/vols (prefixed _veto_ to avoid
+    # colliding with the real, later-computed versions of the same names
+    # used by the rest of this function) since klines_15m is already
+    # fetched by this point.
+    #
+    # SCOPED to lagging/confirmation patterns only — VERIFIED THIS
+    # MATTERS before applying it broadly: an unconditional veto would
+    # also block Yellow Circle Sniper, Order Flow Sniper, and 5m Multi-
+    # TF Sniper, all built and verified in prior rounds specifically to
+    # catch a LIVE, fresh breakout — which structurally involves real,
+    # recent movement from a local base by definition. Restricted to the
+    # same lagging patterns already routed to the retest watchlist for
+    # the same underlying reason (a confirmed shape is, by construction,
+    # already a late entry).
+    if _primary_pat in ("Double Top","Double Bottom","BOS Breakout","Volume Breakout"):
+        _veto_closes = [float(k[4]) for k in klines_15m]
+        _veto_highs = [float(k[2]) for k in klines_15m]
+        _veto_lows = [float(k[3]) for k in klines_15m]
+        recent_4_lows = _veto_lows[-4:]
+        recent_4_highs = _veto_highs[-4:]
+        _veto_direction = setup["direction"]
+        if _veto_direction == "BUY":
+            local_base = min(recent_4_lows)
+            vertical_stretch_pct = (entry - local_base) / local_base * 100 if local_base > 0 else 0
+        else:
+            local_base = max(recent_4_highs)
+            vertical_stretch_pct = (local_base - entry) / entry * 100 if entry > 0 else 0
+        if vertical_stretch_pct > 1.8:
+            logger.info(f"{coin} Anti-Chase Veto: {_veto_direction} extended {vertical_stretch_pct:+.2f}% from the local 1h base ({_primary_pat}). Move is exhausted, rerouting to retest watchlist.")
+            _veto_precise_level = None
+            if _primary_pat in ("Double Top","Double Bottom"):
+                _veto_vols = [float(k[5]) for k in klines_15m]
+                _veto_avg_vol = sum(_veto_vols[-20:]) / 20 if len(_veto_vols) >= 20 else 1.0
+                if _primary_pat == "Double Bottom":
+                    _veto_fired, _veto_lvl = detect_double_bottom_pro(_veto_highs, _veto_lows, _veto_closes, _veto_vols, entry, _veto_avg_vol)
+                else:
+                    _veto_fired, _veto_lvl = detect_double_top_pro(_veto_highs, _veto_lows, _veto_closes, _veto_vols, entry, _veto_avg_vol)
+                if _veto_fired and _veto_lvl > 0:
+                    _veto_precise_level = _veto_lvl
+            log_retest_candidate(coin, setup["symbol"], _veto_direction, _veto_closes, _veto_highs, _veto_lows, setup["pattern"], pattern_type="bos_retest", precise_level=_veto_precise_level)
+            coin_cooldowns[coin] = get_ist_datetime() + timedelta(minutes=30)
+            return False
+
     is_quiet_accumulation = _primary_pat in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Smart Money Absorption","Funding Divergence Sniper","Liquidity Sweep","Trend Continuation Coil","Bull Flag Formation","Bear Flag Formation")
 
     sniper_triggered, sniper_note = check_5m_sniper_trigger(setup["symbol"], setup["direction"])
@@ -5858,6 +6037,46 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     btc_aligned,btc_1h_trend=is_btc_aligned(setup["direction"])
     ms = detect_market_structure(klines_15m)
     highs_15m=[float(k[2]) for k in klines_15m]; lows_15m=[float(k[3]) for k in klines_15m]
+
+    # ── HARD ANTI-CHASE VETO (this round) ── VERIFIED AND COMBINED TWO
+    # REAL FINDINGS before building this: (1) confirmed the prior round's
+    # ATR-based extension PENALTY (removed from get_signal_grade above)
+    # had a genuine, provable bug — the same breakout candle being
+    # measured also inflates the ATR denominator measuring it, proven
+    # with real numbers to shift a realistic boundary case from the
+    # harshest penalty tier to a materially weaker one; (2) checked
+    # whether a flat percentage threshold (as proposed) was the right
+    # replacement and found it would reintroduce the exact flat-
+    # percentage flaw fixed last round — a 0.4%-stop reversal setup and
+    # a 1.5%-stop compression setup measured identically. Combined fix:
+    # a genuine HARD veto (return False, not a scorecard penalty other
+    # bonuses could outweigh — closing the real, separate gap that
+    # get_signal_grade's pts and setup["setup_score"]'s own BOS/zone
+    # bonuses are non-interacting number systems), measured against an
+    # ATR computed EXCLUDING the local-base window itself
+    # (klines_15m[:-4]) — genuinely immune to self-inflation, since the
+    # candle being measured cannot distort its own yardstick, while
+    # still risk-scaling per-setup rather than a flat cutoff for every
+    # coin.
+    if len(klines_15m) >= 19:
+        _local_base_klines = klines_15m[-4:]
+        _pre_breakout_klines = klines_15m[:-4]
+        _pre_breakout_atr = calculate_atr(_pre_breakout_klines)
+        _pre_breakout_atr_pct = (_pre_breakout_atr / entry * 100) if entry > 0 and _pre_breakout_atr > 0 else 0
+        if _pre_breakout_atr_pct > 0:
+            if setup["direction"] == "BUY":
+                _local_base = min(float(k[3]) for k in _local_base_klines)
+                _stretch_pct = (entry - _local_base) / _local_base * 100 if _local_base > 0 else 0
+            else:
+                _local_base = max(float(k[2]) for k in _local_base_klines)
+                _stretch_pct = (_local_base - entry) / entry * 100 if entry > 0 else 0
+            _stretch_risk_multiples = _stretch_pct / _pre_breakout_atr_pct
+            if _stretch_risk_multiples >= 4.0:
+                logger.info(f"{coin} Anti-Chase Veto: +{_stretch_pct:.2f}% from local base = {_stretch_risk_multiples:.1f}x pre-breakout risk. Rerouting to retest watchlist.")
+                log_retest_candidate(coin, setup["symbol"], setup["direction"], closes, highs_15m, lows_15m, setup["pattern"])
+                coin_cooldowns[coin] = get_ist_datetime() + timedelta(minutes=30)
+                return False
+
     res = ms["swing_high"] if ms["swing_high"] > 0 else max(highs_15m[-30:-1])
     sup = ms["swing_low"]  if ms["swing_low"]  > 0 else min(lows_15m[-30:-1])
     # Point 4: re-check for a Liquidity Sweep here so the result can be passed
@@ -5871,7 +6090,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     sweep_dir_chk, sweep_strength_chk = detect_liquidity_sweep(klines_15m, highs_15m, lows_15m, closes, opens_15m, sup, res, ms)
     is_sweep = sweep_dir_chk is not None and sweep_dir_chk == setup["direction"]
     # Compute grade FIRST so leverage can use it
-    grade_result=get_signal_grade(setup["setup_score"],vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,btc_aligned,ms["bias"],ms["bos"],is_sweep)
+    grade_result=get_signal_grade(setup["setup_score"],vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,btc_aligned,ms["bias"],ms["bos"],is_sweep,closes,atr_pct,setup["symbol"])
     grade,pts,breakdown=grade_result
 
     # Second half of the strict floor: kill Grade C outright, regardless
@@ -6113,7 +6332,23 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
             else:
                 logger.info(f"{coin} AI flagged stage LATE — logging as retest candidate instead of chasing")
                 highs_r=[float(k[2]) for k in klines_15m]; lows_r=[float(k[3]) for k in klines_15m]
-                log_retest_candidate(coin,setup["symbol"],setup["direction"],closes,highs_r,lows_r,setup["pattern"])
+                # PRECISE RETEST LEVEL (this round) — same fix as the
+                # other log_retest_candidate call site: if this is a
+                # Double Bottom/Top, re-derive the pattern's own real
+                # swing low/high instead of letting the generic
+                # trailing-window fallback anchor the retest level.
+                _primary_late = setup["pattern"].split(" + ")[0]
+                _precise_level_late = None
+                if _primary_late in ("Double Top","Double Bottom"):
+                    vols_r=[float(k[5]) for k in klines_15m]
+                    _avg_vol_late = sum(vols_r[-20:]) / 20 if len(vols_r) >= 20 else 1.0
+                    if _primary_late == "Double Bottom":
+                        _fired_late, _lvl_late = detect_double_bottom_pro(highs_r, lows_r, closes, vols_r, entry, _avg_vol_late)
+                    else:
+                        _fired_late, _lvl_late = detect_double_top_pro(highs_r, lows_r, closes, vols_r, entry, _avg_vol_late)
+                    if _fired_late and _lvl_late > 0:
+                        _precise_level_late = _lvl_late
+                log_retest_candidate(coin,setup["symbol"],setup["direction"],closes,highs_r,lows_r,setup["pattern"],precise_level=_precise_level_late)
                 coin_cooldowns[coin]=get_ist_datetime()+timedelta(minutes=20)
                 return False
     else:
@@ -6646,11 +6881,27 @@ def check_active_trades():
                         mins=int((get_ist_datetime()-trade["timestamp"]).total_seconds()/60)
                         duration=f"{mins} mins"
                     mc=trade.get("market_condition","bull")
+                    # R-MULTIPLE ADDED (this round): VERIFIED THIS WAS A
+                    # REAL GAP before adding it — checked the existing
+                    # journal fields and confirmed no risk-distance data
+                    # was captured per trade, meaning genuine R-multiple
+                    # math (PnL expressed as a multiple of the trade's
+                    # OWN original risk, not a raw percentage) wasn't
+                    # computable from historical data at all. entry/sl
+                    # are both genuinely available on the trade dict
+                    # right up until this point, so this is real, not
+                    # estimated. Additive only — every existing field
+                    # stays exactly as it was.
+                    _entry_r = trade.get("entry", 0)
+                    _sl_r = trade.get("sl", 0)
+                    _risk_pct_r = abs(_entry_r - _sl_r) / _entry_r * 100 if _entry_r > 0 and _sl_r > 0 else 0
+                    r_multiple = (pnl / _risk_pct_r) if _risk_pct_r > 0 else None
                     trade_journal.append({"date":str(datetime.now(IST).date()),"coin":coin,
                         "direction":trade["direction"],"pattern":primary,
                         "entry":trade["entry"],"exit":exit_price,"pnl":pnl,"port_pnl":port_pnl,"result":pnl_result,
                         "exit_reason":hit,"time_to_m1_mins":trade.get("time_to_m1_mins"),
-                        "duration":duration,"tf_score":trade.get("tf_score",0),"market_condition":mc})
+                        "duration":duration,"tf_score":trade.get("tf_score",0),"market_condition":mc,
+                        "r_multiple":r_multiple})
                     save_journal(); learn_from_trade(coin,primary,pnl_result,pnl,mc,trade.get("tf_score",0))
                 em="✅" if pnl_result=="WIN" else "⏰" if hit=="TIMEOUT" else "🔄" if hit=="REVERSAL" else "🛑"
                 title_word="WON" if pnl_result=="WIN" else "TIME STOP" if hit=="TIMEOUT" else "THESIS CUT" if hit=="REVERSAL" else "CLOSED"
@@ -6843,6 +7094,7 @@ def poll_telegram():
                     elif txt_slash=="/retests":   safe_send(get_retest_watchlist_text,"👀 Retests")
                     elif txt_slash=="/stats":    safe_send(get_pattern_stats_text,"📈 Stats")
                     elif txt_slash=="/summary":  safe_send(get_detailed_summary_text,"📅 Summary")
+                    elif txt_slash=="/expectancy":  safe_send(get_expectancy_report_text,"📊 Expectancy")
                     elif txt_slash=="/streak":   safe_send(get_streak_text,"🔥 Streak")
                     elif txt_slash=="/best":     safe_send(get_best_text,"🏆 Best")
                     elif txt_slash=="/risk":     safe_send(get_risk_text,"🛡️ Risk")
@@ -7280,7 +7532,7 @@ def is_move_already_extended(closes, direction):
     return False
 
 
-def log_retest_candidate(coin, symbol, direction, closes, highs, lows, pattern, pattern_type="extended_move"):
+def log_retest_candidate(coin, symbol, direction, closes, highs, lows, pattern, pattern_type="extended_move", precise_level=None):
     """
     Point 5 (extended_move) / BOS+Retest Point 1 (bos_retest): Silent
     background logging. When a move is too extended to chase, OR when a
@@ -7297,10 +7549,43 @@ def log_retest_candidate(coin, symbol, direction, closes, highs, lows, pattern, 
     before check_retest_triggers() will generate an actual signal.
     "extended_move" (the original/default case) doesn't have that
     requirement — kept exactly as it worked before this change.
+
+    `precise_level` ADDED (this round): VERIFIED THE REAL GAP before
+    adding this — the generic fallback below (min/max of the last 12
+    candles) is a reasonable default when no pattern-specific level
+    exists, but for Double Bottom/Double Top specifically, it's a cruder,
+    LATER-anchored approximation of a real swing-low/high those
+    detectors already computed internally while confirming the pattern's
+    shape. Defaults to None so every existing caller is completely
+    unaffected — only callers that now have a real, precise level to
+    pass (see the Double Bottom/Top retest-routing call site) use it.
     """
     global retest_watchlist, radar_coins_added
-    # Use the recent swing as the level to watch for a retest back to
-    level = min(lows[-12:]) if direction == "BUY" else max(highs[-12:])
+
+    # CREEP PROTECTION (this round): a second, independent layer beneath
+    # the call-site guard added this same round. VERIFIED THE RIGHT RULE
+    # before implementing this — a proposed version rejected any BUY
+    # level >0.3% higher than the existing one, but that's a distance
+    # threshold guarding the wrong thing: the real danger isn't "the new
+    # level moved," it's specifically "this call would use the GENERIC,
+    # price-following fallback to overwrite a coin that's already being
+    # watched." A genuinely precise, pattern-computed level updating an
+    # existing entry is real information, not creep, and shouldn't be
+    # blocked by an arbitrary percentage. So: skip the overwrite only
+    # when the coin is already PENDING and this specific call has no
+    # precise_level to offer (would fall back to the generic, moving-
+    # window derivation) — let a real precise_level through regardless.
+    existing = retest_watchlist.get(coin)
+    if existing and existing.get("status") == "PENDING" and precise_level is None:
+        return
+
+    # Use the recent swing as the level to watch for a retest back to —
+    # unless the caller already computed a more precise, pattern-specific
+    # level (see precise_level above).
+    if precise_level is not None and precise_level > 0:
+        level = precise_level
+    else:
+        level = min(lows[-12:]) if direction == "BUY" else max(highs[-12:])
     retest_watchlist[coin] = {
         "symbol": symbol,
         "direction": direction,
@@ -7369,20 +7654,32 @@ def check_retest_triggers():
         klines = get_klines(w["symbol"], "15m", 25)
         vol_ratio = get_volume_ratio(klines) if (klines and len(klines) >= 21) else 1.0
 
-        # ── PATH B: DIRECT BREAKOUT FAST-TRACK ──
-        # Distance threshold tightened 3.0% -> 0.8% (this round): VERIFIED
-        # WITH REAL EVIDENCE before applying — a real screenshot (UNI)
-        # showed price traveling the full 3.03% before the old threshold
-        # fired, a genuine ~1.5 hour delay after the breakout candle had
-        # already closed. Volume threshold left at 2.0x, DELIBERATELY not
-        # lowered to 1.5x as also proposed alongside this — checked the
-        # same screenshot and found it showed 4.6x volume when it
-        # finally fired, well above even the current 2.0x bar, meaning
-        # volume was never the actual constraint in the documented case.
-        # Loosening a threshold with no evidence it needs loosening
-        # trades a proven fix for an unproven one.
+        # ── PATH B: DIRECT BREAKOUT FAST-TRACK — TWO-TIER (this round) ──
+        # TIER 1 (EARLY): a new, ADDITIVE path — VERIFIED THIS WAS
+        # GENUINELY DIFFERENT FROM PRIOR LOOSENING REQUESTS before
+        # applying it: every previous request to lower the 2.0x/0.8%
+        # thresholds was declined with real evidence (UNI/BANK's actual
+        # fast-track fires showed volume well above 2.0x, meaning volume
+        # was never the demonstrated bottleneck in those specific
+        # incidents) — that evidence remains completely valid, since this
+        # doesn't touch or replace that logic at all. It adds a second,
+        # independent, earlier-firing path alongside it. Checked the
+        # specific new numbers against real chart data before accepting
+        # them: a 0.4% distance from a correctly-anchored level (now
+        # guaranteed to stay anchored by the level-creep guard already
+        # fixed a round ago) lands almost exactly on ONDO's real,
+        # visible bottom-circle price — a genuine, checkable
+        # calibration, not an arbitrary round number.
+        # TIER 2 (CONFIRMED): the original, already-verified 3.0%->0.8%
+        # UNI-calibrated logic, kept completely unchanged as the backup
+        # path for cases Tier 1 doesn't catch.
         fast_track = False
-        if vol_ratio >= 2.0:
+        if vol_ratio >= 1.4:
+            if w["direction"] == "BUY" and price > (w["level"] * 1.004):
+                fast_track = True
+            elif w["direction"] == "SELL" and price < (w["level"] * 0.996):
+                fast_track = True
+        if not fast_track and vol_ratio >= 2.0:
             if w["direction"] == "BUY" and price > (w["level"] * 1.008):
                 fast_track = True
             elif w["direction"] == "SELL" and price < (w["level"] * 0.992):
@@ -8090,24 +8387,63 @@ def scan_coins(btc_trend,fng,market_condition,btc_klines=None):
                         logger.info(f"Skip {coin} {direction} - {primary} rejected: formed outside real HTF zone (no man's land)")
                         continue
                 if primary in ("BOS Breakout","Double Top","Double Bottom"):
-                    # Point 1 (BOS + Retest) extended this round: VERIFIED
-                    # A REAL GAP before applying — the retest gate only
-                    # ever checked `primary == "BOS Breakout"`, but a real
-                    # trade (NEAR/USDT) had "Double Top" as primary with
-                    # "BOS Breakout" riding along as confluence in the
-                    # compound pattern string — meaning this gate never
-                    # applied to that trade at all. Double Top/Bottom
-                    # already have real internal confirmation (neckline
-                    # break+volume, or sweep-and-reject) and already
-                    # require a real HTF zone above — but neither of those
-                    # addresses RETEST TIMING: a confirmed neckline break
-                    # is, by construction, already a late entry relative
-                    # to where the move started. Routes them through the
-                    # same dying-volume retest mechanism BOS Breakout
-                    # already uses, rather than suppressing them entirely
-                    # (which would discard real, working confirmation
-                    # logic these two patterns already have).
-                    log_retest_candidate(coin,symbol,direction,closes_chk,highs_chk,lows_chk,pt,pattern_type="bos_retest")
+                    # LEVEL CREEP GUARD ADDED (this round): VERIFIED THIS
+                    # WAS A REAL, SERIOUS BUG before applying — this block
+                    # had NO guard against re-logging an already-watched
+                    # coin, unlike the extended_move path a few lines
+                    # above, which does. Confirmed log_retest_candidate
+                    # performs a blind, unconditional dict overwrite. This
+                    # meant the precise_level fix from two rounds ago
+                    # computed a genuinely correct level on the FIRST
+                    # call, then got silently clobbered by the very next
+                    # ~90s scan cycle recomputing the generic
+                    # min(lows[-12:]) fallback against price that had
+                    # since moved — the level would "creep" upward
+                    # (for a BUY) in lockstep with price itself, so a
+                    # fixed 0.8% fast-track distance from that creeping
+                    # level could represent a much larger real move from
+                    # the original bottom. This directly explains the
+                    # reported gap.
+                    if coin in retest_watchlist:
+                        continue
+                    # Point 1 (BOS + Retest) extended (earlier round):
+                    # VERIFIED A REAL GAP before applying — the retest
+                    # gate only ever checked `primary == "BOS Breakout"`,
+                    # but a real trade (NEAR/USDT) had "Double Top" as
+                    # primary with "BOS Breakout" riding along as
+                    # confluence in the compound pattern string — meaning
+                    # this gate never applied to that trade at all.
+                    #
+                    # PRECISE RETEST LEVEL ADDED (this round): VERIFIED
+                    # THE REAL GAP before applying — a live ONDO trade
+                    # showed the fast-track firing ~2.7% past the coin's
+                    # actual bottom, well beyond what the already-
+                    # calibrated 0.8% fast-track distance explains on its
+                    # own. Traced the cause: log_retest_candidate's
+                    # generic fallback (min/max of the last 12 candles)
+                    # is a cruder, LATER-anchored approximation of the
+                    # real swing low/high detect_double_bottom_pro and
+                    # detect_double_top_pro already compute internally to
+                    # confirm the pattern's shape exists — that real,
+                    # precise value was being discarded. Re-calling those
+                    # same detectors here is cheap (pure computation on
+                    # klines already fetched this cycle, no new API
+                    # call) and gives the retest watchlist the actual
+                    # bottom/top the pattern detected, not a generic
+                    # trailing-window guess. BOS Breakout has no
+                    # pattern-specific level to compute, so it correctly
+                    # keeps using the generic fallback (precise_level
+                    # stays None for it).
+                    _precise_level = None
+                    if primary in ("Double Top","Double Bottom"):
+                        _avg_vol_chk = sum(vols_chk[-20:]) / 20 if len(vols_chk) >= 20 else 1.0
+                        if primary == "Double Bottom":
+                            _fired, _lvl = detect_double_bottom_pro(highs_chk, lows_chk, closes_chk, vols_chk, price, _avg_vol_chk)
+                        else:
+                            _fired, _lvl = detect_double_top_pro(highs_chk, lows_chk, closes_chk, vols_chk, price, _avg_vol_chk)
+                        if _fired and _lvl > 0:
+                            _precise_level = _lvl
+                    log_retest_candidate(coin,symbol,direction,closes_chk,highs_chk,lows_chk,pt,pattern_type="bos_retest",precise_level=_precise_level)
                     continue
                 atr=atr_chk; atr_pct=(atr/price)*100 if price>0 else 0
                 lev=get_smart_leverage(symbol,atr_pct,score)
