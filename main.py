@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 if not CHARTS_AVAILABLE:
     logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -2350,6 +2350,64 @@ def detect_yellow_circle_sniper(symbol, live_price):
         return None
 
 
+def detect_market_regime(klines):
+    """
+    Per-coin market regime classifier — the structural fix for "a Double
+    Bottom in a choppy regime is a trap, the same Double Bottom in a
+    trending regime is a breakout." VERIFIED THE REAL GAP before
+    building this: the existing detect_market_condition only classifies
+    BTC's overall market (bull/bear/sideways), never per-coin, and has
+    no concept of squeeze or choppy volatility as distinct from trend
+    direction — a coin can genuinely be coiling tightly while BTC itself
+    trends, or vice versa, which that function structurally cannot see.
+
+    Built using measures already proven and calibrated elsewhere in this
+    file — calculate_adx, and the same range_pct style already
+    established in detect_volatility_contraction/
+    detect_pre_breakout_compression — rather than inventing new,
+    unverified indicators. The 25 ADX bar for TRENDING is deliberately
+    set above the existing ADX_MIN_TREND=21 (the bar for "is there a
+    real trend at all, at all"), since a regime-level "this is a strong
+    trend" call should be a stricter bar than the minimum floor used to
+    gate individual lagging patterns.
+
+    Returns one of: "TRENDING", "SQUEEZE", "CHOPPY", "RANGE_BOUND".
+    """
+    if len(klines) < 30:
+        return "RANGE_BOUND"
+    closes = [float(k[4]) for k in klines]
+    highs = [float(k[2]) for k in klines]
+    lows = [float(k[3]) for k in klines]
+    adx_val = calculate_adx(klines)
+
+    # Real trend strength, same measure already used to gate lagging
+    # patterns elsewhere in this file.
+    if adx_val >= 25:
+        return "TRENDING"
+
+    # Recent (last 20 candles) range, same style already used in
+    # detect_volatility_contraction/detect_pre_breakout_compression.
+    recent_high = max(highs[-20:])
+    recent_low = min(lows[-20:])
+    range_pct = (recent_high - recent_low) / recent_low * 100 if recent_low > 0 else 999
+
+    # SQUEEZE: genuinely tight range AND low trend strength — a real
+    # coiling/compression state, not just "not trending."
+    if range_pct < 3.0 and adx_val < 18:
+        return "SQUEEZE"
+
+    # CHOPPY: price is genuinely moving a lot candle-to-candle (real
+    # whipsaw), but not making real net progress — the literal
+    # definition of chop, distinct from a genuine range-bound drift.
+    candle_ranges = [(float(k[2]) - float(k[3])) / float(k[3]) * 100 if float(k[3]) > 0 else 0 for k in klines[-20:]]
+    avg_candle_range = sum(candle_ranges) / len(candle_ranges) if candle_ranges else 0
+    net_move_pct = abs(closes[-1] - closes[-20]) / closes[-20] * 100 if len(closes) >= 20 and closes[-20] > 0 else 0
+    if avg_candle_range > 0 and (net_move_pct / (avg_candle_range * 20)) < 0.15:
+        return "CHOPPY"
+
+    return "RANGE_BOUND"
+
+
 def detect_patterns(symbol, klines, price, btc_trend):
     """
     Upgraded pattern detection with:
@@ -2568,10 +2626,21 @@ def detect_patterns(symbol, klines, price, btc_trend):
     # the proposed 99.0 — matches Funding Divergence Sniper, not an
     # unprecedented new ceiling.
     yc_dir = detect_yellow_circle_sniper(symbol, price)
-    if yc_dir == "BUY" and alt_bull_ok:
-        p.append(("Yellow Circle Sniper", 92.0, "BUY"))
-    elif yc_dir == "SELL" and alt_bear_ok:
-        p.append(("Yellow Circle Sniper", 92.0, "SELL"))
+    if yc_dir in ("BUY", "SELL"):
+        # 3m CVD CONFIRMATION (this round): VERIFIED THE RIGHT
+        # INTEGRATION SHAPE before adding this — NOT a hard AND-gate on
+        # the already-extensively-verified trigger above (that would
+        # make a proven-correct pattern silently fail on a network
+        # hiccup or thin 3m data, making it LESS reliable). Real CVD
+        # agreement upgrades the score as a genuine, deserved bonus for
+        # stronger evidence; its absence just means the pattern fires at
+        # its already-proven base score, same as before this round.
+        _yc_cvd = detect_cvd_delta_3m(symbol)
+        _yc_score = 92.0 + (2.0 if _yc_cvd == yc_dir else 0.0)
+        if yc_dir == "BUY" and alt_bull_ok:
+            p.append(("Yellow Circle Sniper", _yc_score, "BUY"))
+        elif yc_dir == "SELL" and alt_bear_ok:
+            p.append(("Yellow Circle Sniper", _yc_score, "SELL"))
 
     # ── ADX GATE (relocated here this round) ──
     # Everything above this line is a genuine accumulation/predictive
@@ -2936,7 +3005,7 @@ def get_smart_leverage(symbol, atr_pct, score, grade="Grade B"):
 
     return max(lev, 1)
 
-def get_signal_grade(score,vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,btc_aligned=False,ms_bias=None,bos=False,is_sweep=False,closes=None,atr_pct=None,symbol=None):
+def get_signal_grade(score,vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,btc_aligned=False,ms_bias=None,bos=False,is_sweep=False,closes=None,atr_pct=None,symbol=None,regime=None,primary_pattern=None):
     """
     Unified grading fix: the letter grade is now decided PURELY by the
     confirmation scorecard, completely disconnected from the 100-point
@@ -2981,9 +3050,24 @@ def get_signal_grade(score,vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok
     elif score>=92:  pts+=2; breakdown.append(("🎯 Score ≥92",      2))
     elif score>=85:  pts+=1; breakdown.append(("🎯 Score ≥85",      1))
     else:                    breakdown.append(("🎯 Score",           0))
-    if vol_ratio>=1.5:   pts+=2; breakdown.append((f"📊 Volume {vol_ratio:.1f}x (strong)",   2))
-    elif vol_ratio>=1.2: pts+=1; breakdown.append((f"📊 Volume {vol_ratio:.1f}x (moderate)",  1))
-    else:                        breakdown.append((f"📊 Volume {vol_ratio:.1f}x",              0))
+    _is_coiling_for_vol = primary_pattern in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Smart Money Absorption","Funding Divergence Sniper","Liquidity Sweep","Trend Continuation Coil","Bull Flag Formation","Bear Flag Formation") if primary_pattern else False
+    if _is_coiling_for_vol:
+        # DYING VOLUME REWARD (this round): VERIFIED THIS WAS A REAL,
+        # ACTIVE INCONSISTENCY before fixing it — several of these exact
+        # patterns already REQUIRE dying volume in their own detection
+        # logic just to fire at all, yet this same scorecard was
+        # penalizing them by omission for not having "strong" volume,
+        # the literal opposite of what their own thesis needs. Made
+        # conditional on the pattern actually being coiling-style, NOT a
+        # blanket reversal — a genuine breakout/confirmation pattern
+        # still needs real volume as meaningful validation.
+        if vol_ratio<=0.6:   pts+=2; breakdown.append((f"📊 Volume {vol_ratio:.1f}x (dying — coil intact)", 2))
+        elif vol_ratio<=0.9: pts+=1; breakdown.append((f"📊 Volume {vol_ratio:.1f}x (quiet)", 1))
+        else:                        breakdown.append((f"📊 Volume {vol_ratio:.1f}x (not yet dying)", 0))
+    else:
+        if vol_ratio>=1.5:   pts+=2; breakdown.append((f"📊 Volume {vol_ratio:.1f}x (strong)",   2))
+        elif vol_ratio>=1.2: pts+=1; breakdown.append((f"📊 Volume {vol_ratio:.1f}x (moderate)",  1))
+        else:                        breakdown.append((f"📊 Volume {vol_ratio:.1f}x",              0))
     if tf_score==3:  pts+=2; breakdown.append(("📡 4h+1h Aligned",  2))
     elif tf_score==2:pts+=1; breakdown.append(("📡 4h Aligned",     1))
     else:                    breakdown.append(("📡 TF Alignment",    0))
@@ -3051,10 +3135,62 @@ def get_signal_grade(score,vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok
     # function's pts and setup["setup_score"]'s own bonuses (BOS,
     # zone) are separate number systems that could never act as a hard
     # stop against each other.
-    thresholds_max = 23
-    if pts >= 20:   grade = "Grade A+ 🍀"
-    elif pts >= 15: grade = "Grade A 🍀"
-    elif pts >= 9:  grade = "Grade B"
+    # ── TIGHT STRUCTURAL RISK REWARD (this round) ── VERIFIED THIS WAS
+    # GENUINELY INDEPENDENT EVIDENCE before adding it, not redundant
+    # with the extension veto in format_and_send: the veto measures "has
+    # price already moved too far relative to its own risk" (a
+    # dynamic, move-dependent question); this measures "is this coin's
+    # own typical risk small in absolute terms" (a static property of
+    # the coin's current volatility) — a setup can score well on both
+    # without double-counting the same underlying data. Uses atr_pct,
+    # the same honest, already-available proxy the veto uses, since the
+    # real SL genuinely isn't computed yet at this point (see the
+    # sequencing note above the grading call site).
+    if atr_pct is not None and atr_pct > 0:
+        if atr_pct < 0.8:    pts+=2; breakdown.append((f"🎯 Tight Risk ({atr_pct:.2f}% ATR)", 2))
+        elif atr_pct < 1.5:  pts+=1; breakdown.append((f"🎯 Moderate Risk ({atr_pct:.2f}% ATR)", 1))
+        else:                        breakdown.append((f"🎯 Risk ({atr_pct:.2f}% ATR)", 0))
+
+    # ── REGIME-AWARE SCORING (this round) ── VERIFIED THE CATEGORIZATION
+    # before implementing: reused the EXACT SAME predictive-pattern list
+    # already established and checked pattern-by-pattern for the
+    # is_quiet_accumulation/is_early_pat exemptions elsewhere in this
+    # session, rather than a fresh, separately-reasoned categorization
+    # that could silently drift from the existing one. Direct
+    # implementation of the message's core claim: a Double Bottom (a
+    # confirmation/breakout pattern) in a RANGE_BOUND or CHOPPY regime
+    # is genuinely more likely to be a trap than the identical pattern
+    # in a TRENDING regime — this is a real, structural distinction the
+    # scorecard never made before this round.
+    regime_label = None
+    if regime and primary_pattern:
+        _is_coiling_pattern = primary_pattern in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Smart Money Absorption","Funding Divergence Sniper","Liquidity Sweep","Trend Continuation Coil","Bull Flag Formation","Bear Flag Formation")
+        if regime == "TRENDING":
+            if not _is_coiling_pattern:
+                pts += 1; regime_label = ("🌊 Regime: Trending (breakout favored)", 1)
+            else:
+                regime_label = ("🌊 Regime: Trending", 0)
+        elif regime == "SQUEEZE":
+            if _is_coiling_pattern:
+                pts += 2; regime_label = ("🌊 Regime: Squeeze (coil favored, +2)", 2)
+            else:
+                regime_label = ("🌊 Regime: Squeeze", 0)
+        elif regime in ("RANGE_BOUND", "CHOPPY"):
+            if not _is_coiling_pattern:
+                pts -= 3; regime_label = (f"🌊 Regime: {regime.title()} (breakout penalized, -3)", -3)
+            else:
+                regime_label = (f"🌊 Regime: {regime.title()}", 0)
+        if regime_label:
+            breakdown.append(regime_label)
+
+    # THRESHOLDS RECALIBRATED AGAIN (this round): max moved from 23 to
+    # 25 with the tight-structural-risk addition. Recalculated 20/15/9
+    # proportionally against the new max — 22/16/10 — the same
+    # documented approach used twice before in this function's history.
+    thresholds_max = 25
+    if pts >= 22:   grade = "Grade A+ 🍀"
+    elif pts >= 16: grade = "Grade A 🍀"
+    elif pts >= 10: grade = "Grade B"
     else:           grade = "Grade C"
     return grade, pts, breakdown
 
@@ -3353,6 +3489,52 @@ def detect_aggressive_order_flow(klines):
     except Exception as e:
         logger.warning(f"order flow: {e}")
         return None
+
+def detect_cvd_delta_3m(symbol):
+    """
+    Near-real-time 3m Cumulative Volume Delta — genuinely distinct from
+    detect_aggressive_order_flow (which correctly, deliberately operates
+    on 15m klines over a 75-minute window). This is System 1's actual
+    micro-entry trigger: "aggressive market buys are consistently
+    outpacing market sells over the last 10 minutes" on the 3m chart,
+    not the 15m aggregate.
+
+    VERIFIED THIS NEEDED A NEW FUNCTION rather than reusing the existing
+    one: the existing detect_aggressive_order_flow's 75-minute window is
+    correct for its own use case, but a genuine mismatch for near-
+    real-time reversal detection — by the time enough 15m data existed
+    to read a real signal, the same lateness problem this whole session
+    has been about would just reappear one level down.
+
+    Uses 3 x 3m candles (9 minutes) — the closest honest match to "the
+    last 10 minutes" without overshooting it, since 10 doesn't divide
+    evenly by 3. Threshold raised to 70% (from the existing, proven 65%
+    used for the much wider 75-minute window) deliberately: a 9-minute
+    sample on 3m data is smaller and noisier, and deserves a stricter
+    bar before being trusted as a real signal, not the same bar reused
+    without adjustment.
+
+    Returns "BUY", "SELL", or None.
+    """
+    try:
+        k3 = get_klines(symbol, "3m", 10)
+        if not k3 or len(k3) < 3:
+            return None
+        recent = k3[-3:]
+        taker_buy_vol = sum(float(k[9]) for k in recent)
+        total_vol = sum(float(k[5]) for k in recent)
+        if total_vol <= 0:
+            return None
+        taker_sell_vol = total_vol - taker_buy_vol
+        if taker_buy_vol / total_vol >= 0.70:
+            return "BUY"
+        if taker_sell_vol / total_vol >= 0.70:
+            return "SELL"
+        return None
+    except Exception as e:
+        logger.warning(f"3m CVD delta {symbol}: {e}")
+        return None
+
 
 def detect_order_flow_sniper(symbol, klines, price):
     """
@@ -6090,7 +6272,8 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     sweep_dir_chk, sweep_strength_chk = detect_liquidity_sweep(klines_15m, highs_15m, lows_15m, closes, opens_15m, sup, res, ms)
     is_sweep = sweep_dir_chk is not None and sweep_dir_chk == setup["direction"]
     # Compute grade FIRST so leverage can use it
-    grade_result=get_signal_grade(setup["setup_score"],vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,btc_aligned,ms["bias"],ms["bos"],is_sweep,closes,atr_pct,setup["symbol"])
+    _coin_regime = detect_market_regime(klines_15m)
+    grade_result=get_signal_grade(setup["setup_score"],vol_ratio,oi_rising,tf_score,vol_ok,rsi_ok,funding_ok,st_ok,vwap_ok,zone_ok,adx_val,btc_aligned,ms["bias"],ms["bos"],is_sweep,closes,atr_pct,setup["symbol"],_coin_regime,_primary_pat)
     grade,pts,breakdown=grade_result
 
     # Second half of the strict floor: kill Grade C outright, regardless
@@ -6110,8 +6293,8 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     # Verified this gap directly: ran a full end-to-end Early Spark
     # signal through format_and_send and watched it die at this exact
     # gate despite clearing every other exemption already in place.
-    if grade == "Grade C" and _floor_primary not in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Vanguard Macro Squeeze","Smart Money Absorption","Funding Divergence Sniper","Order Flow Sniper","Yellow Circle Sniper"):
-        logger.info(f"{coin} rejected - Grade C on scorecard ({pts} pts) despite score {setup['setup_score']:.1f}"); return False
+    if grade in ("Grade C","Grade B") and _floor_primary not in ("Inside Bar Coil","Pre-Breakout Compression","Volatility Contraction (Coiling)","Early Spark Ignition","Vanguard Macro Squeeze","Smart Money Absorption","Funding Divergence Sniper","Order Flow Sniper","Yellow Circle Sniper"):
+        logger.info(f"{coin} rejected - {grade} on scorecard ({pts} pts) despite score {setup['setup_score']:.1f}"); return False
 
     # ── FRESH PRICE CHECK BEFORE RISK CALCULATION (this round) ──
     # VERIFIED THIS WAS A REAL GAP: `entry` was captured at the very top
