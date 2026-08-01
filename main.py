@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 if not CHARTS_AVAILABLE:
     logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -143,7 +143,7 @@ pattern_stats = {p: {"signals":0,"wins":0,"losses":0,"total_pnl":0.0,"weight":1.
     "Volume Spike","Double Bottom","Double Top","Support Bounce","Resistance Rejection",
     "Bullish Engulfing","Bearish Engulfing","Volume Breakout","Bull Flag Formation","Bear Flag Formation",
     "BOS Breakout","Change of Character (ChoCh)","Liquidity Sweep","Volatility Contraction (Coiling)","Pre-Breakout Compression",
-    "Inside Bar Coil","BOS-Retest","BOS Retest (Sniper Entry)","Early Spark Ignition","Pressure Cooker Triangle","Vanguard Macro Squeeze","Smart Money Absorption","Funding Divergence Sniper","Trend Continuation Coil","5m Multi-TF Sniper","Order Flow Sniper","Yellow Circle Sniper","Lightning 3M Ignition (Taker Delta)","Lightning 5M Setup","Pre-Breakout Macro","Hammer","Inverted Hammer","Shooting Star","Dragonfly Doji","Gravestone Doji","Tweezer Bottom","Tweezer Top","Morning Star","Evening Star","Three White Soldiers","Three Black Crows","Triple Bottom (Anticipatory)","Triple Top (Anticipatory)","Inverse Head & Shoulders (Early)","Head & Shoulders (Early)","Wolfe Wave Reversal","PDL Reversal Sweep","PDH Reversal Sweep","ChoCh + Fib 0.618 Golden Zone","Distribution Breakdown","V-Shape Reversal"
+    "Inside Bar Coil","BOS-Retest","BOS Retest (Sniper Entry)","Early Spark Ignition","Pressure Cooker Triangle","Vanguard Macro Squeeze","Smart Money Absorption","Funding Divergence Sniper","Trend Continuation Coil","5m Multi-TF Sniper","Order Flow Sniper","Yellow Circle Sniper","Lightning 3M Ignition (Taker Delta)","Lightning 5M Setup","Pre-Breakout Macro","Hammer","Inverted Hammer","Shooting Star","Dragonfly Doji","Gravestone Doji","Tweezer Bottom","Tweezer Top","Morning Star","Evening Star","Three White Soldiers","Three Black Crows","Triple Bottom (Anticipatory)","Triple Top (Anticipatory)","Inverse Head & Shoulders (Early)","Head & Shoulders (Early)","Wolfe Wave Reversal","PDL Reversal Sweep","PDH Reversal Sweep","ChoCh + Fib 0.618 Golden Zone"
 ]}
 
 last_update_id         = None
@@ -392,7 +392,6 @@ BREAKOUT_ENGINE_PATTERNS = {
     "BOS Breakout", "Volume Breakout", "Double Bottom", "Double Top",
     "Bull Flag Formation", "Bear Flag Formation", "EMA Trend", "Pullback to 20 EMA",
     "Momentum Surge", "Volume Spike", "Support Bounce", "Resistance Rejection",
-    "Distribution Breakdown", "V-Shape Reversal",
 }
 PRE_BREAKOUT_ENGINE_PATTERNS = {
     "Inside Bar Coil", "Pre-Breakout Compression", "Volatility Contraction (Coiling)",
@@ -1812,129 +1811,8 @@ def detect_double_top_pro(highs, lows, closes, vols, price, avg_vol):
     return fired, (high2_val if fired else 0)
 
 
-def detect_distribution_range(highs, lows, closes, vols, price, avg_vol):
-    """
-    Distribution — a topping/consolidation range that forms after a real
-    prior uptrend, where price fails to make a fresh sustained high,
-    chops sideways while volume dries up, then breaks DOWN out of the
-    range on real volume. Requested against the reference notes: HH/HL
-    uptrend -> failed new high -> sideways distribution box -> breakdown.
-
-    Bearish-only by definition (distribution precedes markdown). The
-    bullish mirror — accumulation before a breakout — is already covered
-    by the existing coil/compression detectors (Inside Bar Coil,
-    Pre-Breakout Compression, Volatility Contraction), so it isn't
-    duplicated here.
-
-    Thresholds are a reasoned first pass (not sourced from an external
-    reference), same caveat as this file's other pattern detectors:
-    prior rise >= 4% (there must be a real uptrend to distribute from),
-    range width 1.5%-7% (tighter than that is a coil, not a distribution
-    range; wider is just chop), volume must be drying out inside the
-    range vs the prior uptrend leg, and the breakdown needs a real close
-    below the range low plus a volume kick — same confirmation style as
-    detect_double_top_pro's neckline break.
-
-    Returns (fired: bool, level: float) — level is the range low, the
-    breakdown trigger price.
-    """
-    if len(closes) < 45: return False, 0
-
-    uptrend_window = closes[-45:-15]
-    uptrend_vols = vols[-45:-15]
-    if len(uptrend_window) < 15 or not uptrend_vols: return False, 0
-    uptrend_move_pct = (uptrend_window[-1] - uptrend_window[0]) / uptrend_window[0] * 100 if uptrend_window[0] > 0 else 0
-    if uptrend_move_pct < 4.0:
-        return False, 0  # no genuine prior uptrend, nothing to distribute from
-
-    # Box window is the 15 candles BEFORE the confirmation candle — the
-    # confirmation/breakdown candle itself must stay OUT of this
-    # measurement, otherwise a genuine breakdown (which by definition
-    # undercuts the box) inflates the box's own range and corrupts its
-    # own low (same self-referential bug class as detect_double_top_pro
-    # guards against with its separate neckline window).
-    range_highs = highs[-16:-1]; range_lows = lows[-16:-1]; range_vols = vols[-16:-1]
-    if not range_highs: return False, 0
-    range_high = max(range_highs); range_low = min(range_lows)
-    if range_low <= 0: return False, 0
-    range_pct = (range_high - range_low) / range_low * 100
-    if range_pct < 1.5 or range_pct > 7.0:
-        return False, 0  # too tight = coil, too wide = just chop, not a range
-
-    # "New high fail": the range's own high should sit close to the prior
-    # uptrend's high, not meaningfully above it — a genuinely failed push,
-    # not a continuation.
-    prior_high = max(uptrend_window)
-    if range_high < prior_high * 0.995:
-        return False, 0
-
-    avg_uptrend_vol = sum(uptrend_vols) / len(uptrend_vols)
-    avg_range_vol = sum(range_vols) / len(range_vols)
-    if avg_range_vol > avg_uptrend_vol * 1.1:
-        return False, 0  # volume still expanding — not a genuine distribution phase
-
-    broke_down = price < range_low * 0.998 and vols[-1] > avg_range_vol * 1.4
-    return broke_down, (range_low if broke_down else 0)
-
-
-def detect_v_shape_reversal(closes, highs, lows, vols, price, avg_vol):
-    """
-    V-Shape Reversal — a sharp, fast decline into a pivot low (or rally
-    into a pivot high) immediately followed by an equally sharp move back
-    out, with no basing period in between. What separates this from
-    Double Bottom/Top or Cup & Handle (which require a base or multiple
-    touches) is speed on both legs, not structure — then a genuine
-    breakout back past the level the move started from, on real volume.
-
-    Both directions: BUY (V bottom) / SELL (inverted-V top).
-
-    Thresholds (reasoned from the pattern's own definition, same caveat
-    as Distribution above): pivot must sit roughly in the middle of the
-    20-candle window (so there's room to measure a real leg in and a real
-    leg out on both sides), each leg >= 3%, and the recovery/reversal leg
-    must not take meaningfully longer than the leg into the pivot (a slow
-    grind back out is a round bottom, not a V).
-
-    Returns (direction, level) or (None, 0). `level` is the pre-move high
-    (BUY) or pre-move low (SELL) — the breakout trigger price.
-    """
-    if len(closes) < 20: return None, 0
-    window = closes[-20:]; h_window = highs[-20:]; l_window = lows[-20:]
-
-    # ── Bullish V: sharp drop into a pivot low, sharp recovery out ──
-    inner_lows = l_window[2:-2]
-    if inner_lows:
-        pivot_low = min(inner_lows)
-        pivot_low_idx = l_window.index(pivot_low, 2)
-        pre_high = max(h_window[:pivot_low_idx+1])
-        decline_pct = (pre_high - pivot_low) / pre_high * 100 if pre_high > 0 else 0
-        decline_candles = pivot_low_idx + 1
-        recovery_candles = len(window) - pivot_low_idx
-        recovery_pct = (price - pivot_low) / pivot_low * 100 if pivot_low > 0 else 0
-        if decline_pct >= 3.0 and recovery_pct >= 3.0 and recovery_candles <= decline_candles * 1.8:
-            if price > pre_high * 1.001 and vols[-1] > avg_vol * 1.3:
-                return "BUY", pre_high
-
-    # ── Bearish inverted-V: sharp rally into a pivot high, sharp reversal down ──
-    inner_highs = h_window[2:-2]
-    if inner_highs:
-        pivot_high = max(inner_highs)
-        pivot_high_idx = h_window.index(pivot_high, 2)
-        pre_low = min(l_window[:pivot_high_idx+1])
-        rally_pct = (pivot_high - pre_low) / pre_low * 100 if pre_low > 0 else 0
-        rally_candles = pivot_high_idx + 1
-        decline_candles = len(window) - pivot_high_idx
-        decline_pct = (pivot_high - price) / pivot_high * 100 if pivot_high > 0 else 0
-        if rally_pct >= 3.0 and decline_pct >= 3.0 and decline_candles <= rally_candles * 1.8:
-            if price < pre_low * 0.999 and vols[-1] > avg_vol * 1.3:
-                return "SELL", pre_low
-
-    return None, 0
-
-
 def detect_volatility_contraction(closes, highs, lows, vols, price):
     """
-
     Point 2: Volatility Contraction Pattern (VCP) — catches the setup BEFORE
     the breakout candle and its volume spike, instead of after.
 
@@ -4024,18 +3902,6 @@ def detect_patterns(symbol, klines, price, btc_trend):
     if _dt_fired and alt_bear_ok:
         p.append(("Double Top", TIER1_BASE, "SELL"))
 
-    # ── Distribution Breakdown — Tier 1, Breakout engine (bearish only, see docstring) ──
-    _dist_fired, _dist_level = detect_distribution_range(highs, lows, closes, vols, price, avg_vol)
-    if _dist_fired and alt_bear_ok:
-        p.append(("Distribution Breakdown", TIER1_BASE, "SELL"))
-
-    # ── V-Shape Reversal — Tier 1, Breakout engine, both directions ──
-    _vshape_dir, _vshape_level = detect_v_shape_reversal(closes, highs, lows, vols, price, avg_vol)
-    if _vshape_dir == "BUY" and alt_bull_ok:
-        p.append(("V-Shape Reversal", TIER1_BASE, "BUY"))
-    elif _vshape_dir == "SELL" and alt_bear_ok:
-        p.append(("V-Shape Reversal", TIER1_BASE, "SELL"))
-
     # ── Volume Breakout — Tier 1 ──
     if price > res and vols[-1] > avg_vol * 2.2 and alt_bull_ok:
         p.append(("Volume Breakout", TIER1_BASE, "BUY"))
@@ -5221,11 +5087,11 @@ def check_active_macro_coils():
         # 2. INVALIDATION CHECK: Did structure completely break?
         level = data["level"]
         if data["direction"] == "BUY" and live_price < level * 0.98:
-            send_telegram(f"❌ <b>MACRO SETUP INVALIDATED</b>\n🏗️ Engine: 🏛️ PRE-BREAKOUT MACRO ENGINE\n🪙 {coin} broke 2% below {data['pattern']} support. Removed from radar.")
+            send_telegram(f"❌ <b>MACRO SETUP INVALIDATED</b>\n🪙 {coin} broke 2% below {data['pattern']} support. Removed from radar.")
             keys_to_delete.append(coin)
             continue
         elif data["direction"] == "SELL" and live_price > level * 1.02:
-            send_telegram(f"❌ <b>MACRO SETUP INVALIDATED</b>\n🏗️ Engine: 🏛️ PRE-BREAKOUT MACRO ENGINE\n🪙 {coin} broke 2% above {data['pattern']} resistance. Removed from radar.")
+            send_telegram(f"❌ <b>MACRO SETUP INVALIDATED</b>\n🪙 {coin} broke 2% above {data['pattern']} resistance. Removed from radar.")
             keys_to_delete.append(coin)
             continue
 
@@ -7547,10 +7413,8 @@ def expire_pending_signals():
     expired=[c for c,s in list(pending_signals.items()) if s.get("expires_at") and now>s["expires_at"]]
     for coin in expired:
         with trade_lock:
-            s = pending_signals.get(coin)
-            _eng_label = get_engine_label(s["pattern"].split(" + ")[0]) if s and s.get("pattern") else "📊 SIGNAL ENGINE"
             if coin in pending_signals: del pending_signals[coin]
-        send_telegram(f"⏰ <b>{BOT_HEADER}</b>\n🏗️ Engine: {_eng_label}\nSignal expired: <b>{coin}</b>")
+        send_telegram(f"⏰ <b>{BOT_HEADER}</b>\nSignal expired: <b>{coin}</b>")
     if expired: save_pending_signals()
 
 def check_price_alerts():
@@ -8239,20 +8103,6 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
                             logger.info(f"{coin} EVALUATION REJECTED BY AI before tracking: {_pre_susp_ai['reasoning']}")
                             if _pre_susp_ai["stage"] == "LATE":
                                 log_retest_candidate(coin, setup["symbol"], setup["direction"], closes, _pre_susp_highs, _pre_susp_lows, setup["pattern"])
-                            # COST FIX: this rejection path set no cooldown at
-                            # all, unlike the main AI call path (see the
-                            # identical fix + comment ~20 lines below this
-                            # function's other ai_analyze_setup call site).
-                            # SCAN_INTERVAL is 90s, and a genuine coil can
-                            # keep matching for 20-30+ min — meaning the same
-                            # coin got a fresh billed Claude call every single
-                            # scan cycle for as long as it kept coiling and
-                            # kept getting rejected. Same 20-minute cooldown
-                            # as the other rejection path, same reasoning:
-                            # short enough that a real change in conditions
-                            # isn't missed for long, long enough to stop the
-                            # per-scan re-billing.
-                            coin_cooldowns[coin] = get_ist_datetime() + timedelta(minutes=20)
                             return False
                         setup["ai_reasoning"] = _pre_susp_ai["reasoning"]
 
@@ -8282,6 +8132,38 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
                             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                             f"🕐 {get_ist_time()}"
                         )
+                        # REAL GAP FOUND AND FIXED (this round) — per
+                        # explicit request for a genuine 5m chart on
+                        # this alert: verified send_telegram_photo/
+                        # generate_signal_chart were never called
+                        # anywhere in this block, despite the message's
+                        # own text already claiming "MONITORING 5M
+                        # CHART" — purely a text label, no image. sl/tp
+                        # are not yet computed this early in the
+                        # function (that logic lives further downstream,
+                        # closer to activation), so rather than fabricate
+                        # levels, computed a real, genuine structural
+                        # SL/TP here using the same real get_structure_sl
+                        # /calculate_atr functions the activation chart
+                        # uses, on real 5m data — matching the requested
+                        # timeframe and check_5m_sniper_trigger's own
+                        # real interval — specifically for this
+                        # early-stage visual reference.
+                        try:
+                            _early_klines_5m = get_klines(setup["symbol"], "5m", 60)
+                            if _early_klines_5m and len(_early_klines_5m) >= 20:
+                                _early_atr = calculate_atr(_early_klines_5m, 14)
+                                _early_sl = get_structure_sl(_early_klines_5m, setup["direction"], setup["scan_price"], _early_atr)
+                                _early_sl_dist = abs(setup["scan_price"] - _early_sl)
+                                _early_tp = setup["scan_price"] + _early_sl_dist * 2.0 if setup["direction"] == "BUY" else setup["scan_price"] - _early_sl_dist * 2.0
+                                _early_chart_path = generate_signal_chart(
+                                    setup["symbol"], _early_klines_5m, setup["scan_price"], _early_sl, _early_tp,
+                                    setup["direction"], coin, interval="5m", pattern_name=_primary_pat
+                                )
+                                if _early_chart_path:
+                                    send_telegram_photo(_early_chart_path)
+                        except Exception as e:
+                            logger.warning(f"{coin} Early Alert 5m chart: {e}")
                 logger.info(f"{coin} {setup['direction']} coiled on 15m, moved to EVALUATING state.")
                 return False  # halts cleanly — check_evaluating_signals() resumes this via the held setup, not a fresh re-detection
 
@@ -8697,20 +8579,45 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     # hold. All three represent a real, mathematically-confirmed
     # trigger the AI would otherwise see only after the fact and
     # correctly-but-uselessly flag as STAGE:LATE.
-    if setup.get("is_macro") or setup.get("is_lightning") or from_evaluation:
+    # ── LIGHTNING IGNITION ENGINE: STRUCTURALLY ISOLATED FROM CLAUDE
+    # (per explicit instruction) ──────────────────────────────────
+    # This is a genuinely SEPARATE code path from the AI-eligible branch
+    # below, not a shared conditional — a Lightning-tagged setup returns
+    # here, before is_macro/from_evaluation/the standard AI branch are
+    # even reached. Purely pattern- and entry-timing-based execution,
+    # with zero dependency on ai_analyze_setup ever being reachable
+    # from this point onward for a Lightning trade.
+    if setup.get("is_lightning") or setup["pattern"].split(" + ")[0] in LIGHTNING_ENGINE_PATTERNS:
+        # REAL GAP FOUND AND FIXED (this round): VERIFIED WITH A DIRECT
+        # EXECUTION TEST before applying — confirmed "Yellow Circle
+        # Sniper" (created inside detect_patterns with no is_lightning
+        # tag) genuinely still reached the real ai_analyze_setup
+        # function, exactly what this isolation block exists to
+        # prevent. The same class of gap already found and fixed once
+        # in update_trailing_sl (standalone snipers not carrying the
+        # is_lightning tag) — checking the real, already-verified
+        # LIGHTNING_ENGINE_PATTERNS set directly closes it here too,
+        # so both ways a setup can genuinely be a Lightning trade are
+        # covered.
+        ai_result = {
+            "verdict": "CLEAN",
+            "confidence": "HIGH",
+            "stage": "EARLY",
+            "trade": True,
+            "eta_read": "Executing pure pattern geometry.",
+            "reasoning": "Mathematical Sniper Execution (Lightning Engine — never sent to Claude).",
+        }
+        logger.info(f"{coin} Lightning Ignition Engine — pure pattern/timing execution, Claude not called.")
+    elif setup.get("is_macro") or from_evaluation:
         if setup.get("is_macro"):
             ai_reason = setup.get("macro_ai_reasoning", "Approved by Upstream Macro AI.")
-        elif from_evaluation:
-            # REAL FIX (this round): from_evaluation now genuinely
-            # carries real AI reasoning from the suspend-side review
-            # (see the AI-BEFORE-SUSPEND fix above) — use it instead of
-            # the generic Lightning message, since a from_evaluation
-            # trade genuinely WAS reviewed by Claude before tracking,
-            # unlike a Lightning trade which never goes through Claude
-            # at all.
-            ai_reason = setup.get("ai_reasoning", "Pre-approved by AI during coiling phase.")
         else:
-            ai_reason = "Mathematical Sniper Execution (AI Bypassed to avoid late-chase rejection)."
+            # from_evaluation now genuinely carries real AI reasoning
+            # from the suspend-side review (see the AI-BEFORE-SUSPEND
+            # fix elsewhere in this function) — use it, since a
+            # from_evaluation trade genuinely WAS reviewed by Claude
+            # before tracking.
+            ai_reason = setup.get("ai_reasoning", "Pre-approved by AI during coiling phase.")
         ai_result = {
             "verdict": "CLEAN",
             "confidence": "HIGH",
@@ -8821,11 +8728,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
                     # faster, but it shouldn't re-fire every single cycle either.
                     coin_cooldowns[coin]=get_ist_datetime()+timedelta(minutes=20)
                     return False
-            # EARLY-ONLY GATE: Breakout only fires on STAGE:EARLY, never
-            # MID or LATE. LATE was already routed to the retest
-            # watchlist; MID now gets the same treatment.
-            if ai_result and ai_result.get("stage") in ("LATE","MID"):
-                _stage_now = ai_result.get("stage")
+            if ai_result and ai_result.get("stage")=="LATE":
                 # SNIPER-CONFIRMED OVERRIDE (this round): VERIFIED THE
                 # REASONING before applying — checked ai_analyze_setup's real
                 # signature and confirmed it has NO parameter carrying 5m
@@ -8839,10 +8742,10 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
                 # a resumed EVALUATING signal, the same confirmation that
                 # caused the resume in the first place).
                 if from_evaluation or sniper_triggered or primary_pattern in ("5m Multi-TF Sniper", "Yellow Circle Sniper"):
-                    logger.info(f"{coin} AI flagged {_stage_now}, but 5m Sniper confirms live entry. Firing Signal.")
-                    penalty_notes.append(f"AI Override (5m Sniper Confirmed Live Entry, was {_stage_now})")
+                    logger.info(f"{coin} AI flagged LATE, but 5m Sniper confirms live entry. Firing Signal.")
+                    penalty_notes.append("AI Override (5m Sniper Confirmed Live Entry)")
                 else:
-                    logger.info(f"{coin} AI flagged stage {_stage_now} — Breakout only sends EARLY, logging as retest candidate instead")
+                    logger.info(f"{coin} AI flagged stage LATE — logging as retest candidate instead of chasing")
                     highs_r=[float(k[2]) for k in klines_15m]; lows_r=[float(k[3]) for k in klines_15m]
                     # PRECISE RETEST LEVEL (this round) — same fix as the
                     # other log_retest_candidate call site: if this is a
@@ -8904,19 +8807,9 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     msg += f"└─────────────────────────────────┘\n\n"
     msg += f"  🏗️ Engine: {get_engine_label(setup['pattern'].split(' + ')[0])}\n"
     msg += f"  🪙 <b>{coin}</b>  {dir_arrow}  🔧 <b>{lev}x Leverage</b>\n"
-    # GRADING SCOPE FIX: grading (badge/bar/scorecard) is exclusive to the
-    # Breakout engine per explicit instruction. Gated on the real engine
-    # (via get_engine_label/_primary_pat) rather than is_lightning alone,
-    # since Pre-Breakout/Early-Entry patterns (Inside Bar Coil, Early Spark
-    # Ignition, etc.) also reach this exact message builder via
-    # sniper_triggered/from_evaluation and are not is_lightning either.
-    # grade/pts are still computed upstream for risk sizing / the
-    # floor-gate — this only changes what's displayed.
-    _is_breakout_engine = get_engine_label(_primary_pat) == "💥 BREAKOUT ENGINE"
-    if _is_breakout_engine:
-        msg += f"  {grade_em} <b>{grade}</b>  •  {pts}/{max_pts} pts\n"
-        msg += f"  [{grade_bar}]\n"
-        msg += f"  📊 Setup Score: <b>{setup['setup_score']:.0f}/100</b>  [{score_bar}]\n"
+    msg += f"  {grade_em} <b>{grade}</b>  •  {pts}/{max_pts} pts\n"
+    msg += f"  [{grade_bar}]\n"
+    msg += f"  📊 Setup Score: <b>{setup['setup_score']:.0f}/100</b>  [{score_bar}]\n"
     msg += f"  {cond_icon} Market: <b>{cond_em}</b>\n\n"
 
     msg += f"  ┌── TRADE LEVELS ─────────────┐\n"
@@ -8953,15 +8846,14 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     msg += f"  ⚖️  Risk/Reward: <b>1 : {rr_ratio:.1f}</b>\n"
     msg += f"  💼 Position   : <b>{pos_size:.1f}% of margin</b>  (risking {risk_pct:.1f}% of equity if SL hits)\n\n"
 
-    if _is_breakout_engine:
-        msg += f"  ┌── ALIGNMENT SCORECARD ──────┐\n"
-        for name,p in breakdown:
-            bar="●" if p>0 else "○"
-            pts_txt=f"+{p}pt{'s' if p!=1 else ''}" if p>0 else "  —  "
-            msg+=f"  │  {bar} {name:<22} {pts_txt}\n"
-        msg += f"  │                              \n"
-        msg += f"  │  Total: <b>{pts} / {max_pts} points</b>\n"
-        msg += f"  └─────────────────────────────┘\n\n"
+    msg += f"  ┌── ALIGNMENT SCORECARD ──────┐\n"
+    for name,p in breakdown:
+        bar="●" if p>0 else "○"
+        pts_txt=f"+{p}pt{'s' if p!=1 else ''}" if p>0 else "  —  "
+        msg+=f"  │  {bar} {name:<22} {pts_txt}\n"
+    msg += f"  │                              \n"
+    msg += f"  │  Total: <b>{pts} / {max_pts} points</b>\n"
+    msg += f"  └─────────────────────────────┘\n\n"
 
     msg += f"  ┌── CONFIRMATIONS ────────────┐\n"
     msg += f"  │  📡 TF   : {tf_label}\n"
@@ -10403,14 +10295,12 @@ def check_retest_triggers():
         pending_signals[coin] = setup
 
         dir_em = "🟢 LONG  ▲" if w["direction"] == "BUY" else "🔴 SHORT ▼"
-        header_title = ("⚡ EARLY ENTRY — FAST-TRACK CONFIRMED" if fast_track
-                         else "🎯 EARLY ENTRY — RETEST CONFIRMED")
+        header_title = "⚡ DIRECT BREAKOUT FAST-TRACK" if fast_track else "🚨 RETEST CONFIRMED"
         msg = (
             f"<b>{header_title}</b>\n"
             f"┌─────────────────────────────────┐\n"
             f"│  ⚙️  TRADING SIGNAL MASTER v32G  │\n"
             f"└─────────────────────────────────┘\n\n"
-            f"  🏗️ Engine: 🎯 EARLY ENTRY ENGINE\n"
             f"  🪙 <b>{coin}</b>  {dir_em}  🔧 <b>{lev}x Leverage</b>\n"
             f"  📌 Setup : <b>{pat_name}</b>\n\n"
             f"  ┌── TRADE LEVELS ─────────────┐\n"
