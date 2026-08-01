@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 if not CHARTS_AVAILABLE:
     logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -8239,6 +8239,20 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
                             logger.info(f"{coin} EVALUATION REJECTED BY AI before tracking: {_pre_susp_ai['reasoning']}")
                             if _pre_susp_ai["stage"] == "LATE":
                                 log_retest_candidate(coin, setup["symbol"], setup["direction"], closes, _pre_susp_highs, _pre_susp_lows, setup["pattern"])
+                            # COST FIX: this rejection path set no cooldown at
+                            # all, unlike the main AI call path (see the
+                            # identical fix + comment ~20 lines below this
+                            # function's other ai_analyze_setup call site).
+                            # SCAN_INTERVAL is 90s, and a genuine coil can
+                            # keep matching for 20-30+ min — meaning the same
+                            # coin got a fresh billed Claude call every single
+                            # scan cycle for as long as it kept coiling and
+                            # kept getting rejected. Same 20-minute cooldown
+                            # as the other rejection path, same reasoning:
+                            # short enough that a real change in conditions
+                            # isn't missed for long, long enough to stop the
+                            # per-scan re-billing.
+                            coin_cooldowns[coin] = get_ist_datetime() + timedelta(minutes=20)
                             return False
                         setup["ai_reasoning"] = _pre_susp_ai["reasoning"]
 
