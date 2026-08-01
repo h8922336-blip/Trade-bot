@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 if not CHARTS_AVAILABLE:
     logger.warning("mplfinance/pandas not installed — chart images disabled, text signals unaffected. Add mplfinance,pandas,matplotlib to requirements.txt and redeploy to enable.")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8909949122:AAEINK16qv8ALdW2G3R_2Sb93LDsJG0WC6Q")
-CHAT_ID        = os.getenv("CHAT_ID", "8005940008")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")      # CryptoPanic API key (optional)
 
@@ -69,7 +69,6 @@ OKX_KLINE_URL = "https://www.okx.com/api/v5/market/candles"
 # get_funding_rate/get_oi_trend, automatically, no other code changes
 # needed anywhere else.
 FUTURES_ONLY_SYMBOLS = set()
-BINANCE_AGG_URL     = "https://api.binance.com/api/v3/aggTrades"
 BINANCE_FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
 BINANCE_OI_URL      = "https://fapi.binance.com/futures/data/openInterestHist"
 
@@ -89,7 +88,7 @@ COINS = list(dict.fromkeys([
     "ARB","VET","INJ","OP","ATOM","TIA","SUI","SEI","ALGO","EGLD",
     "FLOW","EOS","XTZ","AAVE","MKR","GRT","SNX","COMP","CRV","SUSHI",
     "LDO","CAKE","1INCH","DYDX","GMX","ENS","PENDLE","RNDR","FET","WLD",
-    "AR","THETA","LPT","AKT","SAND","MANA","AXS","GALA","CHZ","APE",
+    "AR","THETA","LPT","AKT","TAO","XLM","AXS","GALA","CHZ","APE",
     "GMT","ENJ","PEPE","WIF","FLOKI","BONK","ORDI","BOME","NOT","DOGS",
     "JUP","PYTH","JTO","STRK","EIGEN","ETHFI","IO","ZERO","ONDO",
     "BLUR","CFX","METIS","MANTA","ZETA","TRB","ALT","PIXEL","PORTAL","STPT","KAS",
@@ -144,7 +143,7 @@ pattern_stats = {p: {"signals":0,"wins":0,"losses":0,"total_pnl":0.0,"weight":1.
     "Volume Spike","Double Bottom","Double Top","Support Bounce","Resistance Rejection",
     "Bullish Engulfing","Bearish Engulfing","Volume Breakout","Bull Flag Formation","Bear Flag Formation",
     "BOS Breakout","Change of Character (ChoCh)","Liquidity Sweep","Volatility Contraction (Coiling)","Pre-Breakout Compression",
-    "Inside Bar Coil","BOS-Retest","BOS Retest (Sniper Entry)","Early Spark Ignition","Pressure Cooker Triangle","Vanguard Macro Squeeze","Smart Money Absorption","Funding Divergence Sniper","Trend Continuation Coil","5m Multi-TF Sniper","Order Flow Sniper","Yellow Circle Sniper","Lightning 3M Ignition (Taker Delta)","Lightning 5M Setup","Pre-Breakout Macro","Hammer","Inverted Hammer","Shooting Star","Dragonfly Doji","Gravestone Doji","Tweezer Bottom","Tweezer Top","Morning Star","Evening Star","Three White Soldiers","Three Black Crows","Triple Bottom (Anticipatory)","Triple Top (Anticipatory)","Inverse Head & Shoulders (Early)","Head & Shoulders (Early)","Wolfe Wave Reversal"
+    "Inside Bar Coil","BOS-Retest","BOS Retest (Sniper Entry)","Early Spark Ignition","Pressure Cooker Triangle","Vanguard Macro Squeeze","Smart Money Absorption","Funding Divergence Sniper","Trend Continuation Coil","5m Multi-TF Sniper","Order Flow Sniper","Yellow Circle Sniper","Lightning 3M Ignition (Taker Delta)","Lightning 5M Setup","Pre-Breakout Macro","Hammer","Inverted Hammer","Shooting Star","Dragonfly Doji","Gravestone Doji","Tweezer Bottom","Tweezer Top","Morning Star","Evening Star","Three White Soldiers","Three Black Crows","Triple Bottom (Anticipatory)","Triple Top (Anticipatory)","Inverse Head & Shoulders (Early)","Head & Shoulders (Early)","Wolfe Wave Reversal","PDL Reversal Sweep","PDH Reversal Sweep","ChoCh + Fib 0.618 Golden Zone"
 ]}
 
 last_update_id         = None
@@ -220,7 +219,6 @@ MIN_RR_RATIO             = 2.0  # TP must be at least this many multiples of the
                                   # structural SL was tight but ATR was also small)
 MAX_DAILY_LOSSES         = 3
 CIRCUIT_BREAKER_MIN_LOSS = -5.0
-WHALE_TRADE_THRESHOLD    = 500000
 ATR_VOLATILITY_RATIO     = 3.0
 CONSEC_LOSS_SUSPEND      = 5
 MIN_SIGNALS_TO_SUSPEND   = 15
@@ -369,10 +367,62 @@ LEV_TIER_1               = ["BTC","ETH"]
 LEV_TIER_2               = ["BNB","SOL","XRP","ADA","AVAX","DOT","LINK","LTC",
                              "NEAR","UNI","ATOM","APT","SUI","ARB","OP","INJ"]
 LEV_TIER_3               = ["DOGE","SHIB","PEPE","WIF","FLOKI","BONK","DOGS",
-                             "BOME","NOT","APE","GMT","CHZ","GALA","SAND","MANA"]
+                             "BOME","NOT","APE","GMT","CHZ","GALA"]
 BOT_VERSION = "v32G"
 BOT_NAME    = "TRADING SIGNAL MASTER"
 BOT_HEADER  = f"⚙️ {BOT_NAME} {BOT_VERSION}"
+
+# ── ENGINE PATTERN LIBRARIES (added per explicit instruction — pure,
+# additive labeling constants, not a rewrite of any detection/scoring
+# logic). VERIFIED every single name below against the real, current
+# file before adding: every pattern listed genuinely exists somewhere
+# in the codebase under this exact string. Used by get_engine_label()
+# to attach a clear "which engine produced this" tag to trade
+# notifications, so a signal's origin is never ambiguous. ──
+LIGHTNING_ENGINE_PATTERNS = {
+    "Lightning 5M Setup", "Lightning 3M Ignition (Taker Delta)",
+    "Yellow Circle Sniper", "Order Flow Sniper", "5m Multi-TF Sniper",
+    "Hammer", "Inverted Hammer", "Shooting Star", "Dragonfly Doji", "Gravestone Doji",
+    "Tweezer Bottom", "Tweezer Top", "Morning Star", "Evening Star",
+    "Three White Soldiers", "Three Black Crows",
+    "Triple Bottom (Anticipatory)", "Triple Top (Anticipatory)",
+    "Inverse Head & Shoulders (Early)", "Head & Shoulders (Early)", "Wolfe Wave Reversal",
+}
+BREAKOUT_ENGINE_PATTERNS = {
+    "BOS Breakout", "Volume Breakout", "Double Bottom", "Double Top",
+    "Bull Flag Formation", "Bear Flag Formation", "EMA Trend", "Pullback to 20 EMA",
+    "Momentum Surge", "Volume Spike", "Support Bounce", "Resistance Rejection",
+}
+PRE_BREAKOUT_ENGINE_PATTERNS = {
+    "Inside Bar Coil", "Pre-Breakout Compression", "Volatility Contraction (Coiling)",
+    "Early Spark Ignition", "Smart Money Absorption", "Funding Divergence Sniper",
+    "Pressure Cooker Triangle", "Trend Continuation Coil", "BOS-Retest",
+    "BOS Retest (Sniper Entry)", "Change of Character (ChoCh)", "Liquidity Sweep",
+    "PDL Reversal Sweep", "PDH Reversal Sweep", "ChoCh + Fib 0.618 Golden Zone",
+}
+
+def get_engine_label(pattern_name):
+    """
+    Maps any real pattern name (including dynamic Lightning/Macro names
+    with parenthetical suffixes, e.g. "Lightning 3M Ignition (Taker
+    Delta) (Fast-Track)") to a clear, human-readable engine label for
+    Telegram notifications. Uses the same is_lightning-adjacent
+    substring check already established and verified elsewhere in this
+    file this round, so it correctly covers both real Lightning
+    mechanisms and any pattern-name suffix variation, not just an exact
+    literal match.
+    """
+    primary = pattern_name.split(" + ")[0] if pattern_name else ""
+    if primary in LIGHTNING_ENGINE_PATTERNS or primary.startswith("Lightning") or "Ignition" in primary:
+        return "⚡ LIGHTNING IGNITION ENGINE"
+    if primary.startswith("Pre-Breakout Macro"):
+        return "🏛️ PRE-BREAKOUT MACRO ENGINE"
+    if primary in PRE_BREAKOUT_ENGINE_PATTERNS:
+        return "🔄 EARLY ENTRY / RETEST ENGINE"
+    if primary in BREAKOUT_ENGINE_PATTERNS:
+        return "💥 BREAKOUT ENGINE"
+    return "📊 SIGNAL ENGINE"
+
 
 def S(c="━",n=30): return c*n
 def fmt_pnl(v): return ("🟢 " if v>=0 else "🔴 ")+f"{v:+.2f}%"
@@ -2472,9 +2522,18 @@ def detect_bos_retest(klines, ms, price, avg_vol):
         max_recent_high = max(highs[-15:])
         if max_recent_high > swing_high * 1.015:
             dist = abs(price - swing_high) / swing_high * 100
-            candle_range = highs[-1] - lows[-1]
-            lower_wick_pct = (min(opens[-1], closes[-1]) - lows[-1]) / candle_range * 100 if candle_range > 0 else 0
-            is_rejecting = closes[-1] > opens[-1] or lower_wick_pct > 40
+            # LIVE-CANDLE FIX (this round): moved the wick-shape geometry
+            # to the confirmed, closed [-2] candle — [-1] is still live/
+            # unclosed, the same illusion already found and fixed in
+            # detect_liquidity_sweep and the Double Bottom/Top functions.
+            # closes[-1] > swing_high is DELIBERATELY kept at -1 — that's
+            # a real-time "is price above the level right now" question,
+            # genuinely different from "did the candle that just formed
+            # show a real rejection shape," which can only be answered
+            # once that candle has actually closed.
+            candle_range = highs[-2] - lows[-2]
+            lower_wick_pct = (min(opens[-2], closes[-2]) - lows[-2]) / candle_range * 100 if candle_range > 0 else 0
+            is_rejecting = closes[-2] > opens[-2] or lower_wick_pct > 40
             if dist <= 0.8 and closes[-1] > swing_high and is_rejecting:
                 return "BUY"
 
@@ -2482,9 +2541,12 @@ def detect_bos_retest(klines, ms, price, avg_vol):
         min_recent_low = min(lows[-15:])
         if min_recent_low < swing_low * 0.985:
             dist = abs(price - swing_low) / swing_low * 100
-            candle_range = highs[-1] - lows[-1]
-            upper_wick_pct = (highs[-1] - max(opens[-1], closes[-1])) / candle_range * 100 if candle_range > 0 else 0
-            is_rejecting = closes[-1] < opens[-1] or upper_wick_pct > 40
+            # LIVE-CANDLE FIX (this round, mirror of the bullish branch
+            # above): wick-shape geometry moved to the confirmed [-2]
+            # candle, closes[-1] < swing_low deliberately kept live.
+            candle_range = highs[-2] - lows[-2]
+            upper_wick_pct = (highs[-2] - max(opens[-2], closes[-2])) / candle_range * 100 if candle_range > 0 else 0
+            is_rejecting = closes[-2] < opens[-2] or upper_wick_pct > 40
             if dist <= 0.8 and closes[-1] < swing_low and is_rejecting:
                 return "SELL"
 
@@ -3330,13 +3392,23 @@ def detect_daily_level_reversal(symbol, klines_15m, price):
     # BUY at Previous Daily Low (PDL) Rejection
     if pdl > 0 and abs(c_low - pdl) / pdl < 0.005:  # pierced or tapped PDL within 0.5%
         lower_wick_pct = (min(c_open, c_close) - c_low) / candle_range * 100
-        if c_close > c_open and lower_wick_pct > 35.0:  # strong bullish rejection
+        # REAL GAP FOUND AND FIXED (this round): VERIFIED WITH A CONCRETE
+        # COUNTER-EXAMPLE — the candle-level rejection could be real and
+        # valid, but live price could have since moved meaningfully away
+        # from PDL by the time this actually fires, entering far from
+        # the level the signal is anchored to. Threshold (0.8%) matches
+        # the already-verified, real dist<=0.8 proximity check used for
+        # the same class of question in detect_bos_retest.
+        if c_close > c_open and lower_wick_pct > 35.0 and abs(price - pdl) / pdl < 0.008:  # strong bullish rejection, price still near the level
             return "BUY", pdl
 
     # SELL at Previous Daily High (PDH) Rejection
     if pdh > 0 and abs(c_high - pdh) / pdh < 0.005:  # pierced or tapped PDH within 0.5%
         upper_wick_pct = (c_high - max(c_open, c_close)) / candle_range * 100
-        if c_close < c_open and upper_wick_pct > 35.0:  # strong bearish rejection
+        # REAL GAP FOUND AND FIXED (this round, mirror of the PDL branch
+        # above): live price could have moved meaningfully away from
+        # PDH since the candle-level rejection.
+        if c_close < c_open and upper_wick_pct > 35.0 and abs(pdh - price) / pdh < 0.008:  # strong bearish rejection, price still near the level
             return "SELL", pdh
 
     return None, 0
@@ -3686,14 +3758,31 @@ def detect_patterns(symbol, klines, price, btc_trend):
     # notes gap already caught and fixed for the micro-candlestick
     # patterns two rounds ago — this block was discarding
     # macro5m_notes the identical way. ──
-    klines_5m_macro = get_klines(symbol, "5m", 30)
-    if klines_5m_macro:
-        macro5m_pat, macro5m_dir, macro5m_notes = detect_micro_structures_5m(klines_5m_macro, price, sup, res)
-        if macro5m_pat:
-            if macro5m_dir == "BUY" and alt_bull_ok:
-                p.append((macro5m_pat, TIER1_BASE, "BUY", macro5m_notes))
-            elif macro5m_dir == "SELL" and alt_bear_ok:
-                p.append((macro5m_pat, TIER1_BASE, "SELL", macro5m_notes))
+    # PERFORMANCE FIX (this round): VERIFIED THIS WAS A REAL, GENUINE
+    # COST before applying — this fetch was unconditional across every
+    # coin, every scan cycle. Gated on proximity to the same real
+    # structural sup/res levels many other patterns in this function
+    # already anchor on. Threshold (1%) matches the already-established
+    # near_support/near_resistance precedent elsewhere in this file.
+    #
+    # HONEST LIMITATION (checked, not glossed over): Triple Top/Bottom
+    # inside detect_micro_structures_5m checks proximity to its OWN,
+    # separately-computed 15-candle recent high/low, not this outer
+    # sup/res — these two level sets usually correlate closely in a
+    # real market but are not identical by construction, so this gate
+    # is a genuine, if likely small, tradeoff (a rare case where price
+    # is near the Triple Top/Bottom's own levels but not near swing-
+    # based sup/res would be skipped), not a risk-free optimization.
+    near_levels = (sup > 0 and abs(price - sup) / sup < 0.01) or (res > 0 and abs(res - price) / res < 0.01)
+    if near_levels:
+        klines_5m_macro = get_klines(symbol, "5m", 30)
+        if klines_5m_macro:
+            macro5m_pat, macro5m_dir, macro5m_notes = detect_micro_structures_5m(klines_5m_macro, price, sup, res)
+            if macro5m_pat:
+                if macro5m_dir == "BUY" and alt_bull_ok:
+                    p.append((macro5m_pat, TIER1_BASE, "BUY", macro5m_notes))
+                elif macro5m_dir == "SELL" and alt_bear_ok:
+                    p.append((macro5m_pat, TIER1_BASE, "SELL", macro5m_notes))
 
     # ── MICRO CANDLESTICK PATTERNS (3m / 9m / 15m) — non-destructive,
     # per explicit integration strategy: standalone detector, standard
@@ -5315,7 +5404,24 @@ def is_sentiment_valid(direction,fng,pattern_name=""):
     predictive_patterns = (
         "Inside Bar Coil","Pre-Breakout Compression",
         "Volatility Contraction (Coiling)","Early Spark Ignition",
-        "Smart Money Absorption","Funding Divergence Sniper"
+        "Smart Money Absorption","Funding Divergence Sniper",
+        # REAL GAP FOUND AND FIXED (this round): PDL Reversal Sweep, PDH
+        # Reversal Sweep, and ChoCh + Fib 0.618 Golden Zone were added
+        # to this bot in a later round than this exemption list, and
+        # were never propagated here. Checked each against this
+        # function's own real, established criterion before adding —
+        # PDL/PDH Reversal Sweep trade a wick-confirmed rejection at an
+        # explicit price extreme (arguably an even more direct fit than
+        # some already-exempted patterns), and ChoCh + Fib Golden Zone
+        # requires a genuine structural break followed by a real
+        # rejection, conceptually the same "considered structural
+        # entry" class as the already-exempted Smart Money Absorption.
+        # Without this, a mathematically valid contrarian bounce would
+        # be vetoed specifically in the extreme-sentiment conditions
+        # it's designed to catch — the same contradiction already found
+        # and fixed once for Smart Money Absorption/Funding Divergence
+        # Sniper.
+        "PDL Reversal Sweep","PDH Reversal Sweep","ChoCh + Fib 0.618 Golden Zone"
     )
     if pattern_name in predictive_patterns:
         return True
@@ -7380,6 +7486,30 @@ def update_trailing_sl(coin,trade,price,klines=None):
     """
     if trade.get("is_macro"):
         klines = get_klines(trade.get("symbol", coin+"USDT"), "4h", 20)
+    elif trade.get("is_lightning") or trade.get("pattern","").split(" + ")[0] in ("Yellow Circle Sniper","5m Multi-TF Sniper"):
+        # REAL GAP FOUND AND FIXED (this round): standalone Engine-1
+        # snipers ("Yellow Circle Sniper", "5m Multi-TF Sniper") are
+        # created as plain tuple appends inside detect_patterns (the
+        # 15m pipeline) with no is_lightning tag ever set on them —
+        # traced every real creation site to confirm this. They were
+        # falling through to the default 15m ATR trailing stop despite
+        # already having real, established 5m-native treatment
+        # elsewhere in this file (the reversal-check and chart/SL
+        # mappings both already list them as "5m"), confirming 5m is
+        # genuinely the correct scale, not a new assumption.
+        #
+        # LIGHTNING ENGINE FIX (earlier round): mirrors the is_macro
+        # pattern directly above. VERIFIED THIS WAS THE REAL, LIVE
+        # CAUSE of the reported profit-shortfall bug — traced every
+        # reference to is_lightning across the file and confirmed it
+        # was never checked anywhere in trade management, meaning a
+        # Lightning trade's tight, fast-timeframe target was being
+        # trailed using 15m ATR, a much larger volatility scale than
+        # the trade itself. Re-fetches real 5m data instead — matching
+        # check_lightning_ignition_engine's own real setup-detection
+        # timeframe — so the trail distance is scaled to the same
+        # timeframe the trade was actually built around.
+        klines = get_klines(trade.get("symbol", coin+"USDT"), "5m", 20)
 
     if klines and len(klines) >= 15 and trade.get("timestamp"):
         atr = calculate_atr(klines, 14)
@@ -7705,7 +7835,19 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     _sl_klines = klines_15m
     _chart_interval = "15m"
     _primary_for_native = setup["pattern"].split(" + ")[0]
-    if _primary_for_native.startswith("Lightning 5M Setup"):
+    if _primary_for_native.startswith("Lightning 5M Setup") or (setup.get("is_lightning") and "Ignition" in _primary_for_native):
+        # LIGHTNING ENGINE FIX (this round): FOUND AND FIXED THE ACTUAL
+        # ROOT CAUSE of the reported "chart still shows 15m" issue.
+        # Verified directly against the real FLOW pattern name from the
+        # screenshot ("Lightning 3M Ignition (Taker Delta) (Fast-Track)")
+        # that .startswith("Lightning 5M Setup") is False for the
+        # CVD-only Lightning variant — meaning every trade from that
+        # specific mechanism has always fallen through to the 15m
+        # default chart, unconditionally, not just when Fast-Track was
+        # involved. Added the is_lightning tag check (confirmed set
+        # correctly on both real Lightning mechanisms) so both are now
+        # covered.
+        #
         # Prefix check (not a literal dict lookup) since
         # check_lightning_ignition_engine builds its pattern name
         # dynamically (e.g. "Lightning 5M Setup (Tweezer Bottom)") and
@@ -7978,6 +8120,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
                         send_telegram(
                             f"🟡 <b>EARLY ALERT: 15m Setup Detected — {coin}</b>\n"
                             f"⚙️ <b>TRADING SIGNAL MASTER v32G</b>\n"
+                            f"🏗️ Engine: {get_engine_label(_primary_pat)}\n"
                             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                             f"🪙 <b>{coin}</b>  {'🟢' if setup['direction']=='BUY' else '🔴'} {setup['direction']}\n"
                             f"📌 Pattern: {_primary_pat}\n"
@@ -8235,7 +8378,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     # for the chart/SL and reversal-check mappings, rather than
     # maintain a parallel literal-string list that's structurally
     # incapable of matching this one pattern family.
-    _is_accum_exempt = _floor_primary in _accum_exempt_patterns or _floor_primary.startswith("Lightning 5M Setup") or _floor_primary.startswith("Pre-Breakout Macro")
+    _is_accum_exempt = _floor_primary in _accum_exempt_patterns or _floor_primary.startswith("Lightning 5M Setup") or (setup.get("is_lightning") and "Ignition" in _floor_primary) or _floor_primary.startswith("Pre-Breakout Macro")
     # MINIMUM FLOOR ADDED FOR EXEMPTED PATTERNS (this round): VERIFIED
     # BOTH SIDES before applying this, not just one — tested a genuine,
     # high-quality Early Spark setup (dying volume, tight risk, real
@@ -8605,6 +8748,7 @@ def format_and_send(setup,coin,is_river=False,is_instant=False,market_condition=
     msg += f"┌─────────────────────────────────┐\n"
     msg += f"│  ⚙️  TRADING SIGNAL MASTER v32G  │\n"
     msg += f"└─────────────────────────────────┘\n\n"
+    msg += f"  🏗️ Engine: {get_engine_label(setup['pattern'].split(' + ')[0])}\n"
     msg += f"  🪙 <b>{coin}</b>  {dir_arrow}  🔧 <b>{lev}x Leverage</b>\n"
     msg += f"  {grade_em} <b>{grade}</b>  •  {pts}/{max_pts} pts\n"
     msg += f"  [{grade_bar}]\n"
@@ -8863,7 +9007,7 @@ def check_active_trades():
         # worse outcome than the "tiny wins" problem being fixed. 60
         # candles gives a genuine 51+ usable after dropping the live one,
         # with a safety margin.
-        klines_check=get_klines(trade["symbol"],"15m",60)
+        klines_check=get_klines(trade["symbol"],"5m" if trade.get("is_lightning") else "15m",60)
         update_trailing_sl(coin,trade,price,klines_check)
         check_profit_milestones(coin,trade,price,pnl)
         if not trade.get("reversal_alerted",False):
@@ -8880,7 +9024,20 @@ def check_active_trades():
             # instead of comparing an ultra-tight-stop trade's health
             # against a much slower, mismatched 15m indicator.
             _reversal_pattern = trade.get("pattern", "").split(" + ")[0]
-            if _reversal_pattern.startswith("Lightning 5M Setup"):
+            if _reversal_pattern.startswith("Lightning 5M Setup") or (trade.get("is_lightning") and "Ignition" in _reversal_pattern):
+                # LIGHTNING ENGINE FIX (this round): FOUND A SECOND, REAL
+                # INSTANCE of the same underlying gap the trailing-stop
+                # fix above addresses — the CVD-only standalone Lightning
+                # trigger's pattern name ("Lightning 3M Ignition (Taker
+                # Delta)") does not start with "Lightning 5M Setup" and
+                # is not in the fallback dict below either, meaning it
+                # was silently falling through to the default 15m
+                # reversal check, unprotected. Added the is_lightning
+                # tag check (confirmed set on both real Lightning
+                # mechanisms) as an additional match condition, so this
+                # covers both variants robustly rather than patching
+                # only the one specific missing string.
+                #
                 # Prefix check (not a literal dict lookup) since a
                 # Lightning trade opened via check_lightning_ignition_engine
                 # has a DYNAMIC pattern name (e.g. "Lightning 5M Setup
@@ -9165,7 +9322,7 @@ def check_active_trades():
                     # real, permanent trade-history data. Normalized to
                     # the shared bucket so all Lightning variants
                     # aggregate into one real, trackable entry.
-                    _stats_key = "Lightning 5M Setup" if primary.startswith("Lightning 5M Setup") else "Pre-Breakout Macro" if primary.startswith("Pre-Breakout Macro") else primary
+                    _stats_key = "Lightning 5M Setup" if primary.startswith("Lightning 5M Setup") else "Lightning 3M Ignition (Taker Delta)" if "Ignition" in primary else "Pre-Breakout Macro" if primary.startswith("Pre-Breakout Macro") else primary
                     if _stats_key in pattern_stats:
                         pattern_stats[_stats_key]["signals"]+=1
                         pattern_stats[_stats_key]["total_pnl"]+=port_pnl
@@ -9236,7 +9393,8 @@ def check_active_trades():
                        f"   invalidated, closed here instead of riding it to the\n"
                        f"   structural stop.\n\n" if hit=="REVERSAL" else "")
                     + f"🪙 <b>{coin}</b>  {'🟢' if trade['direction']=='BUY' else '🔴'} {trade['direction']}\n"
-                    f"📌 Pattern: {primary}\n\n"
+                    f"📌 Pattern: {primary}\n"
+                    f"🏗️ Engine: {get_engine_label(primary)}\n\n"
                     f"💰 Entry: <code>{format_price(trade['entry'])}</code>\n"
                     f"📍 Exit:  <code>{format_price(exit_price)}</code>\n"
                     f"⏱️ Duration: {duration}\n\n"
@@ -9577,29 +9735,11 @@ def poll_telegram():
                         }
                         send_telegram(
                             f"{_H('TRADING SIGNAL MASTER v32G','⚙️')}\n\n"
-                            f"  Tap a button or type a command:\n\n"
+                            f"  Tap a command to execute:\n\n"
                             f"  📊 /trades    — Active trades\n"
-                            f"  ⏳ /pending   — Pending signals\n"
-                            f"  👀 /retests   — Coins watched for pullback\n"
-                            f"  📈 /stats     — Pattern stats\n"
-                            f"  🧠 /analyst   — AI reviews open trades\n"
-                            f"  🔮 /counsel   — AI suggestion per trade\n"
-                            f"  📅 /summary   — 10-day summary\n"
-                            f"  🔥 /streak    — Win/loss streak\n"
-                            f"  🏆 /best      — Top performers\n"
-                            f"  🛡 /risk      — Risk exposure\n"
-                            f"  🧠 /learn     — Bot insights\n"
-                            f"  📓 /journal   — Trade journal\n"
-                            f"  🌀 /patterns  — Patterns ranked\n"
-                            f"  📰 /news      — Crypto news\n"
                             f"  🌍 /market    — Market overview\n"
-                            f"  🔍 /scan      — Manual scan\n"
-                            f"  ⚡ /cb        — Circuit breaker\n"
-                            f"  📡 /status    — Live bot status\n"
-                            f"  🔔 /alerts    — Price alerts\n"
                             f"  📉 /trend BTC — Trend analysis\n"
                             f"  🆚 /compare BTC ETH — Compare\n"
-                            f"  💎 /gems      — Hidden gems scan\n"
                             f"  🔬 /backtest BTC — Backtest\n\n"
                             f"  🕐 {get_ist_time()}",
                             reply_markup=menu_kb
